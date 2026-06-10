@@ -22,7 +22,7 @@ function RegularCanvas({
   userId: string;
   onTurnComplete: () => void;
 }) {
-  const { messages, sending, send } = useChat(
+  const { messages, sending, send, stop, regenerate } = useChat(
     conversation.conversation_id,
     userId,
     onTurnComplete
@@ -34,8 +34,8 @@ function RegularCanvas({
   }, [messages]);
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex items-center gap-2 border-b border-border px-4 py-3">
+    <div className="flex h-full flex-col bg-slate-950">
+      <header className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
         <ModeIcon mode={conversation.mode} className="size-4 text-muted-foreground" />
         <span className="text-sm font-medium">
           {conversation.title ?? "Regular chat"}
@@ -49,15 +49,23 @@ function RegularCanvas({
               Start the conversation below.
             </div>
           )}
-          {messages.map((m) => (
-            <ChatBubble key={m.id} message={m} />
-          ))}
+          {messages.map((m, i) => {
+            const isLastAssistant =
+              m.role === "assistant" && i === messages.length - 1;
+            return (
+              <ChatBubble
+                key={m.id}
+                message={m}
+                onRegenerate={isLastAssistant && !sending ? regenerate : undefined}
+              />
+            );
+          })}
           <div ref={bottomRef} />
         </div>
       </ScrollArea>
 
       <div className="mx-auto w-full max-w-3xl">
-        <Composer disabled={sending} onSend={send} />
+        <Composer disabled={sending} sending={sending} onSend={send} onStop={stop} />
       </div>
     </div>
   );

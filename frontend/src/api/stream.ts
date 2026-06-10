@@ -9,7 +9,13 @@ import type { StreamEvent } from "@/types";
  * fires for each frame as it arrives, giving the live token-by-token UI.
  */
 export async function streamChat(
-  body: { user_id: string; conversation_id: string; prompt: string },
+  body: {
+    user_id: string;
+    conversation_id: string;
+    prompt: string;
+    model?: string;
+    effort?: string;
+  },
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {

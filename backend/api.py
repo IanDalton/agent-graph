@@ -32,6 +32,7 @@ from backend.db.arcade_db import (
     database_name_for_user,
 )
 from backend.embeddings import embeddings_enabled
+from backend.model_selection import available_models, default_model_label
 
 logger = logging.getLogger("agent_graph.api")
 
@@ -104,12 +105,19 @@ async def _client_for(user_id: str, *, ensure: bool = False) -> AsyncIterator[Ar
 
 @app.get("/api/config")
 async def get_config() -> dict[str, Any]:
-    """Read-only view of the runtime configuration (no secrets)."""
+    """View of the runtime configuration (no secrets).
+
+    ``model`` is the default model (used when a chat request sends no override); ``models`` is the
+    selectable set for the UI dropdown (see :func:`backend.model_selection.available_models`). The
+    chosen model is sent per-request on ``/api/chat/stream``, not stored server-side.
+    """
     agent_model = os.getenv("AGENT_MODEL")
-    model_label = agent_model or f"ollama/{os.getenv('OLLAMA_MODEL', 'qwen3')}"
     return {
-        "model": model_label,
+        "model": default_model_label(),
+        "models": available_models(),
         "model_source": "AGENT_MODEL" if agent_model else "OLLAMA_MODEL (local fallback)",
+        "effort": main.DEFAULT_EFFORT,
+        "efforts": main.THINKING_EFFORTS,
         "arcade_url": os.getenv("ARCADE_URL", DEFAULT_URL),
         "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8085"),
         "log_level": os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -222,6 +230,12 @@ class ChatRequest(BaseModel):
     user_id: str = "default"
     conversation_id: str
     prompt: str
+    # Optional per-request model override (a label from /api/config "models"). When omitted, the
+    # agent uses the env-configured default. Selection lives in the browser, not on the server.
+    model: str | None = None
+    # Optional per-request thinking-effort override (a value from /api/config "efforts"). When
+    # omitted/unknown, the agent uses DEFAULT_EFFORT. Also browser-side, not stored on the server.
+    effort: str | None = None
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -240,7 +254,11 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
     async def event_source() -> AsyncIterator[str]:
         try:
             async for event in main.stream_run(
-                body.prompt, user_id=body.user_id, conversation_id=body.conversation_id
+                body.prompt,
+                user_id=body.user_id,
+                conversation_id=body.conversation_id,
+                model=body.model,
+                effort=body.effort,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 — surface the failure to the client, don't 500 mid-stream.

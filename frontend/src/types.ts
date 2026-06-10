@@ -23,14 +23,22 @@ export interface ToolEvent {
   done: boolean;
 }
 
-/** A rendered chat turn. The assistant turn additionally carries live thinking
- *  and the tool-call timeline as it streams. */
+/** One node of the agent's chronological execution chain. Thinking runs and tool
+ *  calls are kept in arrival order so the UI can render `thinking → tool → thinking`
+ *  exactly as it streamed, rather than collapsing reasoning into a single block. */
+export type Step =
+  | { id: string; kind: "thinking"; text: string }
+  | { id: string; kind: "tool"; tool: ToolEvent };
+
+/** A rendered chat turn. The assistant turn additionally carries its ordered
+ *  reasoning/tool `steps` chain plus the streamed `content` (the final answer,
+ *  rendered as markdown below the chain). */
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
-  thinking?: string;
-  tools?: ToolEvent[];
+  /** Ordered reasoning/tool chain (assistant turns only). */
+  steps?: Step[];
   streaming?: boolean;
   error?: string;
 }
@@ -47,7 +55,12 @@ export type StreamEvent =
 
 export interface AppConfig {
   model: string;
+  /** Selectable model labels for the dropdown (backend's AGENT_MODELS or a default list). */
+  models?: string[];
   model_source: string;
+  /** Default thinking-effort level, and the selectable set for the dropdown. */
+  effort?: string;
+  efforts?: string[];
   arcade_url: string;
   searxng_url: string;
   log_level: string;

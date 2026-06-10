@@ -1,15 +1,15 @@
 import { useEffect, useState } from "react";
-import { Cpu, Database, RefreshCw, Search, ScrollText } from "lucide-react";
+import { Cpu, Database, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
 import { Markdown } from "@/components/Markdown";
-import type { AppConfig } from "@/types";
 
 function ConfigRow({
   icon: Icon,
@@ -29,12 +29,52 @@ function ConfigRow({
   );
 }
 
-function ConfigCard() {
-  const [config, setConfig] = useState<AppConfig | null>(null);
+/** A config row whose value is an editable dropdown. The active value falls back to the server
+ *  default and is guarded so a stored choice no longer offered still shows (vs. snapping to 0). */
+function SelectRow({
+  icon: Icon,
+  label,
+  value,
+  fallback,
+  options,
+  onChange,
+  selectClassName,
+  title,
+}: {
+  icon: typeof Cpu;
+  label: string;
+  value: string;
+  fallback: string;
+  options: string[];
+  onChange: (value: string) => void;
+  selectClassName?: string;
+  title: string;
+}) {
+  const current = value || fallback;
+  const all = current && !options.includes(current) ? [current, ...options] : options;
 
-  useEffect(() => {
-    api.getConfig().then(setConfig).catch((e) => console.error("config", e));
-  }, []);
+  return (
+    <div className="flex items-start gap-2 text-xs">
+      <Icon className="mt-1.5 size-3.5 shrink-0 text-muted-foreground" />
+      <span className="w-16 shrink-0 pt-1.5 text-muted-foreground">{label}</span>
+      <Select
+        value={current}
+        onChange={(e) => onChange(e.target.value)}
+        className={selectClassName}
+        title={title}
+      >
+        {all.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
+      </Select>
+    </div>
+  );
+}
+
+function ConfigCard() {
+  const { config, model, setModel, effort, setEffort } = useApp();
 
   return (
     <Card>
@@ -44,7 +84,26 @@ function ConfigCard() {
       <CardContent className="space-y-2">
         {config ? (
           <>
-            <ConfigRow icon={Cpu} label="Model" value={config.model} />
+            <SelectRow
+              icon={Cpu}
+              label="Model"
+              value={model}
+              fallback={config.model}
+              options={config.models?.length ? config.models : [config.model]}
+              onChange={setModel}
+              selectClassName="font-mono"
+              title="Model used for new messages"
+            />
+            <SelectRow
+              icon={Zap}
+              label="Effort"
+              value={effort}
+              fallback={config.effort ?? ""}
+              options={config.efforts ?? []}
+              onChange={setEffort}
+              selectClassName="capitalize"
+              title="Thinking effort for new messages"
+            />
             <ConfigRow icon={Database} label="ArcadeDB" value={config.arcade_url} />
             <ConfigRow icon={Search} label="Search" value={config.searxng_url} />
             <ConfigRow icon={ScrollText} label="Logs" value={config.log_level} />

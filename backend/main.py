@@ -32,7 +32,7 @@ from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.embeddings import Embedder
-from backend.model_selection import select_model
+from backend.model_selection import resolve_model
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
 from backend.skills.search_capability import build_search
@@ -40,19 +40,29 @@ from backend.web.client import WebClient
 
 logger = logging.getLogger("agent_graph.main")
 
+# Selectable thinking-effort levels for the UI (the named subset of Pydantic AI's ThinkingLevel).
+# DEFAULT_EFFORT matches the original hardcoded value, so an unset/invalid request is unchanged.
+THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+DEFAULT_EFFORT = "minimal"
 
-def build_agent() -> Agent[GraphDependencies, str]:
+
+def build_agent(model: str | None = None, effort: str | None = None) -> Agent[GraphDependencies, str]:
     """Construct the agent.
 
-    Model selection via env: set ``AGENT_MODEL`` to any Pydantic AI model string
-    (e.g. ``openai:gpt-5.2``). If unset, a local Ollama model named by
-    ``OLLAMA_MODEL`` is used (mirrors the original notebook prototype).
+    ``model`` is an optional explicit model label (from the UI dropdown) — see
+    :func:`backend.model_selection.resolve_model`. When omitted, model selection falls back to
+    env: ``AGENT_MODEL`` (any Pydantic AI model string, e.g. ``openai:gpt-5.2``), else a local
+    Ollama model named by ``OLLAMA_MODEL`` (mirrors the original notebook prototype).
+
+    ``effort`` is an optional thinking-effort level (one of :data:`THINKING_EFFORTS`); an unknown
+    or missing value falls back to :data:`DEFAULT_EFFORT`.
     """
+    effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     return Agent(
-        select_model("AGENT_MODEL"),
+        resolve_model(model),
         deps_type=GraphDependencies,
         capabilities=[
-            Thinking(effort="minimal"),
+            Thinking(effort=effort),
             *build_memory(),
             *build_ontology(),
             *build_search(),
@@ -94,7 +104,11 @@ def _jsonable(value: Any) -> Any:
 
 
 async def stream_run(
-    prompt: str, user_id: str = "default", conversation_id: str = "default"
+    prompt: str,
+    user_id: str = "default",
+    conversation_id: str = "default",
+    model: str | None = None,
+    effort: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one turn and yield structured events as they stream from the model.
 
@@ -108,7 +122,7 @@ async def stream_run(
     - ``{"type": "tool_result", "tool_name", "tool_call_id", "content"}`` — its return
     - ``{"type": "final", "text": str}`` — the fully assembled answer (always emitted last)
     """
-    agent = build_agent()
+    agent = build_agent(model, effort)
     # Each user gets their own database, so no user's data can surface in another
     # user's queries. The database is created on first use.
     async with (
