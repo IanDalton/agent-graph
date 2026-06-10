@@ -4,6 +4,11 @@ This is the single source of truth for all database access: both the agent
 tools (in ``backend.skills.graph_capability``) and the automatic persistence
 hooks call into these functions. All statements are parameterized ArcadeDB SQL
 and scoped by ``user_id`` so each user's memory stays isolated.
+
+Conversation history is stored in two parallel records: ``Message`` vertices keep
+human-readable role/content text for substring search, while ``RunMessages``
+vertices keep each run's serialized Pydantic AI messages (tool calls + returns
+included) so a later turn can be replayed *faithfully* — see ``append_run_messages``.
 """
 
 from __future__ import annotations
@@ -129,6 +134,46 @@ async def search_messages(
     )
 
 
+async def append_run_messages(db: ArcadeClient, conversation_id: str, raw: str) -> None:
+    """Persist one run's serialized Pydantic AI messages for *faithful* replay.
+
+    ``raw`` is ``AgentRunResult.new_messages_json()`` (the run's delta: prompt, the assistant's
+    text AND its tool calls, plus the tool returns). Stored verbatim so the next turn can rebuild
+    the conversation with tool calls/results intact — unlike the human-readable ``Message`` vertices
+    (which keep only role/content text for ``search_messages``/``get_recent_messages``). The two
+    records serve different consumers and are written side by side.
+    """
+    run_id = _new_id()
+    await db.command(
+        "CREATE VERTEX RunMessages SET run_id = :rid, conversation_id = :cid, raw = :raw, created_at = :ts",
+        {"rid": run_id, "cid": conversation_id, "raw": raw, "ts": _now()},
+    )
+    await db.command(
+        "CREATE EDGE HAS_RUN_MESSAGES "
+        "FROM (SELECT FROM Conversation WHERE conversation_id = :cid) "
+        "TO (SELECT FROM RunMessages WHERE run_id = :rid)",
+        {"cid": conversation_id, "rid": run_id},
+    )
+
+
+async def get_run_history(
+    db: ArcadeClient,
+    conversation_id: str,
+    limit: int = 40,
+) -> list[dict[str, Any]]:
+    """Return the most recent runs' serialized message blobs, in chronological order.
+
+    Each row's ``raw`` is one run's ``new_messages_json()``; concatenating them (oldest first)
+    reconstructs the full faithful message history. ``limit`` bounds the number of *runs* loaded.
+    """
+    rows = await db.query(
+        "SELECT raw, created_at FROM RunMessages "
+        "WHERE conversation_id = :cid ORDER BY created_at DESC LIMIT :limit",
+        {"cid": conversation_id, "limit": limit},
+    )
+    return list(reversed(rows))
+
+
 async def store_fact(db: ArcadeClient, user_id: str, text: str) -> None:
     """Store a durable fact about the user and link it to the User vertex."""
     fact_id = _new_id()
@@ -188,6 +233,49 @@ async def vertex_type_exists(db: ArcadeClient, type_name: str) -> bool:
     """True if a type named ``type_name`` already exists in this database's schema."""
     rows = await db.query("SELECT FROM schema:types")
     return any(r.get("name") == type_name for r in rows)
+
+
+async def type_category(db: ArcadeClient, type_name: str) -> str | None:
+    """Return ``'vertex'``/``'edge'`` for ``type_name``, or ``None`` if no such type exists.
+
+    Lets a drop be routed to the right cleanup (DELETE VERTEX vs DELETE … UNSAFE) and prevents
+    dropping a vertex type with the edge tool (or vice versa). ``schema:types`` carries the
+    discriminator in its ``type`` field.
+    """
+    rows = await db.query("SELECT FROM schema:types")
+    for row in rows:
+        if row.get("name") == type_name:
+            return row.get("type")
+    return None
+
+
+async def drop_vertex_type(db: ArcadeClient, type_name: str) -> int:
+    """Delete every instance of a vertex type (cleaning their edges), then drop the type itself.
+
+    Returns the number of instances removed. ``type_name`` is interpolated (DDL can't bind
+    identifiers), so callers MUST pass a value already validated by ``DropVertexTypeArgs`` and
+    confirmed to be a vertex type. ``DELETE VERTEX`` removes connected edges, so no dangling
+    references survive; ``DROP TYPE`` then succeeds (it refuses a non-empty type).
+    """
+    deleted = await db.command(f"DELETE VERTEX FROM {type_name}")
+    count = _affected(deleted)
+    await db.command(f"DROP TYPE {type_name} IF EXISTS")
+    return count
+
+
+async def drop_edge_type(db: ArcadeClient, type_name: str) -> int:
+    """Delete every edge of an edge type, then drop the type itself. Returns the number removed.
+
+    ``type_name`` is interpolated, so callers MUST pass a value validated by ``DropEdgeTypeArgs`` and
+    confirmed to be an *edge* type — ``DELETE … UNSAFE`` on a vertex type would strip records without
+    cleaning adjacency. On edges, ``UNSAFE`` is required to delete the records and (verified against
+    ArcadeDB) does update the endpoints' adjacency, so no dangling references survive; ``DROP TYPE``
+    then succeeds.
+    """
+    deleted = await db.command(f"DELETE FROM {type_name} UNSAFE")
+    count = _affected(deleted)
+    await db.command(f"DROP TYPE {type_name} IF EXISTS")
+    return count
 
 
 async def list_vertex_types(db: ArcadeClient) -> list[dict[str, Any]]:

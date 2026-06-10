@@ -36,7 +36,14 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `create_edge_type`, `node_type`/`node_exists` (tolerant: a bad rid → `None`/`False`, never raises),
   `create_edge`, `update_node`/`delete_node` (revise/remove an instance by rid, user-scoped; delete
   cleans edges via `DELETE VERTEX FROM (SELECT …)`). `search_facts` returns `fact_id`.
+  **Faithful replay:** `append_run_messages`/`get_run_history` store each run's serialized Pydantic
+  AI messages (via `new_messages_json()`) as `RunMessages` vertices — tool calls AND their returns
+  included — *separately* from the human-readable `Message` vertices. `Message` rows keep role/content
+  text for `search_messages`/`get_recent_messages`; `RunMessages` blobs are what `main.run()` reloads
+  into `message_history` so the agent sees the tool work it actually did (not just its text claims)
+  and stops re-doubting/redoing completed work.
   Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
+  `Conversation -HAS_RUN_MESSAGES-> RunMessages`,
   `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
   plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
@@ -47,10 +54,20 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   - a `Capability` with tools `search_memory` (returns each fact's `fact_id`),
     `get_conversation_history`, `store_fact`, `update_fact`/`delete_fact` (revise/remove a fact in
     place to avoid duplicates), and a **read-only** `run_query` escape hatch (guarded by
-    `is_read_only()` + the idempotent endpoint). Its instructions keep the CRITICAL RULE: *check
+    `is_read_only()` + the idempotent endpoint). `run_query` is *tolerant* and can never abort the
+    run: a query-level error — notably a `SELECT FROM <Type>` (vertex **or** edge) where the type
+    doesn't exist yet, which ArcadeDB answers with **500** + a `SchemaException` instead of an empty
+    result — is returned as an ordinary `no_records` result row (with the DB's `detail` + a `hint`),
+    **not** a `ModelRetry` (the tool's `max_retries` is 1, so retrying a second missing-type query
+    would raise `UnexpectedModelBehavior` and crash the run). Querying a not-yet-created type is the
+    normal "check before create" path and its truthful answer is "there are none"; the model reads
+    the note and proceeds to `list_vertex_types`/create. A genuine transient **503** still propagates.
+    Its instructions keep the CRITICAL RULE: *check
     existing data/schema before creating nodes*, and *update an existing fact rather than duplicating*.
   - a `Hooks` object that auto-persists: `before_run` creates the conversation, `after_run` writes
-    the user + assistant turn, `after_tool_execute` logs each tool call, `run_error` logs failures.
+    both the serialized run messages (`RunMessages`, for faithful replay) and the human-readable
+    user + assistant turn (`Message`, for search), `after_tool_execute` logs each tool call,
+    `run_error` logs failures.
     **All persistence here is best-effort** (`_best_effort`): a DB failure (e.g. a 503 that outlasts
     the client's retries) is logged via the `agent_graph.*` loggers and swallowed, never crashing the
     agent loop. `ArcadeClient._request_with_retry` retries 503s + transport errors with capped
@@ -73,8 +90,10 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
-  and streams events using the `async with agent.run_stream_events(...) as stream:` form (the bare
-  `async for` form is deprecated).
+  loads prior turns into `message_history` via `_to_message_history(repo.get_run_history(...))` (the
+  serialized `RunMessages` blobs deserialized with `ModelMessagesTypeAdapter` — faithful, tool calls
+  included; a corrupt blob is skipped, not fatal), and streams events using the
+  `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
 
 ## Infrastructure (docker-compose.yml)
 

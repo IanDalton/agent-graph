@@ -236,6 +236,44 @@ class EdgeProposal(BaseModel):
     guidance: str = Field(..., description="Next step for the agent (e.g. call create_edge_type).")
 
 
+class DropVertexTypeArgs(BaseModel):
+    """Permanently drop a vertex TYPE and all of its instances from this user's database."""
+
+    node_name: str = Field(
+        ...,
+        description=(
+            "The PascalCase vertex type to drop (e.g. 'SoftwareFramework'). This DELETES the type "
+            "AND every instance of it (and those instances' edges). Internal types cannot be dropped."
+        ),
+    )
+
+    @field_validator("node_name")
+    @classmethod
+    def _pascal_case(cls, v: str) -> str:
+        if not _PASCAL_CASE_RE.match(v):
+            raise ValueError("node_name must be PascalCase and alphanumeric (e.g. 'SoftwareFramework').")
+        return v
+
+
+class DropEdgeTypeArgs(BaseModel):
+    """Permanently drop an edge (relationship) TYPE and all of its edges from this user's database."""
+
+    edge_name: str = Field(
+        ...,
+        description=(
+            "The UPPER_SNAKE_CASE edge type to drop (e.g. 'WORKS_AT'). This DELETES the type AND every "
+            "edge of it (the connected nodes are kept). Internal relationship types cannot be dropped."
+        ),
+    )
+
+    @field_validator("edge_name")
+    @classmethod
+    def _upper_snake(cls, v: str) -> str:
+        if not _EDGE_NAME_RE.match(v):
+            raise ValueError("edge_name must be UPPER_SNAKE_CASE (e.g. 'WORKS_AT').")
+        return v
+
+
 class CreateEdgeArgs(BaseModel):
     """Create a relationship (edge) between two existing instance nodes, identified by record id."""
 

@@ -18,14 +18,12 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
     ModelMessage,
-    ModelRequest,
-    ModelResponse,
+    ModelMessagesTypeAdapter,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
     TextPartDelta,
     ThinkingPartDelta,
-    UserPromptPart,
 )
 
 from backend.db import repository as repo
@@ -33,6 +31,8 @@ from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
+
+logger = logging.getLogger("agent_graph.main")
 
 
 def build_agent() -> Agent[GraphDependencies, str]:
@@ -58,20 +58,24 @@ def build_agent() -> Agent[GraphDependencies, str]:
 
 
 def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
-    """Rebuild Pydantic AI message history from stored ``role``/``content`` rows.
+    """Rebuild Pydantic AI message history from stored per-run serialized blobs.
 
-    Each prior user turn becomes a ``ModelRequest`` and each assistant turn a
-    ``ModelResponse`` so the model sees the conversation it already had. Passing
-    these as ``message_history`` is what makes the agent retain context across
-    runs; ``instructions`` are always re-applied regardless of history.
+    Each row's ``raw`` is one run's ``new_messages_json()`` (see
+    :func:`repo.append_run_messages`); deserializing and concatenating them oldest-first
+    reconstructs the conversation *faithfully* — tool calls and their returns included — so the
+    model sees what it actually did, not just its own text. This is what stops the agent
+    re-doubting/redoing tool work it already completed. ``instructions`` are re-applied each run
+    regardless of history. A corrupt blob is skipped rather than failing the whole run.
     """
     history: list[ModelMessage] = []
     for row in rows:
-        content = row.get("content", "")
-        if row.get("role") == "user":
-            history.append(ModelRequest(parts=[UserPromptPart(content=content)]))
-        elif row.get("role") == "assistant":
-            history.append(ModelResponse(parts=[TextPart(content=content)]))
+        raw = row.get("raw")
+        if not raw:
+            continue
+        try:
+            history.extend(ModelMessagesTypeAdapter.validate_json(raw))
+        except Exception:  # noqa: BLE001 — a single bad blob must not blind the agent to the rest.
+            logger.warning("skipping unparseable run-message blob", exc_info=True)
     return history
 
 
@@ -86,10 +90,12 @@ async def run(prompt: str, user_id: str = "default", conversation_id: str = "def
         deps = GraphDependencies(db=db, user_id=user_id, conversation_id=conversation_id)
 
         # Load the prior turns of this thread so the agent retains context. The
-        # persistence hooks store each turn but never reload it, so without this
-        # the model starts every run blind to the conversation. after_run persists
-        # only the current run's new_messages(), so reloaded history isn't re-written.
-        history = _to_message_history(await repo.get_recent_messages(db, conversation_id))
+        # persistence hooks store each run but never reload it, so without this
+        # the model starts every run blind to the conversation. We load the faithful
+        # per-run blobs (tool calls + returns), not the lossy role/content text, so the
+        # agent sees the tool work it already did. after_run persists only the current
+        # run's new_messages(), so reloaded history isn't re-written.
+        history = _to_message_history(await repo.get_run_history(db, conversation_id))
 
         final_text = ""
         async with agent.run_stream_events(prompt, deps=deps, message_history=history) as stream:

@@ -12,10 +12,12 @@ All DB access goes through :mod:`backend.db.repository`.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable
 from typing import Any
 
+import httpx
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.capabilities import Capability, Hooks
@@ -66,6 +68,19 @@ def is_read_only(query: str) -> bool:
     if not stripped:
         return False
     return stripped.split(None, 1)[0].upper() in _READ_ONLY_PREFIXES
+
+
+def _arcade_error_detail(exc: httpx.HTTPStatusError) -> str:
+    """Pull ArcadeDB's human-readable ``detail`` out of an error response, falling back to the text.
+
+    ArcadeDB returns ``{"error": ..., "detail": ..., "exception": ...}`` on a failed statement;
+    e.g. querying a type that doesn't exist yet gives detail "Type with name 'X' was not found".
+    """
+    try:
+        body = exc.response.json()
+        return body.get("detail") or body.get("error") or exc.response.text
+    except (json.JSONDecodeError, ValueError):
+        return exc.response.text or str(exc)
 
 
 def _text(content: Any) -> str:
@@ -151,7 +166,32 @@ async def run_query(ctx: RunContext[GraphDependencies], query_data: RawQuery) ->
             f"Only read-only queries are permitted (must start with one of {_READ_ONLY_PREFIXES})."
         )
     # The query endpoint is idempotent and rejects mutations at the server, too.
-    return await ctx.deps.db.query(query_data.query)
+    try:
+        return await ctx.deps.db.query(query_data.query)
+    except httpx.HTTPStatusError as exc:
+        # A 503 is a genuine transient outage (already retried by the client) — let it surface.
+        if exc.response.status_code == 503:
+            raise
+        # Any other status is a query-level problem — most commonly a SELECT against a type that
+        # doesn't exist yet, which ArcadeDB answers with 500 + a SchemaException rather than an empty
+        # result. This is NOT a model mistake to retry: querying a not-yet-created type is the normal
+        # "check before create" path, and a legitimate negative result is "there are no such records".
+        # Return that as an ordinary result (NOT ModelRetry — run_query's max_retries is 1, so a second
+        # such error would raise UnexpectedModelBehavior and crash the run). The escape hatch must never
+        # be able to abort the run; the model reads the note and adapts (create the type, fix the query).
+        detail = _arcade_error_detail(exc)
+        logger.info("run_query non-fatal error (returning as result): %s", detail)
+        return [
+            {
+                "result": "no_records",
+                "detail": f"Query did not run: {detail}",
+                "hint": (
+                    "A type/class that does not exist yet has no records. Call list_vertex_types to "
+                    "see what exists; create the type (propose_schema_change → create_vertex_type, or "
+                    "propose_edge_type → create_edge_type for relationships) before creating instances."
+                ),
+            }
+        ]
 
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +212,14 @@ async def _ensure_conversation(ctx: RunContext[GraphDependencies]) -> None:
 @persistence_hooks.on.after_run
 async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunResult[Any]) -> AgentRunResult[Any]:
     deps = ctx.deps
+    # Faithful replay record: the run's full serialized messages (tool calls + returns included),
+    # so the next turn sees what the agent actually *did*, not just its text claims. main.run()
+    # reloads these via repo.get_run_history; without it the model re-doubts completed tool work.
+    await _best_effort(
+        repo.append_run_messages(deps.db, deps.conversation_id, result.new_messages_json().decode()),
+        what="append_run_messages",
+    )
+    # Human-readable, searchable mirror: role/content text for search_memory / get_conversation_history.
     for message in result.new_messages():
         for part in message.parts:
             if isinstance(part, UserPromptPart):

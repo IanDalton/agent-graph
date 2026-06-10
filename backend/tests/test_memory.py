@@ -95,6 +95,38 @@ def test_hooks_persist_turn() -> None:
     assert sum(1 for sql, _ in db.commands if sql.startswith("CREATE VERTEX Conversation")) == 1
 
 
+def test_run_messages_blob_round_trips_tool_calls() -> None:
+    """Regression: replayed history must carry tool calls + returns, not just text.
+
+    The agent used to re-doubt completed tool work because only role/content text was replayed.
+    after_run now also persists the run's serialized messages; _to_message_history must rebuild
+    them faithfully, ToolCallPart included.
+    """
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+    from backend.main import _to_message_history
+
+    # TestModel calls the named tool once, producing a ToolCallPart + tool return in the run.
+    model = TestModel(call_tools=["get_conversation_history"])
+    agent = _make_agent(model)
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    asyncio.run(agent.run("hi", deps=deps))
+
+    blobs = [p["raw"] for sql, p in db.commands if sql.startswith("CREATE VERTEX RunMessages")]
+    assert blobs, "after_run must persist a RunMessages blob"
+
+    history = _to_message_history([{"raw": blobs[0]}])
+    tool_calls = [
+        part
+        for msg in history
+        if isinstance(msg, ModelResponse)
+        for part in msg.parts
+        if isinstance(part, ToolCallPart)
+    ]
+    assert any(tc.tool_name == "get_conversation_history" for tc in tool_calls)
+
+
 def test_persistence_failure_does_not_crash_the_run() -> None:
     """A DB write failure in the persistence hooks must be swallowed, not crash the agent loop."""
     model = TestModel(call_tools=[])
@@ -185,6 +217,57 @@ def test_post_raises_after_exhausting_retries() -> None:
 def _ctx(deps: GraphDependencies) -> RunContext[GraphDependencies]:
     """Minimal RunContext for invoking memory tool coroutines directly in unit tests."""
     return RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+
+
+def _http_error(status: int, body: bytes) -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", "http://localhost:2480/api/v1/query/db")
+    resp = httpx.Response(status, content=body, request=req)
+    return httpx.HTTPStatusError(f"{status}", request=req, response=resp)
+
+
+class _QueryRaisingClient(RecordingClient):
+    """RecordingClient whose query() raises a preset HTTPStatusError (simulates a DB query error)."""
+
+    def __init__(self, error: httpx.HTTPStatusError) -> None:
+        super().__init__()
+        self._error = error
+
+    async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        raise self._error
+
+
+def test_run_query_missing_type_returns_no_records_not_retry() -> None:
+    """A SELECT against a not-yet-created type (ArcadeDB 500 SchemaException) must come back as a
+    graceful 'no records' result, NOT a ModelRetry — run_query has max_retries=1, so retrying would
+    crash the run with UnexpectedModelBehavior on the second such error. Querying a missing type is
+    the normal 'check before create' path, and the truthful answer is 'there are none'."""
+    from backend.schemas.graph_schemas import RawQuery
+    from backend.skills.graph_capability import run_query
+
+    body = (
+        b'{"error":"Error on transaction commit",'
+        b'"detail":"Type with name \'Company\' was not found",'
+        b'"exception":"com.arcadedb.exception.SchemaException"}'
+    )
+    deps = GraphDependencies(db=_QueryRaisingClient(_http_error(500, body)), user_id="u", conversation_id="c")
+    result = asyncio.run(
+        run_query(_ctx(deps), RawQuery(query="SELECT FROM Company WHERE name = 'DoorLink'", rationale="check existence"))
+    )
+    # A normal result the model can read, not an exception.
+    assert isinstance(result, list) and len(result) == 1
+    assert result[0]["result"] == "no_records"
+    assert "Company" in result[0]["detail"]  # the DB's detail is surfaced
+    assert "list_vertex_types" in result[0]["hint"]
+
+
+def test_run_query_transient_503_propagates() -> None:
+    """A 503 is a genuine outage the model can't fix; it must surface, not turn into a ModelRetry."""
+    from backend.schemas.graph_schemas import RawQuery
+    from backend.skills.graph_capability import run_query
+
+    deps = GraphDependencies(db=_QueryRaisingClient(_http_error(503, b"")), user_id="u", conversation_id="c")
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(run_query(_ctx(deps), RawQuery(query="SELECT FROM Message", rationale="read")))
 
 
 def test_update_fact_revises_in_place() -> None:

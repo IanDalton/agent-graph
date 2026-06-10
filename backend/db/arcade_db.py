@@ -197,11 +197,15 @@ class ArcadeClient:
             "CREATE VERTEX TYPE User IF NOT EXISTS",
             "CREATE VERTEX TYPE Conversation IF NOT EXISTS",
             "CREATE VERTEX TYPE Message IF NOT EXISTS",
+            # One vertex per run: the serialized Pydantic AI messages (tool calls + returns
+            # included) for faithful conversation replay. See repository.append_run_messages.
+            "CREATE VERTEX TYPE RunMessages IF NOT EXISTS",
             "CREATE VERTEX TYPE Fact IF NOT EXISTS",
             "CREATE VERTEX TYPE LogEntry IF NOT EXISTS",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
+            "CREATE EDGE TYPE HAS_RUN_MESSAGES IF NOT EXISTS",
             "CREATE EDGE TYPE KNOWS IF NOT EXISTS",
             "CREATE EDGE TYPE LOGGED IF NOT EXISTS",
             # Links the User to agent-created instance nodes (see repository.create_node).
@@ -213,6 +217,10 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Conversation (conversation_id) UNIQUE",
             "CREATE PROPERTY Message.message_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (message_id) UNIQUE",
+            "CREATE PROPERTY RunMessages.run_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON RunMessages (run_id) UNIQUE",
+            "CREATE PROPERTY RunMessages.conversation_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON RunMessages (conversation_id) NOTUNIQUE",
             "CREATE PROPERTY Fact.fact_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Fact (fact_id) UNIQUE",
             "CREATE PROPERTY LogEntry.log_id IF NOT EXISTS STRING",
