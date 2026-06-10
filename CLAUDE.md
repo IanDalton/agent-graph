@@ -16,11 +16,17 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 
 - **`backend/db/arcade_db.py`** — `ArcadeClient`: async `httpx` wrapper over ArcadeDB's HTTP API.
   `command()` → `POST /api/v1/command/{db}` (writes/DDL); `query()` → `POST /api/v1/query/{db}`
-  (idempotent reads). `ensure_schema()` creates the vertex/edge types + indexes idempotently.
-  Connection comes from env (`ARCADE_URL`/`ARCADE_DATABASE`/`ARCADE_USER`/`ARCADE_PASSWORD`)
-  with docker-compose defaults.
+  (idempotent reads). `ensure_schema()` creates the vertex/edge types + indexes idempotently;
+  `ensure_database()` creates the database itself if missing (via `POST /api/v1/server`
+  `create database`, root only). **Per-user isolation:** `database_name_for_user(user_id)` maps
+  each user to their own database (`{ARCADE_DATABASE}_{sanitized}_{hash}`, e.g.
+  `AgentMemory_u1_3f2a1b9c`) so one user's data can never appear in another user's queries.
+  `ARCADE_DATABASE` is the *base/prefix*, not a literal database. Connection comes from env
+  (`ARCADE_URL`/`ARCADE_DATABASE`/`ARCADE_USER`/`ARCADE_PASSWORD`) with docker-compose defaults.
 - **`backend/db/dependencies.py`** — `GraphDependencies(db, user_id, conversation_id)`, injected via
-  `deps_type`. `user_id` isolates each user's memory; `conversation_id` scopes the current thread.
+  `deps_type`. The per-user database (carried by `db`) is the real isolation boundary;
+  `user_id` still keys the `User`/`Fact` vertices and survives in `WHERE` filters as
+  defense-in-depth. `conversation_id` scopes the current thread.
 - **`backend/db/repository.py`** — the only place that runs SQL: `create_conversation`,
   `append_message`, `get_recent_messages`, `search_messages`, `store_fact`, `search_facts`,
   `write_log`. Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
@@ -34,15 +40,19 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   - a `Hooks` object that auto-persists: `before_run` creates the conversation, `after_run` writes
     the user + assistant turn, `after_tool_execute` logs each tool call, `run_error` logs failures.
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
-  `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that streams events using the
-  `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
+  `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
+  the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
+  and streams events using the `async with agent.run_stream_events(...) as stream:` form (the bare
+  `async for` form is deprecated).
 
 ## Infrastructure (docker-compose.yml)
 
-- **arcadedb** (`agent_memory_db`) — graph DB. HTTP API on `:2480`, binary on `:2424`. Database
-  `AgentMemory`. Server superuser `root` / password `playwithdata`; the per-database `admin` user
-  (from `defaultDatabases`) **cannot alter the schema**, so `ArcadeClient` defaults to `root`.
-  Data persisted in the `arcadedb_data` volume.
+- **arcadedb** (`agent_memory_db`) — graph DB. HTTP API on `:2480`, binary on `:2424`. The compose
+  `defaultDatabases=AgentMemory` only seeds the base/template database; the real per-user databases
+  (`AgentMemory_<user>_<hash>`) are created on demand by `ensure_database()`. Server superuser `root`
+  / password `playwithdata`; the per-database `admin` user (from `defaultDatabases`) **cannot alter
+  the schema or create databases**, so `ArcadeClient` defaults to `root`. Data persisted in the
+  `arcadedb_data` volume.
 - **searxng** — web search at `http://localhost:8085`. Expects config in `./docker/searxng` (this
   directory does not exist yet and must be created before the service is useful).
 

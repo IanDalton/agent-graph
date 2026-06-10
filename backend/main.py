@@ -10,18 +10,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
     TextPartDelta,
     ThinkingPartDelta,
+    UserPromptPart,
 )
 
-from backend.db.arcade_db import ArcadeClient
+from backend.db import repository as repo
+from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.skills.graph_capability import build_memory
 
@@ -48,15 +54,42 @@ def build_agent() -> Agent[GraphDependencies, str]:
     )
 
 
+def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
+    """Rebuild Pydantic AI message history from stored ``role``/``content`` rows.
+
+    Each prior user turn becomes a ``ModelRequest`` and each assistant turn a
+    ``ModelResponse`` so the model sees the conversation it already had. Passing
+    these as ``message_history`` is what makes the agent retain context across
+    runs; ``instructions`` are always re-applied regardless of history.
+    """
+    history: list[ModelMessage] = []
+    for row in rows:
+        content = row.get("content", "")
+        if row.get("role") == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+        elif row.get("role") == "assistant":
+            history.append(ModelResponse(parts=[TextPart(content=content)]))
+    return history
+
+
 async def run(prompt: str, user_id: str = "default", conversation_id: str = "default") -> str:
     """Run one turn, streaming thinking/text to stdout, and return the final output."""
     agent = build_agent()
-    async with ArcadeClient() as db:
+    # Each user gets their own database, so no user's data can surface in another
+    # user's queries. The database is created on first use.
+    async with ArcadeClient(database=database_name_for_user(user_id)) as db:
+        await db.ensure_database()
         await db.ensure_schema()
         deps = GraphDependencies(db=db, user_id=user_id, conversation_id=conversation_id)
 
+        # Load the prior turns of this thread so the agent retains context. The
+        # persistence hooks store each turn but never reload it, so without this
+        # the model starts every run blind to the conversation. after_run persists
+        # only the current run's new_messages(), so reloaded history isn't re-written.
+        history = _to_message_history(await repo.get_recent_messages(db, conversation_id))
+
         final_text = ""
-        async with agent.run_stream_events(prompt, deps=deps) as stream:
+        async with agent.run_stream_events(prompt, deps=deps, message_history=history) as stream:
             async for event in stream:
                 if isinstance(event, PartStartEvent):
                     event = event.part
