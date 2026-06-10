@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+import sys
 from typing import Any
 
 from pydantic_ai import Agent
@@ -30,6 +32,7 @@ from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.skills.graph_capability import build_memory
+from backend.skills.ontology_capability import build_ontology
 
 
 def build_agent() -> Agent[GraphDependencies, str]:
@@ -50,7 +53,7 @@ def build_agent() -> Agent[GraphDependencies, str]:
     return Agent(
         model,
         deps_type=GraphDependencies,
-        capabilities=[Thinking(effort="minimal"), *build_memory()],
+        capabilities=[Thinking(effort="minimal"), *build_memory(), *build_ontology()],
     )
 
 
@@ -107,13 +110,32 @@ async def run(prompt: str, user_id: str = "default", conversation_id: str = "def
         return final_text
 
 
+def _configure_logging() -> None:
+    """Send application logs to stderr. Level via ``LOG_LEVEL`` (default INFO).
+
+    Persistence failures, DB retries and run errors are emitted under the ``agent_graph.*``
+    loggers, so a database hiccup shows up as a clear log line instead of a raw traceback.
+    """
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+
 def main() -> None:
+    _configure_logging()
     parser = argparse.ArgumentParser(description="Run one turn of the conversation-memory agent.")
     parser.add_argument("prompt")
     parser.add_argument("--user", default="default")
     parser.add_argument("--conversation", default="default")
     args = parser.parse_args()
-    asyncio.run(run(args.prompt, user_id=args.user, conversation_id=args.conversation))
+    try:
+        asyncio.run(run(args.prompt, user_id=args.user, conversation_id=args.conversation))
+    except Exception as exc:  # noqa: BLE001 — CLI boundary: log cleanly instead of dumping a traceback.
+        logging.getLogger("agent_graph").error("Agent run failed: %s: %s", type(exc).__name__, exc)
+        logging.getLogger("agent_graph").debug("Full traceback:", exc_info=exc)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

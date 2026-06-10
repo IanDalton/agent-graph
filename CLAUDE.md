@@ -23,22 +23,53 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `AgentMemory_u1_3f2a1b9c`) so one user's data can never appear in another user's queries.
   `ARCADE_DATABASE` is the *base/prefix*, not a literal database. Connection comes from env
   (`ARCADE_URL`/`ARCADE_DATABASE`/`ARCADE_USER`/`ARCADE_PASSWORD`) with docker-compose defaults.
-- **`backend/db/dependencies.py`** — `GraphDependencies(db, user_id, conversation_id)`, injected via
-  `deps_type`. The per-user database (carried by `db`) is the real isolation boundary;
+- **`backend/db/dependencies.py`** — `GraphDependencies(db, user_id, conversation_id, proposed_schemas)`,
+  injected via `deps_type`. The per-user database (carried by `db`) is the real isolation boundary;
   `user_id` still keys the `User`/`Fact` vertices and survives in `WHERE` filters as
-  defense-in-depth. `conversation_id` scopes the current thread.
+  defense-in-depth. `conversation_id` scopes the current thread. `proposed_schemas` is run-scoped
+  state (a fresh dict per run) backing the ontology pipeline's ordering guard.
 - **`backend/db/repository.py`** — the only place that runs SQL: `create_conversation`,
   `append_message`, `get_recent_messages`, `search_messages`, `store_fact`, `search_facts`,
-  `write_log`. Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
-  `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`.
+  `write_log`, `update_fact`/`delete_fact` (revise/remove a fact by `fact_id`, user-scoped), plus the
+  ontology DDL/DML: `vertex_type_exists`, `list_vertex_types`,
+  `create_vertex_type` (usage stored as type-level `CUSTOM description`), `create_node`,
+  `create_edge_type`, `node_type`/`node_exists` (tolerant: a bad rid → `None`/`False`, never raises),
+  `create_edge`, `update_node`/`delete_node` (revise/remove an instance by rid, user-scoped; delete
+  cleans edges via `DELETE VERTEX FROM (SELECT …)`). `search_facts` returns `fact_id`.
+  Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
+  `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
+  plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
-  `MemorySearchResult`/`MemoryHit`.
+  `MemorySearchResult`/`MemoryHit`, and the ontology models `VertexProperty`, `ProposeSchemaArgs`,
+  `SchemaProposal`, `VertexTypeInfo`, `CreateNodeArgs` (identifier/type validators here are the
+  DDL-injection boundary, since ArcadeDB can't bind type/property *names* as parameters).
 - **`backend/skills/graph_capability.py`** — the bundle, exposed via `build_memory()`:
-  - a `Capability` with tools `search_memory`, `get_conversation_history`, `store_fact`, and a
-    **read-only** `run_query` escape hatch (guarded by `is_read_only()` + the idempotent endpoint).
-    Its instructions keep the CRITICAL RULE: *check existing data/schema before creating nodes*.
+  - a `Capability` with tools `search_memory` (returns each fact's `fact_id`),
+    `get_conversation_history`, `store_fact`, `update_fact`/`delete_fact` (revise/remove a fact in
+    place to avoid duplicates), and a **read-only** `run_query` escape hatch (guarded by
+    `is_read_only()` + the idempotent endpoint). Its instructions keep the CRITICAL RULE: *check
+    existing data/schema before creating nodes*, and *update an existing fact rather than duplicating*.
   - a `Hooks` object that auto-persists: `before_run` creates the conversation, `after_run` writes
     the user + assistant turn, `after_tool_execute` logs each tool call, `run_error` logs failures.
+    **All persistence here is best-effort** (`_best_effort`): a DB failure (e.g. a 503 that outlasts
+    the client's retries) is logged via the `agent_graph.*` loggers and swallowed, never crashing the
+    agent loop. `ArcadeClient._request_with_retry` retries 503s + transport errors with capped
+    backoff and logs each retry; `main._configure_logging` sends `agent_graph.*` logs to stderr
+    (level via `LOG_LEVEL`).
+- **`backend/skills/ontology_capability.py`** — the `OntologyManager` bundle, exposed via
+  `build_ontology()`: lets the agent grow its own ontology through a guarded pipeline.
+  - a `Capability` with vertex tools `list_vertex_types` (read the current ontology + usage notes),
+    `propose_schema_change` (cognitive layer — validates + records, no DB write),
+    `create_vertex_type` (creates the **type**), `create_node` (creates an **instance** of an
+    existing type, linked to the user via `HAS_NODE`); and the parallel edge tools
+    `propose_edge_type` → `create_edge_type` (UPPER_SNAKE_CASE relationship type) → `create_edge`
+    (connects two existing instances by record id); plus `update_node`/`delete_node` to revise/remove
+    an existing instance by rid (avoids duplicates; guarded so internal types — User, Conversation,
+    Message, Fact, LogEntry — can't be edited here). Flow: list → propose → create_*_type →
+    create_node/create_edge. Instances/edges can only be created for types that already exist.
+  - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
+    `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
+    the same run (uses `proposed_schemas` / `proposed_edges` on the deps).
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,

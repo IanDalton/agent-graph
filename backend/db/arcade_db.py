@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 from typing import Any
@@ -22,6 +23,8 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger("agent_graph.db")
 
 # Defaults mirror docker-compose.yml (arcadedb service).
 DEFAULT_URL = "http://localhost:2480"
@@ -69,6 +72,7 @@ class ArcadeClient:
         timeout: float = 30.0,
         max_retries: int = 5,
         retry_base_delay: float = 0.1,
+        retry_max_delay: float = 5.0,
     ) -> None:
         self.url = (url or os.getenv("ARCADE_URL", DEFAULT_URL)).rstrip("/")
         self.database = database or os.getenv("ARCADE_DATABASE", DEFAULT_DATABASE)
@@ -79,6 +83,7 @@ class ArcadeClient:
         # These are transient, so retry the request with exponential backoff.
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
         self._client = httpx.AsyncClient(
             base_url=self.url,
             auth=(user, password),
@@ -103,15 +108,32 @@ class ArcadeClient:
         # ArcadeDB returns {"result": [...]} for both command and query.
         return resp.json().get("result", [])
 
-    async def _request_with_retry(self, path: str, body: dict[str, Any]) -> httpx.Response:
-        """POST ``body`` to ``path``, retrying transient 503s with exponential backoff.
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff for ``attempt`` (0-based), capped at ``retry_max_delay``."""
+        return min(self.retry_base_delay * (2 ** attempt), self.retry_max_delay)
 
-        503 is the only status ArcadeDB uses for "try again shortly" (overloaded,
-        or a database still opening); every other error is raised immediately.
+    async def _request_with_retry(self, path: str, body: dict[str, Any]) -> httpx.Response:
+        """POST ``body`` to ``path``, retrying transient failures with capped exponential backoff.
+
+        Transient = a 503 (ArcadeDB's "try again shortly": overloaded, or a database still opening)
+        or a connection/read transport error. Every other HTTP status is raised immediately. Each
+        retry and the final give-up are logged so overload is visible instead of silent.
         """
-        last_exc: httpx.HTTPStatusError | None = None
+        last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            resp = await self._client.post(path, json=body)
+            try:
+                resp = await self._client.post(path, json=body)
+            except httpx.TransportError as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "ArcadeDB transport error on %s (attempt %d/%d): %s; retrying",
+                        path, attempt + 1, self.max_retries + 1, exc,
+                    )
+                    await asyncio.sleep(self._backoff(attempt))
+                    continue
+                break
+
             if resp.status_code != 503:
                 resp.raise_for_status()
                 return resp
@@ -119,8 +141,17 @@ class ArcadeClient:
                 f"503 Service Unavailable for {path}", request=resp.request, response=resp
             )
             if attempt < self.max_retries:
-                await asyncio.sleep(self.retry_base_delay * (2 ** attempt))
+                logger.warning(
+                    "ArcadeDB 503 on %s (attempt %d/%d); retrying",
+                    path, attempt + 1, self.max_retries + 1,
+                )
+                await asyncio.sleep(self._backoff(attempt))
+
         assert last_exc is not None  # loop ran at least once
+        logger.error(
+            "ArcadeDB request to %s failed after %d attempt(s): %s",
+            path, self.max_retries + 1, last_exc,
+        )
         raise last_exc
 
     async def _server_command(self, command: str) -> dict[str, Any]:
@@ -173,6 +204,8 @@ class ArcadeClient:
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
             "CREATE EDGE TYPE KNOWS IF NOT EXISTS",
             "CREATE EDGE TYPE LOGGED IF NOT EXISTS",
+            # Links the User to agent-created instance nodes (see repository.create_node).
+            "CREATE EDGE TYPE HAS_NODE IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
             "CREATE PROPERTY User.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON User (user_id) UNIQUE",

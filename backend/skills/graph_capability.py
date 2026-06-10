@@ -12,9 +12,11 @@ All DB access goes through :mod:`backend.db.repository`.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable
 from typing import Any
 
-from pydantic_ai import RunContext
+from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.capabilities import Capability, Hooks
 from pydantic_ai.messages import TextPart, ToolCallPart, UserPromptPart
@@ -28,15 +30,33 @@ from backend.schemas.graph_schemas import (
     StoreFactArgs,
 )
 
+logger = logging.getLogger("agent_graph.persistence")
+
 # Statements the read-only raw-query tool is allowed to start with.
 _READ_ONLY_PREFIXES = ("SELECT", "MATCH", "TRAVERSE")
+
+
+async def _best_effort(awaitable: Awaitable[Any], *, what: str) -> None:
+    """Run a persistence write that must never crash the agent.
+
+    Memory persistence (conversation/message/log writes) is a side effect of a run, not the run's
+    purpose. If ArcadeDB is briefly unavailable (e.g. a 503 that outlasts the client's retries), we
+    log the failure and continue rather than aborting the whole agent loop.
+    """
+    try:
+        await awaitable
+    except Exception:  # noqa: BLE001 — deliberately swallow; persistence is best-effort.
+        logger.warning("persistence step %r failed; continuing without it", what, exc_info=True)
 
 INSTRUCTIONS = (
     "You have access to the user's persistent memory in ArcadeDB. "
     "CRITICAL RULE: before storing new data or creating a node, first query the "
     "database (use search_memory, get_conversation_history, or a read-only run_query) "
     "to check whether the relevant information or schema already exists. "
-    "Use store_fact only for durable facts worth remembering across conversations."
+    "Use store_fact only for durable facts worth remembering across conversations. "
+    "AVOID DUPLICATES: if a fact already exists but is now wrong or incomplete, do NOT store a second "
+    "one — call update_fact with that fact's fact_id (returned by search_memory) to revise it in "
+    "place, or delete_fact to remove a redundant/obsolete one."
 )
 
 
@@ -74,7 +94,12 @@ async def search_memory(ctx: RunContext[GraphDependencies], query: str) -> Memor
         MemoryHit(kind="message", content=m.get("content", ""), created_at=m.get("created_at"))
         for m in messages
     ] + [
-        MemoryHit(kind="fact", content=f.get("text", ""), created_at=f.get("created_at"))
+        MemoryHit(
+            kind="fact",
+            content=f.get("text", ""),
+            created_at=f.get("created_at"),
+            fact_id=f.get("fact_id"),
+        )
         for f in facts
     ]
     return MemorySearchResult(hits=hits)
@@ -88,9 +113,34 @@ async def get_conversation_history(ctx: RunContext[GraphDependencies], limit: in
 
 @memory_capability.tool
 async def store_fact(ctx: RunContext[GraphDependencies], args: StoreFactArgs) -> str:
-    """Remember a durable fact about the user for use in future conversations."""
+    """Remember a durable fact about the user for use in future conversations.
+
+    Search first: if a related fact already exists, prefer update_fact over storing a duplicate.
+    """
     await repo.store_fact(ctx.deps.db, ctx.deps.user_id, args.text)
     return f"Stored fact for user {ctx.deps.user_id}."
+
+
+@memory_capability.tool
+async def update_fact(ctx: RunContext[GraphDependencies], fact_id: str, text: str) -> str:
+    """Revise an existing fact in place (use its fact_id from search_memory) instead of duplicating it."""
+    updated = await repo.update_fact(ctx.deps.db, ctx.deps.user_id, fact_id, text)
+    if not updated:
+        raise ModelRetry(
+            f"No fact with id {fact_id!r} for this user. Use search_memory to find the correct fact_id."
+        )
+    return f"Updated fact {fact_id}."
+
+
+@memory_capability.tool
+async def delete_fact(ctx: RunContext[GraphDependencies], fact_id: str) -> str:
+    """Delete a redundant or obsolete fact by its fact_id (from search_memory)."""
+    deleted = await repo.delete_fact(ctx.deps.db, ctx.deps.user_id, fact_id)
+    if not deleted:
+        raise ModelRetry(
+            f"No fact with id {fact_id!r} for this user. Use search_memory to find the correct fact_id."
+        )
+    return f"Deleted fact {fact_id}."
 
 
 @memory_capability.tool
@@ -113,7 +163,10 @@ persistence_hooks = Hooks()
 @persistence_hooks.on.before_run
 async def _ensure_conversation(ctx: RunContext[GraphDependencies]) -> None:
     deps = ctx.deps
-    await repo.create_conversation(deps.db, deps.user_id, deps.conversation_id)
+    await _best_effort(
+        repo.create_conversation(deps.db, deps.user_id, deps.conversation_id),
+        what="create_conversation",
+    )
 
 
 @persistence_hooks.on.after_run
@@ -122,9 +175,15 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
     for message in result.new_messages():
         for part in message.parts:
             if isinstance(part, UserPromptPart):
-                await repo.append_message(deps.db, deps.user_id, deps.conversation_id, "user", _text(part.content))
+                await _best_effort(
+                    repo.append_message(deps.db, deps.user_id, deps.conversation_id, "user", _text(part.content)),
+                    what="append_user_message",
+                )
             elif isinstance(part, TextPart):
-                await repo.append_message(deps.db, deps.user_id, deps.conversation_id, "assistant", _text(part.content))
+                await _best_effort(
+                    repo.append_message(deps.db, deps.user_id, deps.conversation_id, "assistant", _text(part.content)),
+                    what="append_assistant_message",
+                )
     return result
 
 
@@ -137,24 +196,34 @@ async def _log_tool_call(
     args: Any,
     result: Any,
 ) -> Any:
-    await repo.write_log(
-        ctx.deps.db,
-        ctx.deps.conversation_id,
-        level="info",
-        event="tool_execute",
-        payload={"tool": call.tool_name, "args": call.args, "result": str(result)[:2000]},
+    logger.debug("tool %s executed (args=%s)", call.tool_name, call.args)
+    await _best_effort(
+        repo.write_log(
+            ctx.deps.db,
+            ctx.deps.conversation_id,
+            level="info",
+            event="tool_execute",
+            payload={"tool": call.tool_name, "args": call.args, "result": str(result)[:2000]},
+        ),
+        what="write_log:tool_execute",
     )
     return result
 
 
 @persistence_hooks.on.run_error
 async def _log_error(ctx: RunContext[GraphDependencies], *, error: BaseException) -> AgentRunResult[Any]:
-    await repo.write_log(
-        ctx.deps.db,
-        ctx.deps.conversation_id,
-        level="error",
-        event="run_error",
-        payload={"type": type(error).__name__, "message": str(error)},
+    # Always surface the run error on the application logger (with traceback), independent of
+    # whether the DB write below succeeds.
+    logger.error("agent run error: %s: %s", type(error).__name__, error, exc_info=error)
+    await _best_effort(
+        repo.write_log(
+            ctx.deps.db,
+            ctx.deps.conversation_id,
+            level="error",
+            event="run_error",
+            payload={"type": type(error).__name__, "message": str(error)},
+        ),
+        what="write_log:run_error",
     )
     raise error
 

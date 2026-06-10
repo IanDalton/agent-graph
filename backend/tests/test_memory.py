@@ -12,26 +12,38 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
 from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
-from backend.skills.graph_capability import build_memory
+from backend.skills.graph_capability import build_memory, delete_fact, update_fact
 
-EXPECTED_TOOLS = {"search_memory", "get_conversation_history", "store_fact", "run_query"}
+EXPECTED_TOOLS = {
+    "search_memory",
+    "get_conversation_history",
+    "store_fact",
+    "run_query",
+    "update_fact",
+    "delete_fact",
+}
 
 
 class RecordingClient:
     """Duck-typed stand-in for ArcadeClient that records commands instead of executing them."""
 
-    def __init__(self) -> None:
+    def __init__(self, fact_count: int = 1) -> None:
         self.commands: list[tuple[str, dict[str, Any]]] = []
         self.queries: list[tuple[str, dict[str, Any]]] = []
+        self._fact_count = fact_count  # rows UPDATE/DELETE on Fact should report as affected
 
     async def command(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.commands.append((sql, params or {}))
+        # UPDATE/DELETE report affected rows as [{"count": N}].
+        if sql.strip().upper().startswith(("UPDATE", "DELETE")):
+            return [{"count": self._fact_count}]
         return []
 
     async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -40,6 +52,15 @@ class RecordingClient:
         if "count(" in sql.lower():
             return [{"n": 0}]
         return []
+
+
+class Failing503Client(RecordingClient):
+    """Like RecordingClient, but every write (command) fails with a 503, as during DB overload."""
+
+    async def command(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self.commands.append((sql, params or {}))
+        req = httpx.Request("POST", "http://localhost:2480/api/v1/command/db")
+        raise httpx.HTTPStatusError("503 Service Unavailable", request=req, response=httpx.Response(503, request=req))
 
 
 def _make_agent(model: TestModel) -> Agent:
@@ -72,6 +93,19 @@ def test_hooks_persist_turn() -> None:
     assert "assistant" in roles  # TestModel's reply was persisted
     # The conversation vertex was created exactly once (before_run, idempotent).
     assert sum(1 for sql, _ in db.commands if sql.startswith("CREATE VERTEX Conversation")) == 1
+
+
+def test_persistence_failure_does_not_crash_the_run() -> None:
+    """A DB write failure in the persistence hooks must be swallowed, not crash the agent loop."""
+    model = TestModel(call_tools=[])
+    agent = _make_agent(model)
+    db = Failing503Client()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    # Every command() raises 503; the run must still complete and return the model's output.
+    result = asyncio.run(agent.run("hello", deps=deps))
+    assert result.output
+    # The hooks did attempt the writes (so persistence is best-effort, not skipped).
+    assert db.commands
 
 
 def test_database_name_for_user_is_isolated_and_safe() -> None:
@@ -146,6 +180,38 @@ def test_post_raises_after_exhausting_retries() -> None:
                 await db.command("CREATE VERTEX Fact SET text = 'x'")
 
     asyncio.run(main())
+
+
+def _ctx(deps: GraphDependencies) -> RunContext[GraphDependencies]:
+    """Minimal RunContext for invoking memory tool coroutines directly in unit tests."""
+    return RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+
+
+def test_update_fact_revises_in_place() -> None:
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    msg = asyncio.run(update_fact(_ctx(deps), "fid123", "loves Recoleta"))
+    updates = [(sql, p) for sql, p in db.commands if sql.startswith("UPDATE Fact SET text")]
+    assert updates
+    sql, params = updates[0]
+    assert "WHERE fact_id = :fid AND user_id = :uid" in sql
+    assert params["text"] == "loves Recoleta" and params["fid"] == "fid123" and params["uid"] == "u"
+    assert "Updated fact fid123" in msg
+
+
+def test_update_fact_missing_raises() -> None:
+    db = RecordingClient(fact_count=0)  # nothing matched the fact_id
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    with pytest.raises(ModelRetry):
+        asyncio.run(update_fact(_ctx(deps), "nope", "x"))
+
+
+def test_delete_fact_removes_by_id() -> None:
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    msg = asyncio.run(delete_fact(_ctx(deps), "fid123"))
+    assert any(sql.startswith("DELETE VERTEX FROM (SELECT FROM Fact") for sql, _ in db.commands)
+    assert "Deleted fact fid123" in msg
 
 
 # --------------------------------------------------------------------------- #
