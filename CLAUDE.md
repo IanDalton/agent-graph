@@ -34,8 +34,13 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   ontology DDL/DML: `vertex_type_exists`, `list_vertex_types`,
   `create_vertex_type` (usage stored as type-level `CUSTOM description`), `create_node`,
   `create_edge_type`, `node_type`/`node_exists` (tolerant: a bad rid → `None`/`False`, never raises),
-  `create_edge`, `update_node`/`delete_node` (revise/remove an instance by rid, user-scoped; delete
-  cleans edges via `DELETE VERTEX FROM (SELECT …)`). `search_facts` returns `fact_id`.
+  `type_category` (`'vertex'`/`'edge'`/`None` from `schema:types`), `create_edge`,
+  `update_node`/`delete_node` (revise/remove an instance by rid, user-scoped; delete cleans edges via
+  `DELETE VERTEX FROM (SELECT …)`), and `drop_vertex_type`/`drop_edge_type` (retire a whole type:
+  delete all instances/edges then `DROP TYPE … IF EXISTS` — `DROP TYPE` refuses a non-empty type, so
+  the records go first; vertex types clear via `DELETE VERTEX FROM <T>`, edge types via
+  `DELETE FROM <T> UNSAFE`, which is required to delete edge records and does clean endpoint adjacency).
+  `search_facts` returns `fact_id`.
   **Faithful replay:** `append_run_messages`/`get_run_history` store each run's serialized Pydantic
   AI messages (via `new_messages_json()`) as `RunMessages` vertices — tool calls AND their returns
   included — *separately* from the human-readable `Message` vertices. `Message` rows keep role/content
@@ -81,9 +86,16 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
     existing type, linked to the user via `HAS_NODE`); and the parallel edge tools
     `propose_edge_type` → `create_edge_type` (UPPER_SNAKE_CASE relationship type) → `create_edge`
     (connects two existing instances by record id); plus `update_node`/`delete_node` to revise/remove
-    an existing instance by rid (avoids duplicates; guarded so internal types — User, Conversation,
-    Message, Fact, LogEntry — can't be edited here). Flow: list → propose → create_*_type →
-    create_node/create_edge. Instances/edges can only be created for types that already exist.
+    an existing instance by rid (avoids duplicates), and `delete_vertex_type`/`delete_edge_type` to
+    **retire a whole type** the agent created (drops the type AND all its instances/edges — full
+    schema control). Flow: list → propose → create_*_type → create_node/create_edge.
+    Instances/edges can only be created for types that already exist. The destructive tools require
+    no proposal but are guarded: they validate the identifier, confirm the type exists *and* matches
+    the requested category (`type_category` — so you can't `delete_edge_type` a vertex type, whose
+    `UNSAFE` delete would strip records), and refuse the internal types. `_PROTECTED_VERTEX_TYPES`
+    (User, Conversation, Message, Fact, LogEntry, **RunMessages**) and `_PROTECTED_EDGE_TYPES`
+    (HAS_CONVERSATION, HAS_MESSAGE, HAS_RUN_MESSAGES, KNOWS, LOGGED, HAS_NODE) can never be
+    edited/dropped here; `update_node`/`delete_node` reject the protected *vertex* types too.
   - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
     `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
     the same run (uses `proposed_schemas` / `proposed_edges` on the deps).

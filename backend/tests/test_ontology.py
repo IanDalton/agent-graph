@@ -28,6 +28,7 @@ from backend.schemas.graph_schemas import (
 )
 from backend.skills.graph_capability import build_memory
 from backend.schemas.graph_schemas import UpdateNodeArgs
+from backend.schemas.graph_schemas import DropEdgeTypeArgs, DropVertexTypeArgs
 from backend.skills.ontology_capability import (
     _require_prior_proposal,
     build_ontology,
@@ -35,7 +36,9 @@ from backend.skills.ontology_capability import (
     create_edge_type,
     create_node,
     create_vertex_type,
+    delete_edge_type,
     delete_node,
+    delete_vertex_type,
     list_vertex_types,
     propose_edge_type,
     propose_schema_change,
@@ -52,6 +55,8 @@ ONTOLOGY_TOOLS = {
     "create_edge",
     "update_node",
     "delete_node",
+    "delete_vertex_type",
+    "delete_edge_type",
 }
 
 
@@ -387,6 +392,83 @@ def test_delete_node_removes_existing_instance() -> None:
     msg = asyncio.run(delete_node(_ctx(deps), "#29:0"))
     assert any(sql.startswith("DELETE VERTEX FROM (SELECT FROM #29:0") for sql, _ in db.commands)
     assert "Deleted Person node #29:0" in msg
+
+
+# --------------------------------------------------------------------------- #
+# delete_vertex_type / delete_edge_type (drop a whole type)
+# --------------------------------------------------------------------------- #
+def test_drop_type_args_validation() -> None:
+    DropVertexTypeArgs(node_name="Project")
+    DropEdgeTypeArgs(edge_name="WORKS_ON")
+    for bad in ["lower", "has space", "User;DROP TYPE User", ""]:
+        with pytest.raises(ValidationError):
+            DropVertexTypeArgs(node_name=bad)
+    for bad in ["lower", "Has-Dash", "WORKS ON", ""]:
+        with pytest.raises(ValidationError):
+            DropEdgeTypeArgs(edge_name=bad)
+
+
+def test_delete_vertex_type_drops_instances_then_type() -> None:
+    db = RecordingClient(existing_types=[{"name": "Project", "type": "vertex"}])
+    deps = _deps(db)
+    msg = asyncio.run(delete_vertex_type(_ctx(deps), DropVertexTypeArgs(node_name="Project")))
+    sqls = [sql for sql, _ in db.commands]
+    assert "DELETE VERTEX FROM Project" in sqls
+    assert "DROP TYPE Project IF EXISTS" in sqls
+    # The delete must run before the drop (a non-empty type can't be dropped).
+    assert sqls.index("DELETE VERTEX FROM Project") < sqls.index("DROP TYPE Project IF EXISTS")
+    assert "Dropped vertex type 'Project'" in msg
+
+
+def test_delete_edge_type_drops_edges_then_type() -> None:
+    db = RecordingClient(existing_types=[{"name": "WORKS_ON", "type": "edge"}])
+    deps = _deps(db)
+    msg = asyncio.run(delete_edge_type(_ctx(deps), DropEdgeTypeArgs(edge_name="WORKS_ON")))
+    sqls = [sql for sql, _ in db.commands]
+    assert "DELETE FROM WORKS_ON UNSAFE" in sqls
+    assert "DROP TYPE WORKS_ON IF EXISTS" in sqls
+    assert sqls.index("DELETE FROM WORKS_ON UNSAFE") < sqls.index("DROP TYPE WORKS_ON IF EXISTS")
+    assert "Dropped edge type 'WORKS_ON'" in msg
+
+
+def test_delete_vertex_type_refuses_protected() -> None:
+    # An internal type must never be droppable, even though it exists in the schema.
+    db = RecordingClient(existing_types=[{"name": "Message", "type": "vertex"}])
+    deps = _deps(db)
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_vertex_type(_ctx(deps), DropVertexTypeArgs(node_name="Message")))
+    # RunMessages (replay store) is protected too.
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_vertex_type(_ctx(deps), DropVertexTypeArgs(node_name="RunMessages")))
+    assert not any("DROP TYPE" in sql for sql, _ in db.commands)
+
+
+def test_delete_edge_type_refuses_protected() -> None:
+    db = RecordingClient(existing_types=[{"name": "KNOWS", "type": "edge"}])
+    deps = _deps(db)
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_edge_type(_ctx(deps), DropEdgeTypeArgs(edge_name="KNOWS")))
+    assert not any("DROP TYPE" in sql for sql, _ in db.commands)
+
+
+def test_delete_type_refuses_missing_and_wrong_category() -> None:
+    # Missing type.
+    deps = _deps(RecordingClient(existing_types=[]))
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_vertex_type(_ctx(deps), DropVertexTypeArgs(node_name="Nope")))
+
+    # Calling delete_vertex_type on an EDGE type must be refused (else DELETE VERTEX/wrong cleanup).
+    # (name matches the lookup so this hits the wrong-category branch, not the missing branch.)
+    deps = _deps(RecordingClient(existing_types=[{"name": "Partners", "type": "edge"}]))
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_vertex_type(_ctx(deps), DropVertexTypeArgs(node_name="Partners")))
+    assert not any("DROP TYPE" in sql for sql, _ in deps.db.commands)
+
+    # And delete_edge_type on a VERTEX type must be refused (UNSAFE delete would strip vertices).
+    deps = _deps(RecordingClient(existing_types=[{"name": "PROJECT", "type": "vertex"}]))
+    with pytest.raises(ModelRetry):
+        asyncio.run(delete_edge_type(_ctx(deps), DropEdgeTypeArgs(edge_name="PROJECT")))
+    assert not any("DROP TYPE" in sql for sql, _ in deps.db.commands)
 
 
 # --------------------------------------------------------------------------- #

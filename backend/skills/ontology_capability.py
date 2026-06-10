@@ -27,6 +27,8 @@ from backend.db.dependencies import GraphDependencies
 from backend.schemas.graph_schemas import (
     CreateEdgeArgs,
     CreateNodeArgs,
+    DropEdgeTypeArgs,
+    DropVertexTypeArgs,
     EdgeProposal,
     ProposeEdgeArgs,
     ProposeSchemaArgs,
@@ -35,9 +37,16 @@ from backend.schemas.graph_schemas import (
     VertexTypeInfo,
 )
 
-# Internal types the agent must not edit/delete via the generic node tools; facts have their own
-# dedicated update_fact/delete_fact tools, and conversation/message/log records are managed by hooks.
-_PROTECTED_TYPES = frozenset({"User", "Conversation", "Message", "Fact", "LogEntry"})
+# Internal vertex types the agent must not edit/delete via the generic node/type tools; facts have
+# their own update_fact/delete_fact tools, and conversation/message/log/replay records are managed by
+# hooks. Dropping any of these would break the memory system.
+_PROTECTED_VERTEX_TYPES = frozenset(
+    {"User", "Conversation", "Message", "Fact", "LogEntry", "RunMessages"}
+)
+# Internal edge types that wire the memory graph together — never droppable here.
+_PROTECTED_EDGE_TYPES = frozenset(
+    {"HAS_CONVERSATION", "HAS_MESSAGE", "HAS_RUN_MESSAGES", "KNOWS", "LOGGED", "HAS_NODE"}
+)
 
 ONTOLOGY_INSTRUCTIONS = (
     "You can extend your own memory ontology by creating new vertex (node) TYPES. "
@@ -71,7 +80,13 @@ ONTOLOGY_INSTRUCTIONS = (
     "AVOID DUPLICATES: before creating a node, search for an existing one (run_query, e.g. "
     "`SELECT @rid, name FROM Person WHERE name = 'Alice'`). If it already exists, DON'T create "
     "another — call `update_node` with its @rid to revise its properties, or `delete_node` to remove "
-    "a redundant one."
+    "a redundant one.\n"
+    "RETIRING TYPES (destructive): you have full control of your own schema. To remove a whole "
+    "category you created and no longer need, call `delete_vertex_type` (drops the vertex type AND "
+    "all its instances + their edges) or `delete_edge_type` (drops the relationship type AND all its "
+    "edges, keeping the connected nodes). These are irreversible and operate on the TYPE — to delete "
+    "a single record use delete_node instead. Internal types (User, Conversation, Message, Fact, "
+    "LogEntry, RunMessages, and the HAS_*/KNOWS/LOGGED relationships) are protected and cannot be dropped."
 )
 
 ontology_capability = Capability(id="OntologyManager", instructions=ONTOLOGY_INSTRUCTIONS)
@@ -223,7 +238,7 @@ async def _resolve_editable_node(ctx: RunContext[GraphDependencies], rid: str) -
         raise ModelRetry(
             f"No node found at {rid!r}. Look up a valid record id with run_query (SELECT @rid ...)."
         )
-    if node_type in _PROTECTED_TYPES:
+    if node_type in _PROTECTED_VERTEX_TYPES:
         raise ModelRetry(
             f"{rid!r} is an internal '{node_type}' record and can't be changed here. "
             "Use update_fact/delete_fact for facts; conversation history is managed automatically."
@@ -249,6 +264,54 @@ async def delete_node(ctx: RunContext[GraphDependencies], rid: str) -> str:
     if not deleted:
         raise ModelRetry(f"Node {rid!r} was not deleted (not owned by this user?).")
     return f"Deleted {node_type} node {rid}."
+
+
+@ontology_capability.tool
+async def delete_vertex_type(ctx: RunContext[GraphDependencies], args: DropVertexTypeArgs) -> str:
+    """DESTRUCTIVE: drop a vertex TYPE and ALL its instances (and their edges) from this user's DB.
+
+    Use to retire a type you created that is no longer needed (e.g. a wrong/duplicate category). To
+    remove a single record instead, use delete_node. Internal types (User, Conversation, Message,
+    Fact, LogEntry, RunMessages) cannot be dropped.
+    """
+    name = args.node_name
+    if name in _PROTECTED_VERTEX_TYPES:
+        raise ModelRetry(f"'{name}' is an internal vertex type and cannot be dropped.")
+    category = await repo.type_category(ctx.deps.db, name)
+    if category is None:
+        raise ModelRetry(
+            f"No type named '{name}' exists. Call list_vertex_types to see what exists."
+        )
+    if category != "vertex":
+        raise ModelRetry(
+            f"'{name}' is a {category} type, not a vertex type. Use delete_edge_type for relationships."
+        )
+    removed = await repo.drop_vertex_type(ctx.deps.db, name)
+    return f"Dropped vertex type '{name}' and its {removed} instance(s)."
+
+
+@ontology_capability.tool
+async def delete_edge_type(ctx: RunContext[GraphDependencies], args: DropEdgeTypeArgs) -> str:
+    """DESTRUCTIVE: drop an edge (relationship) TYPE and ALL its edges from this user's DB.
+
+    The connected nodes are kept — only the relationships of this type are removed. Use to retire a
+    relationship type you created that is no longer needed. Internal relationship types
+    (HAS_CONVERSATION, HAS_MESSAGE, HAS_RUN_MESSAGES, KNOWS, LOGGED, HAS_NODE) cannot be dropped.
+    """
+    name = args.edge_name
+    if name in _PROTECTED_EDGE_TYPES:
+        raise ModelRetry(f"'{name}' is an internal relationship type and cannot be dropped.")
+    category = await repo.type_category(ctx.deps.db, name)
+    if category is None:
+        raise ModelRetry(
+            f"No type named '{name}' exists. Call list_vertex_types to see what exists."
+        )
+    if category != "edge":
+        raise ModelRetry(
+            f"'{name}' is a {category} type, not an edge type. Use delete_vertex_type for node types."
+        )
+    removed = await repo.drop_edge_type(ctx.deps.db, name)
+    return f"Dropped edge type '{name}' and its {removed} edge(s)."
 
 
 # --------------------------------------------------------------------------- #
