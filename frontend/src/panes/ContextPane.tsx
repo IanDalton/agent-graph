@@ -8,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
+import { Markdown } from "@/components/Markdown";
 import type { AppConfig } from "@/types";
 
 function ConfigRow({
@@ -118,9 +119,7 @@ function SummaryCard({ refreshKey }: { refreshKey: number }) {
             <Skeleton className="h-3 w-5/6" />
           </div>
         ) : summary ? (
-          <div className="whitespace-pre-wrap text-xs leading-relaxed text-muted-foreground">
-            {summary}
-          </div>
+          <Markdown className="text-xs text-muted-foreground">{summary}</Markdown>
         ) : (
           <div className="text-xs text-muted-foreground">
             No summary yet — it updates every few turns.

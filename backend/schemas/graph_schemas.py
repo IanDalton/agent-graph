@@ -16,6 +16,8 @@ _RID_RE = re.compile(r"^#\d+:\d+$")  # ArcadeDB record id, e.g. #29:0
 ALLOWED_PROPERTY_TYPES = frozenset(
     {"STRING", "INTEGER", "LONG", "FLOAT", "DOUBLE", "BOOLEAN", "DATETIME", "DATE"}
 )
+# Memory kinds (research.md's semantic vs. episodic split), recorded per agent-created vertex type.
+MEMORY_KINDS = frozenset({"semantic", "episodic"})
 
 
 class RawQuery(BaseModel):
@@ -104,6 +106,15 @@ class ProposeSchemaArgs(BaseModel):
             "clear, already-created parent type applies — a flat type (no parent) is the default."
         ),
     )
+    kind: str = Field(
+        "semantic",
+        description=(
+            "The memory kind this type holds: 'semantic' for durable facts/entities/state "
+            "(Person, City, ProgrammingLanguage); 'episodic' for time-ordered events "
+            "(Meeting, Purchase, WorkoutSession). Episodic instances should set an 'occurred_at' "
+            "property (when the event happened). Default 'semantic'."
+        ),
+    )
     properties: list[VertexProperty] = Field(
         default_factory=list, description="Optional typed properties the generic type should carry."
     )
@@ -126,6 +137,14 @@ class ProposeSchemaArgs(BaseModel):
             raise ValueError("parent_type must be PascalCase and alphanumeric (e.g. 'Animal').")
         return v
 
+    @field_validator("kind")
+    @classmethod
+    def _valid_kind(cls, v: str) -> str:
+        low = v.strip().lower()
+        if low not in MEMORY_KINDS:
+            raise ValueError(f"kind must be one of {sorted(MEMORY_KINDS)}.")
+        return low
+
 
 class SchemaProposal(BaseModel):
     """Validated, approved proposal returned by propose_schema_change and consumed by create_vertex_type."""
@@ -135,6 +154,9 @@ class SchemaProposal(BaseModel):
     usage: str = Field(..., description="The 'when to use this type' instruction persisted on the type.")
     parent_type: str | None = Field(
         None, description="Existing vertex type this one EXTENDS, or None for a flat (top-level) type."
+    )
+    kind: str = Field(
+        "semantic", description="The memory kind ('semantic' or 'episodic'), carried to create_vertex_type."
     )
     properties: list[VertexProperty] = Field(default_factory=list)
     suggested_existing_type: str | None = Field(
@@ -151,6 +173,10 @@ class VertexTypeInfo(BaseModel):
     usage: str | None = Field(None, description="The stored 'when to use' note, if the type has one.")
     parent_type: str | None = Field(
         None, description="The vertex type this one EXTENDS, if any (so you can see the hierarchy)."
+    )
+    kind: str | None = Field(
+        None,
+        description="The memory kind ('semantic'/'episodic'), or None for legacy/internal types.",
     )
     properties: list[str] = Field(default_factory=list, description="Names of the type's declared properties.")
 

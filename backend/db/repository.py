@@ -396,13 +396,21 @@ async def list_vertex_types(db: ArcadeClient) -> list[dict[str, Any]]:
     types: list[dict[str, Any]] = []
     for row in rows:
         custom = row.get("custom") or {}
-        usage = custom.get("description") if isinstance(custom, dict) else None
+        is_custom = isinstance(custom, dict)
+        usage = custom.get("description") if is_custom else None
+        kind = custom.get("kind") if is_custom else None
         props = row.get("properties") or []
         prop_names = [p.get("name") for p in props if isinstance(p, dict) and p.get("name")]
         parents = row.get("parentTypes") or []
         parent = parents[0] if isinstance(parents, list) and parents else None
         types.append(
-            {"name": row.get("name"), "usage": usage, "parent_type": parent, "properties": prop_names}
+            {
+                "name": row.get("name"),
+                "usage": usage,
+                "parent_type": parent,
+                "kind": kind,
+                "properties": prop_names,
+            }
         )
     return types
 
@@ -413,6 +421,7 @@ async def create_vertex_type(
     usage: str,
     properties: dict[str, str] | None = None,
     parent_type: str | None = None,
+    kind: str = "semantic",
 ) -> bool:
     """Create a vertex type, attach its usage instruction, and add its properties (idempotent).
 
@@ -422,6 +431,11 @@ async def create_vertex_type(
     metadata (key ``description``) so future runs can read it via ``schema:types``. When
     ``parent_type`` is given the new type EXTENDS it (single inheritance), so the agent can grow a
     hierarchy (e.g. ``Pet`` extending ``Animal``).
+
+    ``kind`` (``'semantic'``/``'episodic'``) is stored the same way (CUSTOM ``kind``) so retrieval
+    and the UI can tell durable state from time-ordered events. An ``episodic`` type also gets an
+    ``occurred_at DATETIME`` property — the timestamp of *when the event happened* (distinct from the
+    bookkeeping ``created_at`` that ``create_node`` stamps for when it was recorded).
     """
     newly_created = not await vertex_type_exists(db, type_name)
     # `IF NOT EXISTS` is a SUFFIX for types (ArcadeDB quirk; see ensure_schema) and, verified against
@@ -430,6 +444,9 @@ async def create_vertex_type(
     await db.command(f"CREATE VERTEX TYPE {type_name} IF NOT EXISTS{extends}")
     # Type-level documentation. CUSTOM *values* are string literals, so they bind as parameters.
     await db.command(f"ALTER TYPE {type_name} CUSTOM description = :usage", {"usage": usage})
+    await db.command(f"ALTER TYPE {type_name} CUSTOM kind = :kind", {"kind": kind})
+    if kind == "episodic":
+        await db.command(f"CREATE PROPERTY {type_name}.occurred_at IF NOT EXISTS DATETIME")
     for prop_name, prop_type in (properties or {}).items():
         await db.command(f"CREATE PROPERTY {type_name}.{prop_name} IF NOT EXISTS {prop_type}")
     return newly_created
@@ -586,9 +603,12 @@ async def get_user_graph(
     nodes. Internal edges are naturally excluded: instances only ever have an *incoming* ``HAS_NODE``
     from the User (and no outgoing internal edges), so the outgoing-edge traversal yields only
     agent-created relationships, and the both-endpoints-in-set filter drops any pointing past the
-    limit. Scoped to this user (and the per-user database). Each node carries its type and remaining
-    scalar properties so the frontend can label and inspect it.
+    limit. Scoped to this user (and the per-user database). Each node carries its type, memory
+    ``kind`` (semantic/episodic, resolved once from ``schema:types``) and remaining scalar
+    properties so the frontend can label, color, and inspect it.
     """
+    # Resolve each type's memory kind once so every node can be tagged (semantic vs. episodic).
+    kind_by_type = {t["name"]: t.get("kind") for t in await list_vertex_types(db) if t.get("name")}
     rows = await db.query(
         "SELECT *, @rid, @type FROM (SELECT expand(out('HAS_NODE')) FROM User WHERE user_id = :uid) "
         "LIMIT :limit",
@@ -608,11 +628,13 @@ async def get_user_graph(
         label = props.get("name")
         if not isinstance(label, str):
             label = next((v for v in props.values() if isinstance(v, str)), None)
+        node_type = row.get("@type")
         nodes.append(
             {
                 "id": _sanitize_rid(rid),
-                "type": row.get("@type"),
-                "label": label or row.get("@type"),
+                "type": node_type,
+                "label": label or node_type,
+                "kind": kind_by_type.get(node_type),
                 "properties": props,
             }
         )
@@ -641,6 +663,38 @@ async def get_user_graph(
                 }
             )
     return {"nodes": nodes, "edges": edges}
+
+
+async def get_recent_events(
+    db: ArcadeClient,
+    user_id: str,
+    limit: int = 10,
+    types: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return this user's recent EPISODIC instances, most-recent event first.
+
+    Episodic types are resolved from ``schema:types`` (their CUSTOM ``kind``); the agent-created
+    instances reachable from the User via ``HAS_NODE`` are filtered to those types and ordered by
+    ``occurred_at DESC`` (falling back to ``created_at`` when an instance has no ``occurred_at``).
+    Pass ``types`` to restrict to specific episodic type names (each validated PascalCase). Returns
+    ``[]`` when no episodic types exist. This mirrors research.md's "time-series for events" split
+    (semantic recall stays on ``search_facts``/``search_memory``).
+    """
+    episodic = {t["name"] for t in await list_vertex_types(db) if t.get("kind") == "episodic" and t.get("name")}
+    if types is not None:
+        episodic &= set(types)
+    if not episodic:
+        return []
+    # Type names are validated PascalCase identifiers, so interpolating the IN-list is safe.
+    # `*` already carries occurred_at/created_at; rid/type are aliased for the caller.
+    in_list = ", ".join(f"'{name}'" for name in sorted(episodic))
+    return await db.query(
+        "SELECT *, @rid AS rid, @type AS type "
+        "FROM (SELECT expand(out('HAS_NODE')) FROM User WHERE user_id = :uid) "
+        f"WHERE @type IN [{in_list}] "
+        "ORDER BY occurred_at DESC, created_at DESC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
 
 
 async def write_log(

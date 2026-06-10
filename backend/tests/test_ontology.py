@@ -31,6 +31,7 @@ from backend.skills.graph_capability import build_memory
 from backend.schemas.graph_schemas import UpdateNodeArgs
 from backend.schemas.graph_schemas import DropEdgeTypeArgs, DropVertexTypeArgs
 from backend.skills.ontology_capability import (
+    _build_evaluator_prompt,
     _get_evaluator,
     _require_prior_proposal,
     build_ontology,
@@ -74,6 +75,7 @@ def _approve_evaluator():
 
 ONTOLOGY_TOOLS = {
     "list_vertex_types",
+    "recall_events",
     "propose_schema_change",
     "create_vertex_type",
     "create_node",
@@ -261,6 +263,75 @@ def test_create_executes_approved_proposal() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Memory kind (semantic vs. episodic) — step #6
+# --------------------------------------------------------------------------- #
+def test_kind_defaults_to_semantic_and_validates() -> None:
+    assert ProposeSchemaArgs(node_name="Person", usage="people", rationale="r").kind == "semantic"
+    assert (
+        ProposeSchemaArgs(node_name="Meeting", usage="meetings", rationale="r", kind="EPISODIC").kind
+        == "episodic"  # normalized to lowercase
+    )
+    with pytest.raises(ValidationError):
+        ProposeSchemaArgs(node_name="Meeting", usage="m", rationale="r", kind="chronological")
+
+
+def test_propose_records_kind_on_approved_proposal() -> None:
+    deps = _deps()
+    args = ProposeSchemaArgs(node_name="Meeting", usage="meetings/events", rationale="r", kind="episodic")
+    proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert proposal.approved is True
+    assert proposal.kind == "episodic"
+    assert deps.proposed_schemas["Meeting"].kind == "episodic"
+
+
+def test_create_episodic_vertex_type_emits_kind_and_occurred_at() -> None:
+    db = RecordingClient()
+    deps = _deps(db)
+    asyncio.run(
+        propose_schema_change(
+            _ctx(deps),
+            ProposeSchemaArgs(node_name="Meeting", usage="events", rationale="r", kind="episodic"),
+        )
+    )
+    asyncio.run(create_vertex_type(_ctx(deps), "Meeting"))
+    sqls = [sql for sql, _ in db.commands]
+    assert "CREATE PROPERTY Meeting.occurred_at IF NOT EXISTS DATETIME" in sqls
+    kind_alters = [p for sql, p in db.commands if sql == "ALTER TYPE Meeting CUSTOM kind = :kind"]
+    assert kind_alters and kind_alters[0]["kind"] == "episodic"
+
+
+def test_create_semantic_vertex_type_emits_kind_without_occurred_at() -> None:
+    db = RecordingClient()
+    deps = _deps(db)
+    asyncio.run(
+        propose_schema_change(
+            _ctx(deps), ProposeSchemaArgs(node_name="Person", usage="people", rationale="r")
+        )
+    )
+    asyncio.run(create_vertex_type(_ctx(deps), "Person"))
+    sqls = [sql for sql, _ in db.commands]
+    kind_alters = [p for sql, p in db.commands if sql == "ALTER TYPE Person CUSTOM kind = :kind"]
+    assert kind_alters and kind_alters[0]["kind"] == "semantic"
+    assert not any("occurred_at" in sql for sql in sqls)
+
+
+def test_list_vertex_types_surfaces_kind() -> None:
+    existing = [{"name": "Meeting", "custom": {"kind": "episodic"}, "properties": []}]
+    deps = _deps(RecordingClient(existing_types=existing))
+    infos = asyncio.run(list_vertex_types(_ctx(deps)))
+    assert infos[0].kind == "episodic"
+
+
+def test_evaluator_prompt_includes_proposed_and_existing_kinds() -> None:
+    existing = [{"name": "Meeting", "kind": "episodic", "usage": "events"}]
+    prompt = _build_evaluator_prompt(
+        "vertex type", "Purchase", "purchases", "r", [], existing, memory_kind="episodic"
+    )
+    assert "memory kind: episodic" in prompt
+    assert "Meeting [episodic]" in prompt
+
+
+# --------------------------------------------------------------------------- #
 # Type inheritance (parent_type / EXTENDS)
 # --------------------------------------------------------------------------- #
 def test_parent_type_must_be_pascal_case_or_none() -> None:
@@ -387,6 +458,28 @@ def test_create_node_requires_existing_type() -> None:
     deps = _deps(RecordingClient(existing_types=[]))
     with pytest.raises(ModelRetry):
         asyncio.run(create_node(_ctx(deps), CreateNodeArgs(node_type="SoftwareFramework", properties={"name": "Django"})))
+
+
+def test_create_node_nudges_for_occurred_at_on_episodic_type() -> None:
+    # First attempt on an episodic type without occurred_at gets a single ModelRetry nudge.
+    db = RecordingClient(existing_types=[{"name": "Meeting", "custom": {"kind": "episodic"}, "properties": []}])
+    deps = _deps(db)
+    with pytest.raises(ModelRetry):
+        asyncio.run(create_node(_ctx(deps), CreateNodeArgs(node_type="Meeting", properties={"title": "Coffee with Dana"})))
+    # No CREATE VERTEX was issued — the nudge fired before the write.
+    assert not any(sql.startswith("CREATE VERTEX Meeting SET") for sql, _ in db.commands)
+
+    # Supplying occurred_at proceeds to the write.
+    db = RecordingClient(existing_types=[{"name": "Meeting", "custom": {"kind": "episodic"}, "properties": []}])
+    deps = _deps(db)
+    msg = asyncio.run(
+        create_node(
+            _ctx(deps),
+            CreateNodeArgs(node_type="Meeting", properties={"title": "Coffee", "occurred_at": "2026-06-10T09:00:00Z"}),
+        )
+    )
+    assert any(sql.startswith("CREATE VERTEX Meeting SET") for sql, _ in db.commands)
+    assert "Created Meeting node" in msg
 
 
 def test_create_node_writes_vertex_with_bound_values() -> None:

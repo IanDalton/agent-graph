@@ -84,6 +84,13 @@ ONTOLOGY_INSTRUCTIONS = (
     "on a proposal to an EXISTING generic type the new one specializes (e.g. propose 'Pet' with "
     "parent_type 'Animal'). Keep the parent generic, create the parent first, and only use a parent "
     "when there is a genuine is-a relationship — otherwise omit it for a flat top-level type.\n"
+    "MEMORY KIND (semantic vs. episodic): every vertex type you propose carries a `kind`. Use "
+    "'semantic' (the default) for durable facts, entities, and state — Person, City, "
+    "ProgrammingLanguage, Company. Use 'episodic' for time-ordered EVENTS — Meeting, Purchase, "
+    "WorkoutSession, Trip. When you create an INSTANCE of an episodic type, set an `occurred_at` "
+    "property (ISO-8601, e.g. '2026-06-10T09:00:00Z') to WHEN the event happened — this is what lets "
+    "events be recalled in chronological order via `recall_events` (distinct from the automatic "
+    "created_at, which is just when you recorded it).\n"
     "STORING DATA: `create_vertex_type` only creates the TYPE (the category). To save an actual "
     "INSTANCE — e.g. the framework 'Django' — call `create_node` with that existing type and the "
     "instance's property values. The type must exist first. So the full flow is: "
@@ -133,7 +140,11 @@ _EVALUATOR_INSTRUCTIONS = (
     "type's EXACT name.\n"
     "  - It is too narrow/over-specific to be reused.\n"
     "When you reject, give a brief reason and, when applicable, a revision_hint (how to generalize) "
-    "and/or suggested_existing_type (the existing type to use instead)."
+    "and/or suggested_existing_type (the existing type to use instead).\n"
+    "MEMORY KIND: a vertex proposal also carries a memory kind — 'semantic' for durable "
+    "facts/entities/state (Person, City, ProgrammingLanguage) or 'episodic' for time-ordered events "
+    "(Meeting, Purchase, WorkoutSession). Judge whether it fits: REJECT (with a revision_hint) an "
+    "'episodic' label on a clearly static category, or a 'semantic' label on a clearly event-like one."
 )
 
 _evaluator_agent: Agent[None, EvaluatorVerdict] | None = None
@@ -162,8 +173,13 @@ def _build_evaluator_prompt(
     properties: list[VertexProperty],
     existing: list[dict[str, Any]],
     parent: str | None = None,
+    memory_kind: str | None = None,
 ) -> str:
-    """Render the proposal + current ontology into a prompt for the evaluator."""
+    """Render the proposal + current ontology into a prompt for the evaluator.
+
+    ``kind`` is the proposal *category* ('vertex type'/'edge type'); ``memory_kind`` is the
+    semantic-vs-episodic marker for a vertex proposal (None for edges).
+    """
     if existing:
         lines = []
         for row in existing:
@@ -171,23 +187,29 @@ def _build_evaluator_prompt(
                 continue
             note = row.get("usage") or "(no usage note)"
             extends = f" [extends {row['parent_type']}]" if row.get("parent_type") else ""
-            lines.append(f"- {row.get('name')}{extends}: {note}")
+            mk = f" [{row['kind']}]" if row.get("kind") else ""
+            lines.append(f"- {row.get('name')}{mk}{extends}: {note}")
         ontology = "\n".join(lines)
     else:
         ontology = "(the ontology is empty — no types exist yet)"
     props = ", ".join(f"{p.name}:{p.type}" for p in properties) or "(none)"
     parent_line = f"  extends (parent type): {parent}\n" if parent else ""
+    memory_kind_line = f"  memory kind: {memory_kind}\n" if memory_kind else ""
     return (
         f"Existing types in the ontology:\n{ontology}\n\n"
         f"Proposed new {kind}:\n"
         f"  name: {name}\n"
         f"  usage: {usage}\n"
+        f"{memory_kind_line}"
         f"{parent_line}"
         f"  properties: {props}\n"
         f"  rationale: {rationale}\n\n"
         "Should this type be added? Judge it semantically and return your verdict. "
         "If a parent type is given, also judge whether that inheritance is sensible "
-        "(the parent should be a genuine, more-general category of the proposed type)."
+        "(the parent should be a genuine, more-general category of the proposed type). "
+        "If a memory kind is given, also judge whether it fits: reject 'episodic' for a clearly "
+        "static category (Person, City) and 'semantic' for a clearly time-ordered event "
+        "(Meeting, Purchase), with a revision_hint."
     )
 
 
@@ -216,6 +238,7 @@ async def _evaluate_proposal(
     rationale: str,
     properties: list[VertexProperty],
     parent: str | None = None,
+    memory_kind: str | None = None,
 ) -> EvaluatorVerdict:
     """Ask the evaluator to judge a proposal. Fails open (approves) on any error."""
     try:
@@ -225,7 +248,9 @@ async def _evaluate_proposal(
             "evaluator: ontology unavailable; approving %s %r by default", kind, name, exc_info=True
         )
         return EvaluatorVerdict(approved=True, reason="evaluator skipped (ontology unavailable)")
-    prompt = _build_evaluator_prompt(kind, name, usage, rationale, properties, existing, parent)
+    prompt = _build_evaluator_prompt(
+        kind, name, usage, rationale, properties, existing, parent, memory_kind
+    )
     try:
         result = await _get_evaluator().run(prompt, usage=ctx.usage)
         return result.output
@@ -249,11 +274,43 @@ async def list_vertex_types(ctx: RunContext[GraphDependencies]) -> list[VertexTy
             name=r["name"],
             usage=r.get("usage"),
             parent_type=r.get("parent_type"),
+            kind=r.get("kind"),
             properties=r.get("properties", []),
         )
         for r in rows
         if r.get("name")
     ]
+
+
+@ontology_capability.tool
+async def recall_events(
+    ctx: RunContext[GraphDependencies], limit: int = 10, type: str | None = None
+) -> list[dict[str, Any]]:
+    """Recall recent EPISODIC events (instances of episodic types), most-recent first.
+
+    Use this for "what happened / what did I do recently?" questions — it orders events by their
+    `occurred_at` timestamp (when the event happened), unlike `search_memory` which is for durable
+    semantic facts/state. Optionally pass `type` to restrict to one episodic type (e.g. 'Meeting').
+    Each result carries the record id, type, occurred_at, and the event's other properties.
+    """
+    types = [type] if type else None
+    rows = await repo.get_recent_events(ctx.deps.db, ctx.deps.user_id, limit=limit, types=types)
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        props = {
+            k: v
+            for k, v in row.items()
+            if not k.startswith("@") and k not in {"rid", "type", "user_id"}
+        }
+        events.append(
+            {
+                "rid": str(row.get("rid") or row.get("@rid") or ""),
+                "type": row.get("type") or row.get("@type"),
+                "occurred_at": row.get("occurred_at"),
+                "properties": props,
+            }
+        )
+    return events
 
 
 @ontology_capability.tool
@@ -290,6 +347,7 @@ async def propose_schema_change(
                 node_name=args.node_name,
                 usage=args.usage,
                 parent_type=args.parent_type,
+                kind=args.kind,
                 properties=args.properties,
                 guidance=reason,
             )
@@ -301,6 +359,7 @@ async def propose_schema_change(
         rationale=args.rationale,
         properties=args.properties,
         parent=args.parent_type,
+        memory_kind=args.kind,
     )
     if not verdict.approved:
         ctx.deps.proposed_schemas.pop(args.node_name, None)  # clear any stale prior approval
@@ -309,6 +368,7 @@ async def propose_schema_change(
             node_name=args.node_name,
             usage=args.usage,
             parent_type=args.parent_type,
+            kind=args.kind,
             properties=args.properties,
             suggested_existing_type=verdict.suggested_existing_type,
             guidance=_rejection_guidance("create_vertex_type", verdict),
@@ -319,10 +379,12 @@ async def propose_schema_change(
         node_name=args.node_name,
         usage=args.usage,
         parent_type=args.parent_type,
+        kind=args.kind,
         properties=args.properties,
         guidance=(
-            f"Approved{extends_note}. To create it, call create_vertex_type(node_name="
-            f"'{args.node_name}'). If a suitable generic type already exists, store your data there instead."
+            f"Approved{extends_note} as a {args.kind} type. To create it, call create_vertex_type("
+            f"node_name='{args.node_name}'). If a suitable generic type already exists, store your "
+            "data there instead."
         ),
     )
     ctx.deps.proposed_schemas[args.node_name] = proposal
@@ -344,11 +406,19 @@ async def create_vertex_type(ctx: RunContext[GraphDependencies], node_name: str)
         )
     props = {p.name: p.type for p in proposal.properties}
     newly_created = await repo.create_vertex_type(
-        ctx.deps.db, node_name, usage=proposal.usage, properties=props, parent_type=proposal.parent_type
+        ctx.deps.db,
+        node_name,
+        usage=proposal.usage,
+        properties=props,
+        parent_type=proposal.parent_type,
+        kind=proposal.kind,
     )
     verb = "Created" if newly_created else "Confirmed existing"
     extends = f" extending '{proposal.parent_type}'" if proposal.parent_type else ""
-    return f"{verb} vertex type '{node_name}'{extends} with {len(props)} propert(y/ies) for this user."
+    return (
+        f"{verb} {proposal.kind} vertex type '{node_name}'{extends} with {len(props)} "
+        "propert(y/ies) for this user."
+    )
 
 
 @ontology_capability.tool
@@ -359,11 +429,22 @@ async def create_node(ctx: RunContext[GraphDependencies], args: CreateNodeArgs) 
     The type must already exist — create it first via propose_schema_change + create_vertex_type,
     or pick one from list_vertex_types.
     """
-    if not await repo.vertex_type_exists(ctx.deps.db, args.node_type):
+    types = await repo.list_vertex_types(ctx.deps.db)
+    match = next((t for t in types if t.get("name") == args.node_type), None)
+    if match is None:
         raise ModelRetry(
             f"Vertex type '{args.node_type}' does not exist yet. Create it first via "
             "propose_schema_change then create_vertex_type, or choose an existing type "
             "from list_vertex_types."
+        )
+    # Lenient episodic nudge: ask once for occurred_at, then proceed regardless on the next call so
+    # a stubborn/unknown timestamp never stalls the run.
+    if match.get("kind") == "episodic" and "occurred_at" not in args.properties and ctx.retry == 0:
+        raise ModelRetry(
+            f"'{args.node_type}' is an episodic (event) type — include an 'occurred_at' property "
+            "(ISO-8601 timestamp of WHEN the event happened, e.g. '2026-06-10T09:00:00Z') so the "
+            "event can be recalled in chronological order. If you truly don't know when it "
+            "happened, call create_node again unchanged to proceed without it."
         )
     rid = await repo.create_node(ctx.deps.db, ctx.deps.user_id, args.node_type, args.properties)
     return f"Created {args.node_type} node ({rid}) with {len(args.properties)} propert(y/ies) for this user."

@@ -18,6 +18,10 @@ function layout(graph: MemoryGraph): { nodes: Node[]; edges: Edge[] } {
   const radius = Math.max(120, n * 26);
   const nodes: Node[] = graph.nodes.map((node, i) => {
     const angle = (2 * Math.PI * i) / Math.max(n, 1);
+    // Color/shape by memory kind: episodic events get a dashed accent border, semantic state a solid
+    // primary border (the legacy/null kind falls through to semantic). Makes the two memory systems
+    // visible in the graph (see docs/step6-semantic-episodic-memory.md).
+    const episodic = node.kind === "episodic";
     return {
       id: node.id,
       position: { x: radius * Math.cos(angle), y: radius * Math.sin(angle) },
@@ -26,7 +30,9 @@ function layout(graph: MemoryGraph): { nodes: Node[]; edges: Edge[] } {
         fontSize: 11,
         borderRadius: 8,
         padding: 6,
-        border: "1px solid hsl(var(--border))",
+        border: episodic
+          ? "1px dashed hsl(var(--accent-foreground))"
+          : "1px solid hsl(var(--primary))",
         background: "hsl(var(--card))",
       },
     };
@@ -100,6 +106,17 @@ export function MemoryGraphCard({ refreshKey }: { refreshKey: number }) {
         {loading && !graph ? (
           <Skeleton className="h-[260px] w-full" />
         ) : hasNodes ? (
+          <div className="space-y-2">
+          <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+            <span className="flex items-center gap-1">
+              <span className="inline-block h-2 w-3 rounded-sm border border-[hsl(var(--primary))]" />
+              Semantic (state)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block h-2 w-3 rounded-sm border border-dashed border-[hsl(var(--accent-foreground))]" />
+              Episodic (events)
+            </span>
+          </div>
           <div className="h-[260px] w-full overflow-hidden rounded-md border border-border">
             <ReactFlow
               nodes={nodes}
@@ -112,6 +129,7 @@ export function MemoryGraphCard({ refreshKey }: { refreshKey: number }) {
               <Background gap={16} />
               <Controls showInteractive={false} />
             </ReactFlow>
+          </div>
           </div>
         ) : (
           <div className="text-xs text-muted-foreground">

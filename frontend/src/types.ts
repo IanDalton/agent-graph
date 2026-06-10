@@ -61,6 +61,9 @@ export interface GraphNode {
   id: string;
   type: string;
   label: string;
+  /** Memory kind of the node's type: "semantic" (durable state) or "episodic" (time-ordered event).
+   *  null for legacy/internal types with no marker — rendered as semantic. */
+  kind?: "semantic" | "episodic" | null;
   properties: Record<string, unknown>;
 }
 

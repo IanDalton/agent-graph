@@ -13,13 +13,24 @@ from backend.db import repository as repo
 
 
 class GraphClient:
-    """Fake client returning canned node rows (HAS_NODE expand) and edge rows (outE expand)."""
+    """Fake client returning canned node rows (HAS_NODE expand) and edge rows (outE expand).
 
-    def __init__(self, node_rows: list[dict[str, Any]], edge_rows: list[dict[str, Any]]) -> None:
+    ``type_rows`` answers the ``schema:types`` lookup get_user_graph uses to tag each node's kind.
+    """
+
+    def __init__(
+        self,
+        node_rows: list[dict[str, Any]],
+        edge_rows: list[dict[str, Any]],
+        type_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._node_rows = node_rows
         self._edge_rows = edge_rows
+        self._type_rows = type_rows or []
 
     async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if "schema:types" in sql:
+            return self._type_rows
         # The edge query is the only one that expands outE(); the node query just expands HAS_NODE.
         return self._edge_rows if "outE()" in sql else self._node_rows
 
@@ -63,6 +74,28 @@ def test_get_user_graph_labels_fall_back_to_type() -> None:
     node_rows = [{"@rid": "#5:0", "@type": "Measurement", "value": 42}]
     g = asyncio.run(repo.get_user_graph(GraphClient(node_rows, []), "u"))
     assert g["nodes"][0]["label"] == "Measurement"
+
+
+def test_get_user_graph_attaches_kind_from_schema() -> None:
+    node_rows = [
+        {"@rid": "#35:0", "@type": "Person", "name": "Alice"},
+        {"@rid": "#40:0", "@type": "Meeting", "name": "Standup"},
+    ]
+    type_rows = [
+        {"name": "Person", "custom": {"kind": "semantic"}, "properties": []},
+        {"name": "Meeting", "custom": {"kind": "episodic"}, "properties": []},
+    ]
+    g = asyncio.run(repo.get_user_graph(GraphClient(node_rows, [], type_rows), "u"))
+    by_id = {n["id"]: n for n in g["nodes"]}
+    assert by_id["35_0"]["kind"] == "semantic"
+    assert by_id["40_0"]["kind"] == "episodic"
+
+
+def test_get_user_graph_kind_is_none_for_unmarked_type() -> None:
+    # A type with no kind marker (legacy/internal) reads back as None (treated as semantic by the UI).
+    node_rows = [{"@rid": "#35:0", "@type": "Person", "name": "Alice"}]
+    g = asyncio.run(repo.get_user_graph(GraphClient(node_rows, [], type_rows=[]), "u"))
+    assert g["nodes"][0]["kind"] is None
 
 
 def test_sanitize_rid() -> None:

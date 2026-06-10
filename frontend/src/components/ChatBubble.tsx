@@ -4,6 +4,7 @@ import { Brain, ChevronRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/types";
 import { ToolChip } from "@/components/ToolChip";
+import { Markdown } from "@/components/Markdown";
 
 function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
@@ -55,13 +56,17 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
         {(message.content || (!isUser && empty && message.streaming)) && (
           <div
             className={cn(
-              "whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
+              "break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
               isUser
-                ? "bg-primary text-primary-foreground"
+                ? "whitespace-pre-wrap bg-primary text-primary-foreground"
                 : "bg-muted text-foreground"
             )}
           >
-            {message.content}
+            {isUser ? (
+              message.content
+            ) : (
+              <Markdown>{message.content}</Markdown>
+            )}
             {!isUser && message.streaming && empty && (
               <Loader2 className="inline size-4 animate-spin align-middle text-muted-foreground" />
             )}
