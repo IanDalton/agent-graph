@@ -260,6 +260,70 @@ def test_create_executes_approved_proposal() -> None:
     assert "Created" in message
 
 
+# --------------------------------------------------------------------------- #
+# Type inheritance (parent_type / EXTENDS)
+# --------------------------------------------------------------------------- #
+def test_parent_type_must_be_pascal_case_or_none() -> None:
+    # None and a valid PascalCase parent are accepted; junk is rejected.
+    ProposeSchemaArgs(node_name="Pet", usage="pets", rationale="r", parent_type=None)
+    ProposeSchemaArgs(node_name="Pet", usage="pets", rationale="r", parent_type="Animal")
+    with pytest.raises(ValidationError):
+        ProposeSchemaArgs(node_name="Pet", usage="pets", rationale="r", parent_type="not pascal")
+
+
+def test_propose_with_existing_parent_records_parent() -> None:
+    db = RecordingClient(existing_types=[{"name": "Animal", "custom": {}, "properties": []}])
+    deps = _deps(db)
+    args = ProposeSchemaArgs(node_name="Pet", usage="domestic animals", rationale="r", parent_type="Animal")
+    proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert proposal.approved is True
+    assert proposal.parent_type == "Animal"
+    assert deps.proposed_schemas["Pet"].parent_type == "Animal"
+
+
+def test_propose_with_missing_parent_is_rejected_and_not_recorded() -> None:
+    deps = _deps(RecordingClient(existing_types=[]))  # Animal does not exist
+    args = ProposeSchemaArgs(node_name="Pet", usage="pets", rationale="r", parent_type="Animal")
+    proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert proposal.approved is False
+    assert "Animal" in proposal.guidance
+    assert "Pet" not in deps.proposed_schemas
+    with pytest.raises(ModelRetry):
+        asyncio.run(create_vertex_type(_ctx(deps), "Pet"))
+
+
+def test_propose_extending_protected_type_is_rejected() -> None:
+    deps = _deps(RecordingClient(existing_types=[{"name": "Message"}]))
+    args = ProposeSchemaArgs(node_name="Note", usage="notes", rationale="r", parent_type="Message")
+    proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert proposal.approved is False
+    assert "internal" in proposal.guidance.lower()
+    assert "Note" not in deps.proposed_schemas
+
+
+def test_create_vertex_type_emits_extends() -> None:
+    db = RecordingClient(existing_types=[{"name": "Animal", "custom": {}, "properties": []}])
+    deps = _deps(db)
+    asyncio.run(
+        propose_schema_change(
+            _ctx(deps),
+            ProposeSchemaArgs(node_name="Pet", usage="pets", rationale="r", parent_type="Animal"),
+        )
+    )
+    msg = asyncio.run(create_vertex_type(_ctx(deps), "Pet"))
+    sqls = [sql for sql, _ in db.commands]
+    # IF NOT EXISTS precedes EXTENDS (verified against ArcadeDB; the reverse is a parse error).
+    assert "CREATE VERTEX TYPE Pet IF NOT EXISTS EXTENDS Animal" in sqls
+    assert "Animal" in msg
+
+
+def test_list_vertex_types_surfaces_parent() -> None:
+    existing = [{"name": "Pet", "custom": {}, "properties": [], "parentTypes": ["Animal"]}]
+    deps = _deps(RecordingClient(existing_types=existing))
+    infos = asyncio.run(list_vertex_types(_ctx(deps)))
+    assert infos[0].parent_type == "Animal"
+
+
 def test_guard_blocks_create_without_matching_proposal() -> None:
     deps = _deps()
     call = ToolCallPart(tool_name="create_vertex_type", args={"node_name": "Person"})

@@ -235,17 +235,26 @@ async def get_run_history(
     return list(reversed(rows))
 
 
-async def store_fact(db: ArcadeClient, user_id: str, text: str) -> None:
-    """Store a durable fact about the user and link it to the User vertex."""
+async def store_fact(
+    db: ArcadeClient, user_id: str, text: str, embedding: list[float] | None = None
+) -> None:
+    """Store a durable fact about the user and link it to the User vertex.
+
+    When ``embedding`` is given (semantic search is enabled), it is stored on the Fact's vector
+    property so :func:`search_facts` can rank by similarity. Omitted ⇒ the fact is still searchable
+    via substring matching.
+    """
     fact_id = _new_id()
     await db.command(
         "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
         {"uid": user_id},
     )
-    await db.command(
-        "CREATE VERTEX Fact SET fact_id = :fid, user_id = :uid, text = :text, created_at = :ts",
-        {"fid": fact_id, "uid": user_id, "text": text, "ts": _now()},
-    )
+    set_clause = "fact_id = :fid, user_id = :uid, text = :text, created_at = :ts"
+    params: dict[str, Any] = {"fid": fact_id, "uid": user_id, "text": text, "ts": _now()}
+    if embedding is not None:
+        set_clause += ", embedding = :emb"
+        params["emb"] = embedding
+    await db.command(f"CREATE VERTEX Fact SET {set_clause}", params)
     await db.command(
         "CREATE EDGE KNOWS "
         "FROM (SELECT FROM User WHERE user_id = :uid) "
@@ -254,13 +263,10 @@ async def store_fact(db: ArcadeClient, user_id: str, text: str) -> None:
     )
 
 
-async def search_facts(
-    db: ArcadeClient,
-    user_id: str,
-    text: str,
-    limit: int = 10,
+async def _search_facts_like(
+    db: ArcadeClient, user_id: str, text: str, limit: int
 ) -> list[dict[str, Any]]:
-    """Substring search across this user's stored facts (includes fact_id for in-place updates)."""
+    """Substring (LIKE) fact search — the default, and the fallback when no embedding is given."""
     return await db.query(
         "SELECT fact_id, text, created_at FROM Fact "
         "WHERE user_id = :uid AND text LIKE :pat ORDER BY created_at DESC LIMIT :limit",
@@ -268,15 +274,56 @@ async def search_facts(
     )
 
 
-async def update_fact(db: ArcadeClient, user_id: str, fact_id: str, text: str) -> int:
+async def search_facts(
+    db: ArcadeClient,
+    user_id: str,
+    text: str,
+    limit: int = 10,
+    embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Search this user's stored facts (each hit includes fact_id for in-place updates).
+
+    When ``embedding`` is provided (semantic search enabled), rank by vector similarity via
+    ArcadeDB's ``vectorNeighbors`` HNSW index; otherwise — or if the vector query errors / returns
+    nothing (e.g. no embedded facts yet) — fall back to substring (LIKE) matching. The vector path
+    can never abort the run: any error degrades to LIKE.
+    """
+    if embedding is None:
+        return await _search_facts_like(db, user_id, text, limit)
+    try:
+        hits = await db.query(
+            "SELECT fact_id, text, created_at FROM ("
+            "SELECT expand(vectorNeighbors('Fact[embedding]', :qvec, :k))"
+            ") WHERE user_id = :uid LIMIT :limit",
+            {"qvec": embedding, "k": limit, "uid": user_id, "limit": limit},
+        )
+    except Exception:  # noqa: BLE001 — semantic search is best-effort; degrade to substring search.
+        logger.warning("vector fact search failed; falling back to LIKE", exc_info=True)
+        return await _search_facts_like(db, user_id, text, limit)
+    return hits or await _search_facts_like(db, user_id, text, limit)
+
+
+async def update_fact(
+    db: ArcadeClient,
+    user_id: str,
+    fact_id: str,
+    text: str,
+    embedding: list[float] | None = None,
+) -> int:
     """Replace the text of an existing fact (so the agent can revise instead of duplicating).
 
     Returns the number of facts updated (0 if no such fact for this user). Scoped by user_id and
-    matched on the indexed fact_id.
+    matched on the indexed fact_id. When ``embedding`` is given, the stored vector is refreshed too
+    so semantic search stays consistent with the revised text.
     """
+    set_clause = "text = :text, updated_at = :ts"
+    params: dict[str, Any] = {"text": text, "ts": _now(), "fid": fact_id, "uid": user_id}
+    if embedding is not None:
+        set_clause += ", embedding = :emb"
+        params["emb"] = embedding
     result = await db.command(
-        "UPDATE Fact SET text = :text, updated_at = :ts WHERE fact_id = :fid AND user_id = :uid",
-        {"text": text, "ts": _now(), "fid": fact_id, "uid": user_id},
+        f"UPDATE Fact SET {set_clause} WHERE fact_id = :fid AND user_id = :uid",
+        params,
     )
     return _affected(result)
 
@@ -352,7 +399,11 @@ async def list_vertex_types(db: ArcadeClient) -> list[dict[str, Any]]:
         usage = custom.get("description") if isinstance(custom, dict) else None
         props = row.get("properties") or []
         prop_names = [p.get("name") for p in props if isinstance(p, dict) and p.get("name")]
-        types.append({"name": row.get("name"), "usage": usage, "properties": prop_names})
+        parents = row.get("parentTypes") or []
+        parent = parents[0] if isinstance(parents, list) and parents else None
+        types.append(
+            {"name": row.get("name"), "usage": usage, "parent_type": parent, "properties": prop_names}
+        )
     return types
 
 
@@ -361,17 +412,22 @@ async def create_vertex_type(
     type_name: str,
     usage: str,
     properties: dict[str, str] | None = None,
+    parent_type: str | None = None,
 ) -> bool:
     """Create a vertex type, attach its usage instruction, and add its properties (idempotent).
 
-    Returns True if the type was newly created. ``type_name``/property names are interpolated
-    (DDL cannot bind identifiers); callers MUST pass values already validated by the Pydantic
-    models in ``backend.schemas.graph_schemas``. ``usage`` is stored as type-level CUSTOM
-    metadata (key ``description``) so future runs can read it via ``schema:types``.
+    Returns True if the type was newly created. ``type_name``/property names/``parent_type`` are
+    interpolated (DDL cannot bind identifiers); callers MUST pass values already validated by the
+    Pydantic models in ``backend.schemas.graph_schemas``. ``usage`` is stored as type-level CUSTOM
+    metadata (key ``description``) so future runs can read it via ``schema:types``. When
+    ``parent_type`` is given the new type EXTENDS it (single inheritance), so the agent can grow a
+    hierarchy (e.g. ``Pet`` extending ``Animal``).
     """
     newly_created = not await vertex_type_exists(db, type_name)
-    # `IF NOT EXISTS` is a SUFFIX for types/properties (ArcadeDB quirk; see ensure_schema).
-    await db.command(f"CREATE VERTEX TYPE {type_name} IF NOT EXISTS")
+    # `IF NOT EXISTS` is a SUFFIX for types (ArcadeDB quirk; see ensure_schema) and, verified against
+    # ArcadeDB, must come BEFORE `EXTENDS` — `... EXTENDS <parent> IF NOT EXISTS` is a parse error.
+    extends = f" EXTENDS {parent_type}" if parent_type else ""
+    await db.command(f"CREATE VERTEX TYPE {type_name} IF NOT EXISTS{extends}")
     # Type-level documentation. CUSTOM *values* are string literals, so they bind as parameters.
     await db.command(f"ALTER TYPE {type_name} CUSTOM description = :usage", {"usage": usage})
     for prop_name, prop_type in (properties or {}).items():
@@ -508,6 +564,83 @@ async def create_node(
             {"uid": user_id},
         )
     return rid or "created"
+
+
+def _sanitize_rid(rid: str) -> str:
+    """Turn an ArcadeDB record id into a DOM/JS-safe id for the UI (``#38:0`` -> ``38_0``)."""
+    return rid.lstrip("#").replace(":", "_")
+
+
+# Row keys that are ArcadeDB internals or bookkeeping, not user-facing instance properties.
+_NON_DISPLAY_KEYS = frozenset({"@rid", "@type", "@cat", "@in", "@out", "user_id"})
+
+
+async def get_user_graph(
+    db: ArcadeClient, user_id: str, limit: int = 100,
+) -> dict[str, list[dict[str, Any]]]:
+    """Serialize this user's agent-built knowledge graph (nodes + edges) for UI rendering.
+
+    Returns ``{"nodes": [...], "edges": [...]}`` with DOM-safe ids (``#38:0`` -> ``38_0``):
+    nodes are the instance vertices reachable from the User via ``HAS_NODE`` (depth-limited by
+    ``limit``); edges are the agent-created relationships whose endpoints are *both* among those
+    nodes. Internal edges are naturally excluded: instances only ever have an *incoming* ``HAS_NODE``
+    from the User (and no outgoing internal edges), so the outgoing-edge traversal yields only
+    agent-created relationships, and the both-endpoints-in-set filter drops any pointing past the
+    limit. Scoped to this user (and the per-user database). Each node carries its type and remaining
+    scalar properties so the frontend can label and inspect it.
+    """
+    rows = await db.query(
+        "SELECT *, @rid, @type FROM (SELECT expand(out('HAS_NODE')) FROM User WHERE user_id = :uid) "
+        "LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
+    nodes: list[dict[str, Any]] = []
+    rid_set: set[str] = set()
+    for row in rows:
+        rid = str(row.get("@rid") or "")
+        if not rid:
+            continue
+        rid_set.add(rid)
+        props = {
+            k: v for k, v in row.items() if k not in _NON_DISPLAY_KEYS and not k.startswith("@")
+        }
+        # Prefer a human label: a 'name' property, else the first string prop, else the type.
+        label = props.get("name")
+        if not isinstance(label, str):
+            label = next((v for v in props.values() if isinstance(v, str)), None)
+        nodes.append(
+            {
+                "id": _sanitize_rid(rid),
+                "type": row.get("@type"),
+                "label": label or row.get("@type"),
+                "properties": props,
+            }
+        )
+
+    edges: list[dict[str, Any]] = []
+    if rid_set:
+        # Outgoing edges of every instance node. ArcadeDB exposes an edge's endpoints as @out/@in;
+        # `FROM E` is not queryable, so we expand outE() from the instances instead.
+        edge_rows = await db.query(
+            "SELECT @rid AS rid, @type AS type, @out AS src, @in AS dst FROM ("
+            "SELECT expand(outE()) FROM (SELECT expand(out('HAS_NODE')) FROM User WHERE user_id = :uid)"
+            ")",
+            {"uid": user_id},
+        )
+        for e in edge_rows:
+            src, dst = str(e.get("src") or ""), str(e.get("dst") or "")
+            # Keep only edges between two displayed instance nodes (drops any past the limit).
+            if src not in rid_set or dst not in rid_set:
+                continue
+            edges.append(
+                {
+                    "id": _sanitize_rid(str(e.get("rid") or f"{src}-{dst}")),
+                    "source": _sanitize_rid(src),
+                    "target": _sanitize_rid(dst),
+                    "label": e.get("type"),
+                }
+            )
+    return {"nodes": nodes, "edges": edges}
 
 
 async def write_log(

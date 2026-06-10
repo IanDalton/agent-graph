@@ -51,4 +51,27 @@ export interface AppConfig {
   arcade_url: string;
   searxng_url: string;
   log_level: string;
+  embeddings?: boolean;
+  embed_model?: string | null;
+}
+
+/** One node of the agent-built knowledge graph (see backend repo.get_user_graph).
+ *  `id` is a DOM-safe sanitized record id (e.g. "38_0"). */
+export interface GraphNode {
+  id: string;
+  type: string;
+  label: string;
+  properties: Record<string, unknown>;
+}
+
+export interface GraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  label: string;
+}
+
+export interface MemoryGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
 }

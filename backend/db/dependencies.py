@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from backend.db.arcade_db import ArcadeClient
 
 if TYPE_CHECKING:
+    from backend.embeddings import Embedder
     from backend.schemas.graph_schemas import EdgeProposal, SchemaProposal
     from backend.web.client import WebClient
 
@@ -33,3 +34,6 @@ class GraphDependencies:
     # existing constructions keep working; main.run() supplies one. When None, the web tools
     # build a short-lived client from env per call.
     web: "WebClient | None" = None
+    # Text->vector embedder for semantic memory search. Optional and inert when no embedding model
+    # is configured (EMBED_MODEL unset): in that case fact search uses substring (LIKE) matching.
+    embedder: "Embedder | None" = None

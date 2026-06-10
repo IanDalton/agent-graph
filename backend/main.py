@@ -31,6 +31,7 @@ from pydantic_ai.messages import (
 from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
+from backend.embeddings import Embedder
 from backend.model_selection import select_model
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
@@ -110,11 +111,15 @@ async def stream_run(
     agent = build_agent()
     # Each user gets their own database, so no user's data can surface in another
     # user's queries. The database is created on first use.
-    async with ArcadeClient(database=database_name_for_user(user_id)) as db, WebClient() as web:
+    async with (
+        ArcadeClient(database=database_name_for_user(user_id)) as db,
+        WebClient() as web,
+        Embedder.from_env() as embedder,
+    ):
         await db.ensure_database()
         await db.ensure_schema()
         deps = GraphDependencies(
-            db=db, user_id=user_id, conversation_id=conversation_id, web=web
+            db=db, user_id=user_id, conversation_id=conversation_id, web=web, embedder=embedder
         )
 
         # Load the prior turns of this thread so the agent retains context. The

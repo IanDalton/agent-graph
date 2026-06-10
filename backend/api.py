@@ -31,6 +31,7 @@ from backend.db.arcade_db import (
     ArcadeClient,
     database_name_for_user,
 )
+from backend.embeddings import embeddings_enabled
 
 logger = logging.getLogger("agent_graph.api")
 
@@ -112,6 +113,9 @@ async def get_config() -> dict[str, Any]:
         "arcade_url": os.getenv("ARCADE_URL", DEFAULT_URL),
         "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8085"),
         "log_level": os.getenv("LOG_LEVEL", "INFO").upper(),
+        # Semantic fact search: on when an embedding model is configured, else substring matching.
+        "embeddings": embeddings_enabled(),
+        "embed_model": os.getenv("EMBED_MODEL") or None,
     }
 
 
@@ -191,6 +195,24 @@ async def refresh_summary(conversation_id: str, user_id: str = "default") -> dic
     except Exception:  # noqa: BLE001 — the summary pane must never break the page.
         logger.warning("summary refresh failed", exc_info=True)
         return {"summary": ""}
+
+
+# ---------------------------------------------------------------------------- graph
+
+
+@app.get("/api/graph")
+async def get_graph(user_id: str = "default", limit: int = 100) -> dict[str, Any]:
+    """Return the user's agent-built knowledge graph as ``{nodes, edges}`` for visualization.
+
+    Pure read on the pooled client (no schema ensure). Tolerant: a missing database/type (nothing
+    built yet) or any error yields an empty graph rather than a 500, so the UI pane never breaks.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.get_user_graph(db, user_id, limit=limit)
+    except Exception:  # noqa: BLE001 — the graph pane must never break the page.
+        logger.warning("get_graph failed", exc_info=True)
+        return {"nodes": [], "edges": []}
 
 
 # ----------------------------------------------------------------------------- chat

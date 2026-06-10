@@ -22,6 +22,8 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from backend.embeddings import embedding_dimension
+
 load_dotenv()
 
 logger = logging.getLogger("agent_graph.db")
@@ -252,6 +254,18 @@ class ArcadeClient:
             "CREATE PROPERTY Fact.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Fact (user_id) NOTUNIQUE",
         ]
+        # Semantic search: when an embedding dimension is configured, give Fact a vector property and
+        # an HNSW (LSM_VECTOR) index so search_facts can rank by similarity. ARRAY_OF_FLOATS (not
+        # `LIST OF FLOAT`) is required — verified against ArcadeDB, a bound JSON array binds as
+        # ARRAY_OF_FLOATS and a `LIST OF FLOAT` property rejects it. buildGraphNow:false because a
+        # fresh per-user DB is empty; the graph builds lazily on the first vectorNeighbors query.
+        dim = embedding_dimension()
+        if dim:
+            statements += [
+                "CREATE PROPERTY Fact.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
+                f"CREATE INDEX IF NOT EXISTS ON Fact (embedding) LSM_VECTOR "
+                f"METADATA {{\"dimensions\": {dim}, \"similarity\": \"COSINE\", \"buildGraphNow\": false}}",
+            ]
         for stmt in statements:
             await self.command(stmt)
         # Both existence and schema are now guaranteed for this database in this process.

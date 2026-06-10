@@ -80,6 +80,10 @@ ONTOLOGY_INSTRUCTIONS = (
     "Before proposing, ALWAYS call `list_vertex_types` to see what types already exist and read "
     "their usage notes. Never create a duplicate when an existing type's usage note already covers "
     "your data.\n"
+    "HIERARCHY (optional): you may organize types into an inheritance tree by setting `parent_type` "
+    "on a proposal to an EXISTING generic type the new one specializes (e.g. propose 'Pet' with "
+    "parent_type 'Animal'). Keep the parent generic, create the parent first, and only use a parent "
+    "when there is a genuine is-a relationship — otherwise omit it for a flat top-level type.\n"
     "STORING DATA: `create_vertex_type` only creates the TYPE (the category). To save an actual "
     "INSTANCE — e.g. the framework 'Django' — call `create_node` with that existing type and the "
     "instance's property values. The type must exist first. So the full flow is: "
@@ -157,26 +161,33 @@ def _build_evaluator_prompt(
     rationale: str,
     properties: list[VertexProperty],
     existing: list[dict[str, Any]],
+    parent: str | None = None,
 ) -> str:
     """Render the proposal + current ontology into a prompt for the evaluator."""
     if existing:
-        lines = [
-            f"- {row.get('name')}: {row.get('usage') or '(no usage note)'}"
-            for row in existing
-            if row.get("name")
-        ]
+        lines = []
+        for row in existing:
+            if not row.get("name"):
+                continue
+            note = row.get("usage") or "(no usage note)"
+            extends = f" [extends {row['parent_type']}]" if row.get("parent_type") else ""
+            lines.append(f"- {row.get('name')}{extends}: {note}")
         ontology = "\n".join(lines)
     else:
         ontology = "(the ontology is empty — no types exist yet)"
     props = ", ".join(f"{p.name}:{p.type}" for p in properties) or "(none)"
+    parent_line = f"  extends (parent type): {parent}\n" if parent else ""
     return (
         f"Existing types in the ontology:\n{ontology}\n\n"
         f"Proposed new {kind}:\n"
         f"  name: {name}\n"
         f"  usage: {usage}\n"
+        f"{parent_line}"
         f"  properties: {props}\n"
         f"  rationale: {rationale}\n\n"
-        "Should this type be added? Judge it semantically and return your verdict."
+        "Should this type be added? Judge it semantically and return your verdict. "
+        "If a parent type is given, also judge whether that inheritance is sensible "
+        "(the parent should be a genuine, more-general category of the proposed type)."
     )
 
 
@@ -204,6 +215,7 @@ async def _evaluate_proposal(
     usage: str,
     rationale: str,
     properties: list[VertexProperty],
+    parent: str | None = None,
 ) -> EvaluatorVerdict:
     """Ask the evaluator to judge a proposal. Fails open (approves) on any error."""
     try:
@@ -213,7 +225,7 @@ async def _evaluate_proposal(
             "evaluator: ontology unavailable; approving %s %r by default", kind, name, exc_info=True
         )
         return EvaluatorVerdict(approved=True, reason="evaluator skipped (ontology unavailable)")
-    prompt = _build_evaluator_prompt(kind, name, usage, rationale, properties, existing)
+    prompt = _build_evaluator_prompt(kind, name, usage, rationale, properties, existing, parent)
     try:
         result = await _get_evaluator().run(prompt, usage=ctx.usage)
         return result.output
@@ -233,7 +245,12 @@ async def list_vertex_types(ctx: RunContext[GraphDependencies]) -> list[VertexTy
     """
     rows = await repo.list_vertex_types(ctx.deps.db)
     return [
-        VertexTypeInfo(name=r["name"], usage=r.get("usage"), properties=r.get("properties", []))
+        VertexTypeInfo(
+            name=r["name"],
+            usage=r.get("usage"),
+            parent_type=r.get("parent_type"),
+            properties=r.get("properties", []),
+        )
         for r in rows
         if r.get("name")
     ]
@@ -251,6 +268,31 @@ async def propose_schema_change(
     recorded (so create_vertex_type stays blocked) and the returned guidance steers you toward the
     right existing type or a revision.
     """
+    # If a parent was named, it must already exist and be an agent-editable (non-internal) vertex
+    # type — you can't subclass the memory system's own types. Reject early (before the evaluator)
+    # so create_vertex_type stays blocked and the agent fixes the hierarchy first.
+    if args.parent_type is not None:
+        reason: str | None = None
+        if args.parent_type in _PROTECTED_VERTEX_TYPES:
+            reason = (
+                f"'{args.parent_type}' is an internal type and cannot be extended. Propose a "
+                "generic parent you created, or omit parent_type for a flat type."
+            )
+        elif not await repo.vertex_type_exists(ctx.deps.db, args.parent_type):
+            reason = (
+                f"Parent type '{args.parent_type}' does not exist yet. Create it first "
+                "(propose_schema_change → create_vertex_type), or omit parent_type."
+            )
+        if reason is not None:
+            ctx.deps.proposed_schemas.pop(args.node_name, None)
+            return SchemaProposal(
+                approved=False,
+                node_name=args.node_name,
+                usage=args.usage,
+                parent_type=args.parent_type,
+                properties=args.properties,
+                guidance=reason,
+            )
     verdict = await _evaluate_proposal(
         ctx,
         kind="vertex type",
@@ -258,6 +300,7 @@ async def propose_schema_change(
         usage=args.usage,
         rationale=args.rationale,
         properties=args.properties,
+        parent=args.parent_type,
     )
     if not verdict.approved:
         ctx.deps.proposed_schemas.pop(args.node_name, None)  # clear any stale prior approval
@@ -265,18 +308,21 @@ async def propose_schema_change(
             approved=False,
             node_name=args.node_name,
             usage=args.usage,
+            parent_type=args.parent_type,
             properties=args.properties,
             suggested_existing_type=verdict.suggested_existing_type,
             guidance=_rejection_guidance("create_vertex_type", verdict),
         )
+    extends_note = f" (extending '{args.parent_type}')" if args.parent_type else ""
     proposal = SchemaProposal(
         approved=True,
         node_name=args.node_name,
         usage=args.usage,
+        parent_type=args.parent_type,
         properties=args.properties,
         guidance=(
-            f"Approved. To create it, call create_vertex_type(node_name='{args.node_name}'). "
-            "If a suitable generic type already exists, store your data there instead."
+            f"Approved{extends_note}. To create it, call create_vertex_type(node_name="
+            f"'{args.node_name}'). If a suitable generic type already exists, store your data there instead."
         ),
     )
     ctx.deps.proposed_schemas[args.node_name] = proposal
@@ -298,10 +344,11 @@ async def create_vertex_type(ctx: RunContext[GraphDependencies], node_name: str)
         )
     props = {p.name: p.type for p in proposal.properties}
     newly_created = await repo.create_vertex_type(
-        ctx.deps.db, node_name, usage=proposal.usage, properties=props
+        ctx.deps.db, node_name, usage=proposal.usage, properties=props, parent_type=proposal.parent_type
     )
     verb = "Created" if newly_created else "Confirmed existing"
-    return f"{verb} vertex type '{node_name}' with {len(props)} propert(y/ies) for this user."
+    extends = f" extending '{proposal.parent_type}'" if proposal.parent_type else ""
+    return f"{verb} vertex type '{node_name}'{extends} with {len(props)} propert(y/ies) for this user."
 
 
 @ontology_capability.tool

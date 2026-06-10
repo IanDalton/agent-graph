@@ -1,4 +1,4 @@
-import type { AppConfig, Conversation, StoredMessage } from "@/types";
+import type { AppConfig, Conversation, MemoryGraph, StoredMessage } from "@/types";
 
 const json = async <T>(res: Response): Promise<T> => {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -41,4 +41,9 @@ export const api = {
       )}`,
       { method: "POST" }
     ).then(json<{ summary: string }>),
+
+  getGraph: (userId: string, limit = 100) =>
+    fetch(
+      `/api/graph?user_id=${encodeURIComponent(userId)}&limit=${limit}`
+    ).then(json<MemoryGraph>),
 };

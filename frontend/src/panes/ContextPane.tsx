@@ -7,6 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
+import { MemoryGraphCard } from "@/panes/GraphPane";
 import type { AppConfig } from "@/types";
 
 function ConfigRow({
@@ -139,6 +140,7 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
         <div className="space-y-3 p-3">
           <ConfigCard />
           <SummaryCard refreshKey={refreshKey} />
+          <MemoryGraphCard refreshKey={refreshKey} />
         </div>
       </ScrollArea>
     </aside>

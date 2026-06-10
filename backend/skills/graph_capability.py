@@ -100,12 +100,24 @@ def _text(content: Any) -> str:
 memory_capability = Capability(id="ConversationMemory", instructions=INSTRUCTIONS)
 
 
+async def _embed(ctx: RunContext[GraphDependencies], text: str) -> list[float] | None:
+    """Embed ``text`` via the run's embedder, or None when embeddings are disabled/unavailable.
+
+    Tolerant: the embedder already swallows its own errors, so callers just fall back to LIKE.
+    """
+    embedder = ctx.deps.embedder
+    return await embedder.embed(text) if embedder is not None else None
+
+
 @memory_capability.tool
 async def search_memory(ctx: RunContext[GraphDependencies], query: str) -> MemorySearchResult:
-    """Search the user's past messages and stored facts for relevant context."""
+    """Search the user's past messages and stored facts for relevant context.
+
+    Facts are ranked by semantic similarity when embeddings are enabled, else by substring match.
+    """
     deps = ctx.deps
     messages = await repo.search_messages(deps.db, deps.user_id, query)
-    facts = await repo.search_facts(deps.db, deps.user_id, query)
+    facts = await repo.search_facts(deps.db, deps.user_id, query, embedding=await _embed(ctx, query))
     hits = [
         MemoryHit(kind="message", content=m.get("content", ""), created_at=m.get("created_at"))
         for m in messages
@@ -133,14 +145,16 @@ async def store_fact(ctx: RunContext[GraphDependencies], args: StoreFactArgs) ->
 
     Search first: if a related fact already exists, prefer update_fact over storing a duplicate.
     """
-    await repo.store_fact(ctx.deps.db, ctx.deps.user_id, args.text)
+    await repo.store_fact(ctx.deps.db, ctx.deps.user_id, args.text, embedding=await _embed(ctx, args.text))
     return f"Stored fact for user {ctx.deps.user_id}."
 
 
 @memory_capability.tool
 async def update_fact(ctx: RunContext[GraphDependencies], fact_id: str, text: str) -> str:
     """Revise an existing fact in place (use its fact_id from search_memory) instead of duplicating it."""
-    updated = await repo.update_fact(ctx.deps.db, ctx.deps.user_id, fact_id, text)
+    updated = await repo.update_fact(
+        ctx.deps.db, ctx.deps.user_id, fact_id, text, embedding=await _embed(ctx, text)
+    )
     if not updated:
         raise ModelRetry(
             f"No fact with id {fact_id!r} for this user. Use search_memory to find the correct fact_id."

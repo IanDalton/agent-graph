@@ -95,6 +95,15 @@ class ProposeSchemaArgs(BaseModel):
             "This is persisted on the type so future runs can read it and reuse the right type."
         ),
     )
+    parent_type: str | None = Field(
+        None,
+        description=(
+            "OPTIONAL: an EXISTING generic vertex type for this one to EXTEND, when building a "
+            "hierarchy (e.g. propose 'Pet' extending 'Animal', or 'WebFramework' extending "
+            "'SoftwareFramework'). The parent must already exist and be generic. Omit it unless a "
+            "clear, already-created parent type applies — a flat type (no parent) is the default."
+        ),
+    )
     properties: list[VertexProperty] = Field(
         default_factory=list, description="Optional typed properties the generic type should carry."
     )
@@ -110,6 +119,13 @@ class ProposeSchemaArgs(BaseModel):
             raise ValueError("node_name must be PascalCase and alphanumeric (e.g. 'SoftwareFramework').")
         return v
 
+    @field_validator("parent_type")
+    @classmethod
+    def _parent_pascal_case(cls, v: str | None) -> str | None:
+        if v is not None and not _PASCAL_CASE_RE.match(v):
+            raise ValueError("parent_type must be PascalCase and alphanumeric (e.g. 'Animal').")
+        return v
+
 
 class SchemaProposal(BaseModel):
     """Validated, approved proposal returned by propose_schema_change and consumed by create_vertex_type."""
@@ -117,6 +133,9 @@ class SchemaProposal(BaseModel):
     approved: bool = Field(..., description="True when the proposal passed structural validation.")
     node_name: str
     usage: str = Field(..., description="The 'when to use this type' instruction persisted on the type.")
+    parent_type: str | None = Field(
+        None, description="Existing vertex type this one EXTENDS, or None for a flat (top-level) type."
+    )
     properties: list[VertexProperty] = Field(default_factory=list)
     suggested_existing_type: str | None = Field(
         None,
@@ -130,6 +149,9 @@ class VertexTypeInfo(BaseModel):
 
     name: str
     usage: str | None = Field(None, description="The stored 'when to use' note, if the type has one.")
+    parent_type: str | None = Field(
+        None, description="The vertex type this one EXTENDS, if any (so you can see the hierarchy)."
+    )
     properties: list[str] = Field(default_factory=list, description="Names of the type's declared properties.")
 
 
