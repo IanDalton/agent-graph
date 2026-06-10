@@ -62,6 +62,13 @@ class ArcadeClient:
     or use the client as an async context manager.
     """
 
+    # Databases (keyed by ``url/database``) whose existence + schema have already been ensured in
+    # this process. ``ensure_database``/``ensure_schema`` are idempotent but cost ~30 sequential
+    # round-trips; without this cache every read request (message load, summary, conversation list)
+    # re-ran them, which is what made conversation loading slow. Cleared on process restart, so a
+    # redeploy that adds schema still re-ensures.
+    _ensured: set[str] = set()
+
     def __init__(
         self,
         url: str | None = None,
@@ -169,12 +176,21 @@ class ArcadeClient:
         resp.raise_for_status()
         return bool(resp.json().get("result", False))
 
+    @property
+    def _ensure_key(self) -> str:
+        return f"{self.url}/{self.database}"
+
     async def ensure_database(self) -> None:
         """Create the configured database if it does not yet exist. Idempotent.
 
         Per-user isolation: each user's :class:`ArcadeClient` points at its own
         database, created on first use. Requires the server root user.
+
+        Skips the existence check entirely once this database has been ensured in this process
+        (see :attr:`_ensured`), so repeated requests don't pay the round-trip.
         """
+        if self._ensure_key in ArcadeClient._ensured:
+            return
         if not await self.database_exists():
             await self._server_command(f"create database {self.database}")
 
@@ -190,8 +206,11 @@ class ArcadeClient:
         """Create the vertex/edge types and indexes the agent relies on.
 
         Idempotent: every statement uses ``IF NOT EXISTS`` so it is safe to call
-        on every startup.
+        on every startup. Cached per process (see :attr:`_ensured`): the ~30 DDL round-trips run
+        once per database, not on every request.
         """
+        if self._ensure_key in ArcadeClient._ensured:
+            return
         statements = [
             # Vertex types (`IF NOT EXISTS` is a suffix in ArcadeDB SQL).
             "CREATE VERTEX TYPE User IF NOT EXISTS",
@@ -235,3 +254,5 @@ class ArcadeClient:
         ]
         for stmt in statements:
             await self.command(stmt)
+        # Both existence and schema are now guaranteed for this database in this process.
+        ArcadeClient._ensured.add(self._ensure_key)

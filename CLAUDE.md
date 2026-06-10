@@ -122,7 +122,32 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   included; a corrupt blob is skipped, not fatal), and streams events using the
   `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
   `build_agent()` adds `build_search()` to the capability list, and `run()` opens a `WebClient`
-  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
+  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`. The streaming itself
+  lives in `stream_run(prompt, user_id, conversation_id)`, an async generator that maps Pydantic AI
+  events to a **stable event vocabulary** — `thinking`/`text`/`tool_call`/`tool_result`/`final` dicts
+  — so callers never depend on the library's event classes; `run()` just consumes it for the CLI
+  (thinking in blue, text plain). This is the single streaming source of truth, shared with the API.
+- **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
+  DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
+  `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
+  (read-only model/DB/search/log surface, **no secrets**), `GET|POST /api/conversations` (list /
+  create — create mints a uuid `conversation_id`), `GET /api/conversations/{id}/messages`,
+  `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
+  summary), and `POST /api/chat/stream` (a `StreamingResponse` of `text/event-stream` that writes each
+  `stream_run` event as one `data:` frame; a failure becomes a final `{"type":"error"}` frame rather
+  than a dropped connection). CORS allows the Vite dev origin (`:5173`). This backs the `frontend/` UI.
+
+## Frontend (`frontend/`)
+
+React + Vite + TypeScript SPA using **shadcn/ui** components (Tailwind + Radix). A three-pane
+"Mission Control" shell built so future modes (Research/Swarm/Council) slot in as components:
+left `Sidebar` (conversation list + New Chat, with a per-row mode icon — only 💬 Regular today),
+middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
+chain-of-thought timeline), right `ContextPane` (read-only config card + live LLM summary). State is
+plain React Context (`AppContext`: `userId`, conversations, active id) + a `useChat` reducer for
+per-conversation message/streaming state — no React Query, to keep the dependency surface small.
+Streaming uses `fetch` + a `ReadableStream` reader (in `api/stream.ts`) since `EventSource` is
+GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxies `/api` → `:8000`).
 
 ## Infrastructure (docker-compose.yml)
 
@@ -142,9 +167,11 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 
 ```bash
 docker compose up -d arcadedb searxng  # ArcadeDB (DB AgentMemory auto-created) + SearXNG (web search)
-pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv
+pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv, fastapi, uvicorn
 python -m backend.main "remember I like Recoleta apartments" --user u1 --conversation c1
 python -m pytest backend/tests/   # unit tests run without a DB/network; the integration test skips if :2480 is down
+uvicorn backend.api:app --reload --port 8000   # HTTP/SSE API backing the web UI
+cd frontend && npm install && npm run dev       # web UI on http://localhost:5173 (proxies /api -> :8000)
 # verify the SearXNG JSON API the WebClient depends on:
 curl "http://localhost:8085/search?q=arcadedb&format=json"
 ```

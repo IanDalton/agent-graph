@@ -23,6 +23,7 @@ from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.capabilities import Capability, Hooks
 from pydantic_ai.messages import TextPart, ToolCallPart, UserPromptPart
 
+from backend import summarization
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.schemas.graph_schemas import (
@@ -232,6 +233,12 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
                     repo.append_message(deps.db, deps.user_id, deps.conversation_id, "assistant", _text(part.content)),
                     what="append_assistant_message",
                 )
+    # Refresh the cached conversation summary, but only once every N messages (handled inside).
+    # The response has already streamed to the user; this runs after, and is best-effort.
+    await _best_effort(
+        summarization.maybe_refresh_summary(deps.db, deps.conversation_id),
+        what="refresh_summary",
+    )
     return result
 
 

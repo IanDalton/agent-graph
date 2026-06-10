@@ -120,6 +120,67 @@ async def get_recent_messages(
     return list(reversed(rows))
 
 
+async def count_messages(db: ArcadeClient, conversation_id: str) -> int:
+    """Number of messages in a conversation (fast indexed count)."""
+    rows = await db.query(
+        "SELECT count(*) AS n FROM Message WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return int(rows[0].get("n", 0)) if rows else 0
+
+
+async def get_conversation_summary(db: ArcadeClient, conversation_id: str) -> dict[str, Any]:
+    """Return the cached summary + the message count it was generated at.
+
+    Defaults (``""``/``0``) when the conversation has no summary yet, so callers can compare the
+    current message count against ``summary_message_count`` to decide whether a refresh is due.
+    """
+    rows = await db.query(
+        "SELECT summary, summary_message_count FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    row = rows[0] if rows else {}
+    return {
+        "summary": row.get("summary") or "",
+        "summary_message_count": int(row.get("summary_message_count") or 0),
+    }
+
+
+async def set_conversation_summary(
+    db: ArcadeClient,
+    conversation_id: str,
+    summary: str,
+    message_count: int,
+) -> None:
+    """Store a freshly generated summary and the message count it reflects on the Conversation."""
+    await db.command(
+        "UPDATE Conversation SET summary = :s, summary_message_count = :n, "
+        "summary_updated_at = :ts WHERE conversation_id = :cid",
+        {"s": summary, "n": message_count, "ts": _now(), "cid": conversation_id},
+    )
+
+
+async def list_conversations(
+    db: ArcadeClient,
+    user_id: str,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return this user's conversations, most recently started first.
+
+    Backs the UI's left-pane conversation list. Scoped by ``user_id`` (defense-in-depth on
+    top of the per-user database). ``mode`` is reported as a constant ``"regular"`` for now —
+    a stable field the frontend's mode-icon logic can read before other modes exist.
+    """
+    rows = await db.query(
+        "SELECT conversation_id, title, started_at FROM Conversation "
+        "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
+    for row in rows:
+        row["mode"] = "regular"
+    return rows
+
+
 async def search_messages(
     db: ArcadeClient,
     user_id: str,

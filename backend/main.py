@@ -12,11 +12,13 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, AsyncIterator
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
     ModelMessage,
     ModelMessagesTypeAdapter,
     PartDeltaEvent,
@@ -79,8 +81,32 @@ def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
     return history
 
 
-async def run(prompt: str, user_id: str = "default", conversation_id: str = "default") -> str:
-    """Run one turn, streaming thinking/text to stdout, and return the final output."""
+def _jsonable(value: Any) -> Any:
+    """Coerce arbitrary tool args/results into something JSON-serializable for an SSE frame.
+
+    Tool args arrive as a dict or a raw JSON string; tool results can be any Python value.
+    Anything that isn't a plain JSON scalar/container is rendered as its ``str``.
+    """
+    if value is None or isinstance(value, (str, int, float, bool, dict, list)):
+        return value
+    return str(value)
+
+
+async def stream_run(
+    prompt: str, user_id: str = "default", conversation_id: str = "default"
+) -> AsyncIterator[dict[str, Any]]:
+    """Run one turn and yield structured events as they stream from the model.
+
+    This is the single streaming source of truth, consumed by both the CLI (``run``) and the
+    HTTP/SSE API (``backend.api``). Pydantic AI's event objects are mapped to a small, stable
+    vocabulary so callers never depend on the library's event classes:
+
+    - ``{"type": "thinking", "delta": str}`` — a chunk of the model's reasoning
+    - ``{"type": "text", "delta": str}`` — a chunk of the user-facing answer
+    - ``{"type": "tool_call", "tool_name", "tool_call_id", "args"}`` — a tool invocation
+    - ``{"type": "tool_result", "tool_name", "tool_call_id", "content"}`` — its return
+    - ``{"type": "final", "text": str}`` — the fully assembled answer (always emitted last)
+    """
     agent = build_agent()
     # Each user gets their own database, so no user's data can surface in another
     # user's queries. The database is created on first use.
@@ -102,20 +128,56 @@ async def run(prompt: str, user_id: str = "default", conversation_id: str = "def
         final_text = ""
         async with agent.run_stream_events(prompt, deps=deps, message_history=history) as stream:
             async for event in stream:
+                if isinstance(event, FunctionToolCallEvent):
+                    yield {
+                        "type": "tool_call",
+                        "tool_name": event.part.tool_name,
+                        "tool_call_id": event.part.tool_call_id,
+                        "args": _jsonable(event.part.args),
+                    }
+                    continue
+                if isinstance(event, FunctionToolResultEvent):
+                    part = event.part
+                    yield {
+                        "type": "tool_result",
+                        "tool_name": getattr(part, "tool_name", None),
+                        "tool_call_id": getattr(part, "tool_call_id", None),
+                        "content": _jsonable(getattr(part, "content", None)),
+                    }
+                    continue
+
+                node = event
                 if isinstance(event, PartStartEvent):
-                    event = event.part
+                    node = event.part
                 elif isinstance(event, PartDeltaEvent):
-                    event = event.delta
-                if isinstance(event, ThinkingPartDelta):
-                    print(f"\033[94m{event.content_delta}\033[0m", end="", flush=True)
-                elif isinstance(event, TextPart):
-                    final_text += event.content
-                    print(event.content, end="", flush=True)
-                elif isinstance(event, TextPartDelta):
-                    final_text += event.content_delta
-                    print(event.content_delta, end="", flush=True)
-        print()
-        return final_text
+                    node = event.delta
+
+                if isinstance(node, ThinkingPartDelta):
+                    if node.content_delta:
+                        yield {"type": "thinking", "delta": node.content_delta}
+                elif isinstance(node, TextPart):
+                    final_text += node.content
+                    yield {"type": "text", "delta": node.content}
+                elif isinstance(node, TextPartDelta):
+                    final_text += node.content_delta
+                    yield {"type": "text", "delta": node.content_delta}
+
+        yield {"type": "final", "text": final_text}
+
+
+async def run(prompt: str, user_id: str = "default", conversation_id: str = "default") -> str:
+    """Run one turn, streaming thinking/text to stdout, and return the final output."""
+    final_text = ""
+    async for event in stream_run(prompt, user_id=user_id, conversation_id=conversation_id):
+        kind = event["type"]
+        if kind == "thinking":
+            print(f"\033[94m{event['delta']}\033[0m", end="", flush=True)
+        elif kind == "text":
+            print(event["delta"], end="", flush=True)
+        elif kind == "final":
+            final_text = event["text"]
+    print()
+    return final_text
 
 
 def _configure_logging() -> None:
