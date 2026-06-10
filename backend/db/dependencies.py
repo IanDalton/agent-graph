@@ -9,6 +9,7 @@ from backend.db.arcade_db import ArcadeClient
 
 if TYPE_CHECKING:
     from backend.schemas.graph_schemas import EdgeProposal, SchemaProposal
+    from backend.web.client import WebClient
 
 
 @dataclass
@@ -28,3 +29,7 @@ class GraphDependencies:
     # Same pattern for the edge pipeline: set by propose_edge_type, read by the
     # create_edge_type guard + tool. Keyed by edge_name.
     proposed_edges: dict[str, "EdgeProposal"] = field(default_factory=dict)
+    # Web access (SearXNG search + page fetch) for the WebSearch capability. Optional so
+    # existing constructions keep working; main.run() supplies one. When None, the web tools
+    # build a short-lived client from env per call.
+    web: "WebClient | None" = None

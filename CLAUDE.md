@@ -99,6 +99,21 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
     `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
     the same run (uses `proposed_schemas` / `proposed_edges` on the deps).
+- **`backend/web/client.py`** — `WebClient`: async `httpx` wrapper for the live internet, modeled on
+  `ArcadeClient` (env-driven, context manager, capped-backoff retry on transport/5xx). `search()`
+  hits SearXNG's JSON API (`GET {SEARXNG_URL}/search?format=json`, default
+  `http://localhost:8085`) and returns the trimmed `results` list; `fetch()` downloads a page
+  (byte-capped → `truncated`) and runs it through the stdlib-only `html_to_text` extractor.
+- **`backend/schemas/search_schemas.py`** — web tool I/O: `WebSearchArgs`/`WebSearchHit`/
+  `WebSearchResult`, `FetchUrlArgs` (its `http`/`https`-only validator is the safety boundary) and
+  `FetchPageResult`.
+- **`backend/skills/search_capability.py`** — the `WebSearch` bundle, exposed via `build_search()`:
+  a `Capability` with `web_search` (SearXNG search → ranked title/url/snippet) and `fetch_url`
+  (download + read a page's text). Both take the `WebClient` from `ctx.deps.web` when present, else
+  build a short-lived one from env. **Tolerant** like `run_query`: any failure (SearXNG down, HTTP
+  error, bad page) is caught and returned as a structured `error` result, never raised — so a web
+  hiccup can't abort the run. Tool calls are logged automatically by the memory capability's
+  `after_tool_execute` hook (no extra persistence here).
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
@@ -106,6 +121,8 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   serialized `RunMessages` blobs deserialized with `ModelMessagesTypeAdapter` — faithful, tool calls
   included; a corrupt blob is skipped, not fatal), and streams events using the
   `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
+  `build_agent()` adds `build_search()` to the capability list, and `run()` opens a `WebClient`
+  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
 
 ## Infrastructure (docker-compose.yml)
 
@@ -115,16 +132,21 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   / password `playwithdata`; the per-database `admin` user (from `defaultDatabases`) **cannot alter
   the schema or create databases**, so `ArcadeClient` defaults to `root`. Data persisted in the
   `arcadedb_data` volume.
-- **searxng** — web search at `http://localhost:8085`. Expects config in `./docker/searxng` (this
-  directory does not exist yet and must be created before the service is useful).
+- **searxng** — web search at `http://localhost:8085`, backing the `WebSearch` capability. Config in
+  `./docker/searxng/settings.yml`, which enables the **JSON output format** (`search.formats: [html,
+  json]`) the `WebClient` calls and turns the bot **`limiter` off** — both are disabled by default,
+  so the JSON API is unusable without it. The placeholder `secret_key`/`limiter: false` are dev-only.
+  Override the base URL with `SEARXNG_URL` if not on the compose default.
 
 ## Commands
 
 ```bash
-docker compose up -d arcadedb     # start ArcadeDB (DB AgentMemory auto-created)
+docker compose up -d arcadedb searxng  # ArcadeDB (DB AgentMemory auto-created) + SearXNG (web search)
 pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv
 python -m backend.main "remember I like Recoleta apartments" --user u1 --conversation c1
-python -m pytest backend/tests/   # unit tests run without a DB; the integration test skips if :2480 is down
+python -m pytest backend/tests/   # unit tests run without a DB/network; the integration test skips if :2480 is down
+# verify the SearXNG JSON API the WebClient depends on:
+curl "http://localhost:8085/search?q=arcadedb&format=json"
 ```
 
 Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL` (e.g.
@@ -141,3 +163,6 @@ Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL
   tools or hooks, so the two paths stay consistent.
 - Keep the read-only guard on `run_query` (`is_read_only` + the idempotent `query()` endpoint) and
   the "check existing data/schema first" instruction when editing the capability.
+- The web tools (`web_search`/`fetch_url`) must stay **tolerant**: catch failures and return an
+  `error` result rather than raising, so a SearXNG/network hiccup never aborts the agent run (same
+  contract as `run_query`). Keep the `http`/`https`-only validator on `FetchUrlArgs`.

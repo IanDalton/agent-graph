@@ -1,0 +1,23 @@
+# SearXNG configuration override for agent-graph.
+#
+# Mounted at /etc/searxng (see docker-compose.yml). SearXNG starts from its built-in defaults
+# (`use_default_settings: true`) and applies only the overrides below.
+#
+# Two defaults block programmatic use out of the box and are changed here:
+#   - the JSON output format is disabled  -> the WebClient calls /search?format=json
+#   - the bot `limiter` blocks non-browser clients -> turned off for local/dev use
+#
+# NOTE (dev only): the placeholder `secret_key` and `limiter: false` are conveniences for local
+# development. A real deployment must set a strong secret_key and reconsider the limiter.
+use_default_settings: true
+
+server:
+  # Required: SearXNG refuses to start without a secret_key. Change this for any real deployment.
+  secret_key: "change-me-dev-only"
+  # Allow programmatic JSON queries (the limiter blocks non-browser requests by default).
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

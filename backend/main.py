@@ -32,6 +32,8 @@ from backend.db.dependencies import GraphDependencies
 from backend.model_selection import select_model
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
+from backend.skills.search_capability import build_search
+from backend.web.client import WebClient
 
 logger = logging.getLogger("agent_graph.main")
 
@@ -46,7 +48,12 @@ def build_agent() -> Agent[GraphDependencies, str]:
     return Agent(
         select_model("AGENT_MODEL"),
         deps_type=GraphDependencies,
-        capabilities=[Thinking(effort="minimal"), *build_memory(), *build_ontology()],
+        capabilities=[
+            Thinking(effort="minimal"),
+            *build_memory(),
+            *build_ontology(),
+            *build_search(),
+        ],
     )
 
 
@@ -77,10 +84,12 @@ async def run(prompt: str, user_id: str = "default", conversation_id: str = "def
     agent = build_agent()
     # Each user gets their own database, so no user's data can surface in another
     # user's queries. The database is created on first use.
-    async with ArcadeClient(database=database_name_for_user(user_id)) as db:
+    async with ArcadeClient(database=database_name_for_user(user_id)) as db, WebClient() as web:
         await db.ensure_database()
         await db.ensure_schema()
-        deps = GraphDependencies(db=db, user_id=user_id, conversation_id=conversation_id)
+        deps = GraphDependencies(
+            db=db, user_id=user_id, conversation_id=conversation_id, web=web
+        )
 
         # Load the prior turns of this thread so the agent retains context. The
         # persistence hooks store each run but never reload it, so without this
