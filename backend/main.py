@@ -29,6 +29,7 @@ from pydantic_ai.messages import (
 from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
+from backend.model_selection import select_model
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
 
@@ -42,16 +43,8 @@ def build_agent() -> Agent[GraphDependencies, str]:
     (e.g. ``openai:gpt-5.2``). If unset, a local Ollama model named by
     ``OLLAMA_MODEL`` is used (mirrors the original notebook prototype).
     """
-    model_string = os.getenv("AGENT_MODEL")
-    if model_string:
-        model: Agent | str = model_string
-    else:
-        from pydantic_ai.models.ollama import OllamaModel
-
-        model = OllamaModel(os.getenv("OLLAMA_MODEL", "qwen3"))
-
     return Agent(
-        model,
+        select_model("AGENT_MODEL"),
         deps_type=GraphDependencies,
         capabilities=[Thinking(effort="minimal"), *build_memory(), *build_ontology()],
     )

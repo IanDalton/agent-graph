@@ -118,6 +118,10 @@ class SchemaProposal(BaseModel):
     node_name: str
     usage: str = Field(..., description="The 'when to use this type' instruction persisted on the type.")
     properties: list[VertexProperty] = Field(default_factory=list)
+    suggested_existing_type: str | None = Field(
+        None,
+        description="When rejected because an existing type already covers it: that type's name.",
+    )
     guidance: str = Field(..., description="Next step for the agent (e.g. call create_vertex_type).")
 
 
@@ -127,6 +131,24 @@ class VertexTypeInfo(BaseModel):
     name: str
     usage: str | None = Field(None, description="The stored 'when to use' note, if the type has one.")
     properties: list[str] = Field(default_factory=list, description="Names of the type's declared properties.")
+
+
+class EvaluatorVerdict(BaseModel):
+    """Semantic judgment from the ontology evaluator sub-agent on a proposed vertex/edge type."""
+
+    approved: bool = Field(
+        ..., description="True if the proposed type is a good, generic, non-duplicate addition."
+    )
+    reason: str = Field(
+        ..., description="One or two sentences explaining the verdict (especially why rejected)."
+    )
+    suggested_existing_type: str | None = Field(
+        None,
+        description="If a current type already covers this, its exact name; otherwise null.",
+    )
+    revision_hint: str | None = Field(
+        None, description="If rejected, how to revise the proposal; otherwise null."
+    )
 
 
 class CreateNodeArgs(BaseModel):
@@ -233,6 +255,10 @@ class EdgeProposal(BaseModel):
     edge_name: str
     usage: str = Field(..., description="The 'when to use this relationship' instruction persisted on the type.")
     properties: list[VertexProperty] = Field(default_factory=list)
+    suggested_existing_type: str | None = Field(
+        None,
+        description="When rejected because an existing type already covers it: that type's name.",
+    )
     guidance: str = Field(..., description="Next step for the agent (e.g. call create_edge_type).")
 
 

@@ -5,7 +5,12 @@ through a guarded pipeline that prevents ontology fragmentation and DDL injectio
 
 1. ``propose_schema_change`` — the cognitive layer. Never touches the database. It validates a
    proposed node type structurally (PascalCase name, typed properties), requires a brief usage
-   instruction, and records the approved proposal in run-scoped state.
+   instruction, then asks an LLM **evaluator sub-agent** to judge it *semantically* against the
+   existing ontology (is it generic? a duplicate? should an existing type be reused?). Only an
+   approved proposal is recorded in run-scoped state; a rejected one is returned with the
+   evaluator's reasoning and a steer toward the right existing type, and is NOT recorded — so the
+   executor stays blocked. The evaluator fails open: if it errors, the proposal is approved as
+   before, so a flaky evaluator never crashes or stalls the run.
 2. ``create_vertex_type`` — the executor. Only runs a node type that was approved earlier in the
    same run; a ``before_tool_execute`` guard rejects any attempt to skip step 1.
 
@@ -18,24 +23,33 @@ All DB access goes through :mod:`backend.db.repository`.
 
 from __future__ import annotations
 
-from pydantic_ai import ModelRetry, RunContext
+import logging
+import os
+from typing import Any
+
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.capabilities import Capability, Hooks
 from pydantic_ai.messages import ToolCallPart
 
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
+from backend.model_selection import select_model
 from backend.schemas.graph_schemas import (
     CreateEdgeArgs,
     CreateNodeArgs,
     DropEdgeTypeArgs,
     DropVertexTypeArgs,
     EdgeProposal,
+    EvaluatorVerdict,
     ProposeEdgeArgs,
     ProposeSchemaArgs,
     SchemaProposal,
     UpdateNodeArgs,
+    VertexProperty,
     VertexTypeInfo,
 )
+
+logger = logging.getLogger("agent_graph.ontology")
 
 # Internal vertex types the agent must not edit/delete via the generic node/type tools; facts have
 # their own update_fact/delete_fact tools, and conversation/message/log/replay records are managed by
@@ -92,6 +106,124 @@ ONTOLOGY_INSTRUCTIONS = (
 ontology_capability = Capability(id="OntologyManager", instructions=ONTOLOGY_INSTRUCTIONS)
 
 
+# --------------------------------------------------------------------------- #
+# Semantic evaluator sub-agent
+#
+# A small delegated agent that judges whether a proposed vertex/edge type is a good addition to the
+# ontology, given the types that already exist. The propose_* tools call it after Pydantic's
+# structural validation; only an approved verdict records the proposal (and so unblocks the matching
+# create_*_type). It runs on EVALUATOR_MODEL if set, else the same model the main agent uses.
+# --------------------------------------------------------------------------- #
+_EVALUATOR_INSTRUCTIONS = (
+    "You are an ontology reviewer for a knowledge graph. You judge ONE proposed type at a time and "
+    "decide whether it should be added to the graph's schema.\n"
+    "Structural rules (PascalCase vertex names, UPPER_SNAKE_CASE edge names, valid property types) "
+    "are ALREADY enforced before you see the proposal — do NOT re-check them. Judge SEMANTICS only.\n"
+    "APPROVE only when the proposal is a GENERIC, reusable CATEGORY or RELATION that is NOT already "
+    "covered by one of the existing types' name or usage note.\n"
+    "REJECT when:\n"
+    "  - It is a specific INSTANCE, not a category (e.g. 'React', 'Python', 'JohnDoe', 'WORKS_AT_GOOGLE'). "
+    "Those belong as DATA (a node/edge) inside a generic type, not as a type.\n"
+    "  - An existing type already covers it (a duplicate or near-synonym, e.g. 'UTILIZES' when 'USES' "
+    "exists, or 'WebFramework' when 'SoftwareFramework' exists). Set suggested_existing_type to that "
+    "type's EXACT name.\n"
+    "  - It is too narrow/over-specific to be reused.\n"
+    "When you reject, give a brief reason and, when applicable, a revision_hint (how to generalize) "
+    "and/or suggested_existing_type (the existing type to use instead)."
+)
+
+_evaluator_agent: Agent[None, EvaluatorVerdict] | None = None
+
+
+def _get_evaluator() -> Agent[None, EvaluatorVerdict]:
+    """Lazily build the module-level evaluator agent (so importing this module needs no model env).
+
+    Tests override its model with ``_get_evaluator().override(model=...)`` — the standard Pydantic AI
+    test seam — so they never hit a real LLM.
+    """
+    global _evaluator_agent
+    if _evaluator_agent is None:
+        model = os.getenv("EVALUATOR_MODEL") or select_model("AGENT_MODEL")
+        _evaluator_agent = Agent(
+            model, output_type=EvaluatorVerdict, instructions=_EVALUATOR_INSTRUCTIONS
+        )
+    return _evaluator_agent
+
+
+def _build_evaluator_prompt(
+    kind: str,
+    name: str,
+    usage: str,
+    rationale: str,
+    properties: list[VertexProperty],
+    existing: list[dict[str, Any]],
+) -> str:
+    """Render the proposal + current ontology into a prompt for the evaluator."""
+    if existing:
+        lines = [
+            f"- {row.get('name')}: {row.get('usage') or '(no usage note)'}"
+            for row in existing
+            if row.get("name")
+        ]
+        ontology = "\n".join(lines)
+    else:
+        ontology = "(the ontology is empty — no types exist yet)"
+    props = ", ".join(f"{p.name}:{p.type}" for p in properties) or "(none)"
+    return (
+        f"Existing types in the ontology:\n{ontology}\n\n"
+        f"Proposed new {kind}:\n"
+        f"  name: {name}\n"
+        f"  usage: {usage}\n"
+        f"  properties: {props}\n"
+        f"  rationale: {rationale}\n\n"
+        "Should this type be added? Judge it semantically and return your verdict."
+    )
+
+
+def _rejection_guidance(create_tool: str, verdict: EvaluatorVerdict) -> str:
+    """Build the steer text returned on a rejected proposal."""
+    parts = [f"Rejected by the ontology evaluator: {verdict.reason}"]
+    if verdict.suggested_existing_type:
+        parts.append(
+            f"Use the existing type '{verdict.suggested_existing_type}' instead "
+            "(store your data there via create_node/create_edge)."
+        )
+    if verdict.revision_hint:
+        parts.append(f"To revise: {verdict.revision_hint}")
+    parts.append(
+        f"This was NOT approved, so {create_tool} stays blocked until you submit an approved proposal."
+    )
+    return " ".join(parts)
+
+
+async def _evaluate_proposal(
+    ctx: RunContext[GraphDependencies],
+    *,
+    kind: str,
+    name: str,
+    usage: str,
+    rationale: str,
+    properties: list[VertexProperty],
+) -> EvaluatorVerdict:
+    """Ask the evaluator to judge a proposal. Fails open (approves) on any error."""
+    try:
+        existing = await repo.list_vertex_types(ctx.deps.db)
+    except Exception:  # noqa: BLE001 — best-effort; a DB hiccup must not block proposing.
+        logger.warning(
+            "evaluator: ontology unavailable; approving %s %r by default", kind, name, exc_info=True
+        )
+        return EvaluatorVerdict(approved=True, reason="evaluator skipped (ontology unavailable)")
+    prompt = _build_evaluator_prompt(kind, name, usage, rationale, properties, existing)
+    try:
+        result = await _get_evaluator().run(prompt, usage=ctx.usage)
+        return result.output
+    except Exception:  # noqa: BLE001 — FAIL-OPEN: never crash/block the run on a flaky evaluator.
+        logger.warning(
+            "evaluator failed for %s %r; approving by default", kind, name, exc_info=True
+        )
+        return EvaluatorVerdict(approved=True, reason="evaluator unavailable; approved by default")
+
+
 @ontology_capability.tool
 async def list_vertex_types(ctx: RunContext[GraphDependencies]) -> list[VertexTypeInfo]:
     """List the current ontology — every existing type with its usage note and property names.
@@ -113,9 +245,30 @@ async def propose_schema_change(
 ) -> SchemaProposal:
     """Propose a new GENERIC vertex type. Cognitive layer only — does NOT modify the database.
 
-    Pydantic has already enforced PascalCase + valid property types. Record the approved proposal
-    in run-scoped state so create_vertex_type can later execute it, and tell the agent the next step.
+    Pydantic has already enforced PascalCase + valid property types. An evaluator sub-agent then
+    judges the proposal semantically against the existing ontology. If approved, the proposal is
+    recorded in run-scoped state so create_vertex_type can later execute it. If rejected, it is NOT
+    recorded (so create_vertex_type stays blocked) and the returned guidance steers you toward the
+    right existing type or a revision.
     """
+    verdict = await _evaluate_proposal(
+        ctx,
+        kind="vertex type",
+        name=args.node_name,
+        usage=args.usage,
+        rationale=args.rationale,
+        properties=args.properties,
+    )
+    if not verdict.approved:
+        ctx.deps.proposed_schemas.pop(args.node_name, None)  # clear any stale prior approval
+        return SchemaProposal(
+            approved=False,
+            node_name=args.node_name,
+            usage=args.usage,
+            properties=args.properties,
+            suggested_existing_type=verdict.suggested_existing_type,
+            guidance=_rejection_guidance("create_vertex_type", verdict),
+        )
     proposal = SchemaProposal(
         approved=True,
         node_name=args.node_name,
@@ -175,9 +328,29 @@ async def propose_edge_type(
 ) -> EdgeProposal:
     """Propose a new GENERIC relationship (edge) type. Cognitive layer only — does NOT modify the DB.
 
-    Pydantic has enforced UPPER_SNAKE_CASE + valid property types. Record the approved proposal in
-    run-scoped state so create_edge_type can execute it, and tell the agent the next step.
+    Pydantic has enforced UPPER_SNAKE_CASE + valid property types. An evaluator sub-agent then judges
+    the proposal semantically against the existing ontology. If approved, it is recorded in run-scoped
+    state so create_edge_type can execute it. If rejected, it is NOT recorded (so create_edge_type
+    stays blocked) and the guidance steers you toward the right existing relationship or a revision.
     """
+    verdict = await _evaluate_proposal(
+        ctx,
+        kind="edge (relationship) type",
+        name=args.edge_name,
+        usage=args.usage,
+        rationale=args.rationale,
+        properties=args.properties,
+    )
+    if not verdict.approved:
+        ctx.deps.proposed_edges.pop(args.edge_name, None)  # clear any stale prior approval
+        return EdgeProposal(
+            approved=False,
+            edge_name=args.edge_name,
+            usage=args.usage,
+            properties=args.properties,
+            suggested_existing_type=verdict.suggested_existing_type,
+            guidance=_rejection_guidance("create_edge_type", verdict),
+        )
     proposal = EdgeProposal(
         approved=True,
         edge_name=args.edge_name,

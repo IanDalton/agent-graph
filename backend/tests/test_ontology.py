@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -30,6 +31,7 @@ from backend.skills.graph_capability import build_memory
 from backend.schemas.graph_schemas import UpdateNodeArgs
 from backend.schemas.graph_schemas import DropEdgeTypeArgs, DropVertexTypeArgs
 from backend.skills.ontology_capability import (
+    _get_evaluator,
     _require_prior_proposal,
     build_ontology,
     create_edge,
@@ -44,6 +46,31 @@ from backend.skills.ontology_capability import (
     propose_schema_change,
     update_node,
 )
+
+
+def _verdict_model(approved: bool, **kw: Any) -> TestModel:
+    """A TestModel that makes the evaluator return a fixed EvaluatorVerdict."""
+    return TestModel(custom_output_args={"approved": approved, "reason": "test", **kw})
+
+
+def _raising_evaluator() -> FunctionModel:
+    """An evaluator model that always errors, to exercise the fail-open path."""
+
+    def _boom(messages: Any, info: Any) -> Any:
+        raise RuntimeError("evaluator unavailable")
+
+    return FunctionModel(_boom)
+
+
+@pytest.fixture(autouse=True)
+def _approve_evaluator():
+    """Default the evaluator to APPROVE for every test, so the propose tools don't hit a real LLM.
+
+    Tests that need a different verdict nest their own ``_get_evaluator().override(model=...)``
+    (the innermost override wins).
+    """
+    with _get_evaluator().override(model=_verdict_model(True)):
+        yield
 
 ONTOLOGY_TOOLS = {
     "list_vertex_types",
@@ -147,6 +174,51 @@ def test_propose_records_approved_proposal_and_does_not_touch_db() -> None:
     assert deps.proposed_schemas["SoftwareFramework"].usage == args.usage
     # Purely cognitive: no commands were issued.
     assert db.commands == []
+
+
+# --------------------------------------------------------------------------- #
+# Evaluator sub-agent gate on propose_schema_change
+# --------------------------------------------------------------------------- #
+def test_propose_rejected_by_evaluator_is_not_recorded() -> None:
+    deps = _deps()
+    args = ProposeSchemaArgs(node_name="WebFramework", usage="web frameworks", rationale="r")
+    with _get_evaluator().override(
+        model=_verdict_model(False, suggested_existing_type="SoftwareFramework")
+    ):
+        proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+
+    assert proposal.approved is False
+    assert proposal.suggested_existing_type == "SoftwareFramework"
+    assert "SoftwareFramework" in proposal.guidance  # steers the agent to the existing type
+    # Not recorded -> the ordering guard keeps create_vertex_type blocked.
+    assert "WebFramework" not in deps.proposed_schemas
+    with pytest.raises(ModelRetry):
+        asyncio.run(create_vertex_type(_ctx(deps), "WebFramework"))
+
+
+def test_propose_rejection_clears_stale_prior_approval() -> None:
+    deps = _deps()
+    args = ProposeSchemaArgs(node_name="Thing", usage="things", rationale="r")
+    # First, an approval records it (autouse fixture approves).
+    asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert "Thing" in deps.proposed_schemas
+    # A later rejection of the same name must remove the stale entry so create stays blocked.
+    with _get_evaluator().override(model=_verdict_model(False)):
+        asyncio.run(propose_schema_change(_ctx(deps), args))
+    assert "Thing" not in deps.proposed_schemas
+
+
+def test_propose_fails_open_when_evaluator_errors(caplog: pytest.LogCaptureFixture) -> None:
+    deps = _deps()
+    args = ProposeSchemaArgs(node_name="Person", usage="people", rationale="r")
+    with _get_evaluator().override(model=_raising_evaluator()):
+        with caplog.at_level("WARNING", logger="agent_graph.ontology"):
+            proposal = asyncio.run(propose_schema_change(_ctx(deps), args))
+
+    # Fail-open: approved and recorded despite the evaluator error.
+    assert proposal.approved is True
+    assert "Person" in deps.proposed_schemas
+    assert any("evaluator failed" in r.message for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +370,32 @@ def test_propose_edge_records_and_does_not_touch_db() -> None:
     assert proposal.approved is True
     assert deps.proposed_edges["USES"].usage == "person uses framework"
     assert db.commands == []
+
+
+def test_propose_edge_rejected_by_evaluator_is_not_recorded() -> None:
+    deps = _deps()
+    args = ProposeEdgeArgs(edge_name="UTILIZES", usage="person utilizes framework", rationale="r")
+    with _get_evaluator().override(model=_verdict_model(False, suggested_existing_type="USES")):
+        proposal = asyncio.run(propose_edge_type(_ctx(deps), args))
+
+    assert proposal.approved is False
+    assert proposal.suggested_existing_type == "USES"
+    assert "USES" in proposal.guidance
+    assert "UTILIZES" not in deps.proposed_edges
+    with pytest.raises(ModelRetry):
+        asyncio.run(create_edge_type(_ctx(deps), "UTILIZES"))
+
+
+def test_propose_edge_fails_open_when_evaluator_errors(caplog: pytest.LogCaptureFixture) -> None:
+    deps = _deps()
+    args = ProposeEdgeArgs(edge_name="USES", usage="person uses framework", rationale="r")
+    with _get_evaluator().override(model=_raising_evaluator()):
+        with caplog.at_level("WARNING", logger="agent_graph.ontology"):
+            proposal = asyncio.run(propose_edge_type(_ctx(deps), args))
+
+    assert proposal.approved is True
+    assert "USES" in deps.proposed_edges
+    assert any("evaluator failed" in r.message for r in caplog.records)
 
 
 def test_create_edge_type_requires_prior_proposal_then_executes() -> None:
