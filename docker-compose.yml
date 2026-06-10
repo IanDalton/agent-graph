@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  arcadedb:
+    image: arcadedata/arcadedb:latest
+    container_name: agent_memory_db
+    environment:
+      - JAVA_OPTS=-Darcadedb.server.rootPassword=playwithdata -Darcadedb.server.defaultDatabases=AgentMemory[admin:playwithdata]
+    ports:
+      - "2480:2480" # HTTP API
+      - "2424:2424" # Binary port
+    volumes:
+      - arcadedb_data:/home/arcadedb/databases
+    restart: unless-stopped
+  searxng:
+    image: docker.io/searxng/searxng:${SEARXNG_VERSION:-latest}
+    ports:
+      # Accessible from host at http://localhost:8085
+      - "8085:8080"
+    volumes:
+      - ./docker/searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8085/
+
+volumes:
+  arcadedb_data:

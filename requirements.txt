@@ -1,0 +1,3 @@
+pydantic-ai-slim[openai]
+httpx
+python-dotenv
