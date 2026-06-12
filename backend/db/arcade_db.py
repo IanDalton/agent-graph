@@ -223,12 +223,16 @@ class ArcadeClient:
             "CREATE VERTEX TYPE RunMessages IF NOT EXISTS",
             "CREATE VERTEX TYPE Fact IF NOT EXISTS",
             "CREATE VERTEX TYPE LogEntry IF NOT EXISTS",
+            # Agent-authored documents (reports, notes, code listings) surfaced in the web UI's
+            # Documents tab; text-based ones are user-editable there. See repository.create_document.
+            "CREATE VERTEX TYPE Document IF NOT EXISTS",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_RUN_MESSAGES IF NOT EXISTS",
             "CREATE EDGE TYPE KNOWS IF NOT EXISTS",
             "CREATE EDGE TYPE LOGGED IF NOT EXISTS",
+            "CREATE EDGE TYPE HAS_DOCUMENT IF NOT EXISTS",
             # Links the User to agent-created instance nodes (see repository.create_node).
             "CREATE EDGE TYPE HAS_NODE IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
@@ -246,6 +250,12 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Fact (fact_id) UNIQUE",
             "CREATE PROPERTY LogEntry.log_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON LogEntry (log_id) UNIQUE",
+            "CREATE PROPERTY Document.document_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Document (document_id) UNIQUE",
+            "CREATE PROPERTY Document.conversation_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Document (conversation_id) NOTUNIQUE",
+            "CREATE PROPERTY Document.user_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Document (user_id) NOTUNIQUE",
             # Non-unique lookup indexes used by the repository queries.
             "CREATE PROPERTY Message.conversation_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (conversation_id) NOTUNIQUE",

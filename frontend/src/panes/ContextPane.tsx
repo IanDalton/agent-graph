@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
-import { Cpu, Database, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
+import { DocumentsCard } from "@/panes/DocumentsPane";
 import { Markdown } from "@/components/Markdown";
 
 function ConfigRow({
@@ -189,18 +190,51 @@ function SummaryCard({ refreshKey }: { refreshKey: number }) {
   );
 }
 
-/** The right "Knowledge & Artifacts" pane: read-only config + a live conversation
- *  digest. Future modes extend this (Research → sources, Council → consensus doc). */
+/** The right "Knowledge & Artifacts" pane, split into tabs: Context (config + summary +
+ *  memory graph) and Documents (agent-authored artifacts, user-editable when text-based).
+ *  When a document is featured (agent created one, or the user clicked a document card in
+ *  the chat), the pane flips to the Documents tab automatically.
+ *  Future modes extend this (Research → sources, Council → consensus doc). */
 export function ContextPane({ refreshKey }: { refreshKey: number }) {
+  const { featuredDoc } = useApp();
+  const [tab, setTab] = useState("context");
+
+  useEffect(() => {
+    if (featuredDoc) setTab("documents");
+  }, [featuredDoc]);
+
   return (
     <aside className="h-full border-l border-border bg-card">
-      <ScrollArea className="h-full">
-        <div className="space-y-3 p-3">
-          <ConfigCard />
-          <SummaryCard refreshKey={refreshKey} />
-          <MemoryGraphCard refreshKey={refreshKey} />
+      <Tabs defaultValue="context" value={tab} onValueChange={setTab} className="flex h-full flex-col">
+        <div className="border-b border-border p-2">
+          <TabsList className="w-full">
+            <TabsTrigger value="context">
+              <LayoutPanelLeft className="size-3.5" />
+              Context
+            </TabsTrigger>
+            <TabsTrigger value="documents">
+              <FileText className="size-3.5" />
+              Documents
+            </TabsTrigger>
+          </TabsList>
         </div>
-      </ScrollArea>
+        {/* The tab panel itself is the scroll container (native overflow on a min-h-0 flex
+            child). A nested Radix ScrollArea with h-full broke here: the percentage height
+            didn't resolve through the flex chain, so content spilled past the pane and was
+            clipped by the grid's overflow-hidden instead of scrolling. */}
+        <TabsContent value="context" className="min-h-0 flex-1 overflow-y-auto">
+          <div className="space-y-3 p-3">
+            <ConfigCard />
+            <SummaryCard refreshKey={refreshKey} />
+            <MemoryGraphCard refreshKey={refreshKey} />
+          </div>
+        </TabsContent>
+        <TabsContent value="documents" className="min-h-0 flex-1 overflow-y-auto">
+          <div className="p-3">
+            <DocumentsCard refreshKey={refreshKey} />
+          </div>
+        </TabsContent>
+      </Tabs>
     </aside>
   );
 }

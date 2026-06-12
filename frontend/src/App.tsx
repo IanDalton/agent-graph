@@ -11,7 +11,7 @@ function Shell() {
   const onTurnComplete = useCallback(() => setSummaryKey((k) => k + 1), []);
 
   return (
-    <div className="grid h-full grid-cols-[260px_1fr_320px] overflow-hidden">
+    <div className="grid h-full grid-cols-[260px_1fr_440px] overflow-hidden">
       <Sidebar />
       <main className="min-w-0 overflow-hidden">
         <Canvas onTurnComplete={onTurnComplete} />

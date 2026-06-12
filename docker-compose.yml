@@ -12,6 +12,12 @@ services:
     volumes:
       - arcadedb_data:/home/arcadedb/databases
     restart: unless-stopped
+  # Build-only: produces the `agent-sandbox` image run_python launches per call
+  # (`docker compose build sandbox`). Never started by `up` thanks to the profile.
+  sandbox:
+    build: ./docker/sandbox
+    image: agent-sandbox
+    command: ["python", "--version"]
   searxng:
     image: docker.io/searxng/searxng:${SEARXNG_VERSION:-latest}
     ports:

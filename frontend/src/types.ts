@@ -28,7 +28,15 @@ export interface ToolEvent {
  *  exactly as it streamed, rather than collapsing reasoning into a single block. */
 export type Step =
   | { id: string; kind: "thinking"; text: string }
-  | { id: string; kind: "tool"; tool: ToolEvent };
+  | { id: string; kind: "tool"; tool: ToolEvent }
+  | {
+      id: string;
+      kind: "document";
+      documentId: string;
+      title: string;
+      mimeType: string;
+      action: "created" | "updated";
+    };
 
 /** A rendered chat turn. The assistant turn additionally carries its ordered
  *  reasoning/tool `steps` chain plus the streamed `content` (the final answer,
@@ -50,6 +58,13 @@ export type StreamEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; tool_name: string; tool_call_id: string; args: unknown }
   | { type: "tool_result"; tool_name: string | null; tool_call_id: string | null; content: unknown }
+  | {
+      type: "document";
+      action: "created" | "updated";
+      document_id: string;
+      title: string;
+      mime_type: string;
+    }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
@@ -90,4 +105,21 @@ export interface GraphEdge {
 export interface MemoryGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
+}
+
+/** Document metadata as returned by the list endpoint (no body — fetch it separately). */
+export interface DocumentMeta {
+  document_id: string;
+  conversation_id?: string;
+  title: string;
+  mime_type: string;
+  /** "text" (content is literal text) or "base64" (binary artifact, e.g. a sandbox-made PDF). */
+  encoding?: "text" | "base64";
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** A full document, body included (GET /api/documents/{id}). */
+export interface DocumentFull extends DocumentMeta {
+  content: string;
 }

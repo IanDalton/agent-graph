@@ -40,7 +40,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   delete all instances/edges then `DROP TYPE … IF EXISTS` — `DROP TYPE` refuses a non-empty type, so
   the records go first; vertex types clear via `DELETE VERTEX FROM <T>`, edge types via
   `DELETE FROM <T> UNSAFE`, which is required to delete edge records and does clean endpoint adjacency).
-  `search_facts` returns `fact_id`.
+  `search_facts` returns `fact_id`. **Documents:** `create_document`/`update_document`/
+  `get_document`/`list_documents`/`delete_document` persist agent-authored artifacts as `Document`
+  vertices (user-scoped, `updated_at`-ordered; `list_documents` returns metadata only, no bodies);
+  `update_document` is shared by agent revisions AND user edits from the web UI. A document's
+  `encoding` is `"text"` (literal content) or `"base64"` (binary artifacts — PDFs/images the
+  sandbox produced).
   **Faithful replay:** `append_run_messages`/`get_run_history` store each run's serialized Pydantic
   AI messages (via `new_messages_json()`) as `RunMessages` vertices — tool calls AND their returns
   included — *separately* from the human-readable `Message` vertices. `Message` rows keep role/content
@@ -48,7 +53,7 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   into `message_history` so the agent sees the tool work it actually did (not just its text claims)
   and stops re-doubting/redoing completed work.
   Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
-  `Conversation -HAS_RUN_MESSAGES-> RunMessages`,
+  `Conversation -HAS_RUN_MESSAGES-> RunMessages`, `Conversation -HAS_DOCUMENT-> Document`,
   `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
   plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
@@ -93,8 +98,9 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
     no proposal but are guarded: they validate the identifier, confirm the type exists *and* matches
     the requested category (`type_category` — so you can't `delete_edge_type` a vertex type, whose
     `UNSAFE` delete would strip records), and refuse the internal types. `_PROTECTED_VERTEX_TYPES`
-    (User, Conversation, Message, Fact, LogEntry, **RunMessages**) and `_PROTECTED_EDGE_TYPES`
-    (HAS_CONVERSATION, HAS_MESSAGE, HAS_RUN_MESSAGES, KNOWS, LOGGED, HAS_NODE) can never be
+    (User, Conversation, Message, Fact, LogEntry, **RunMessages**, **Document**) and
+    `_PROTECTED_EDGE_TYPES` (HAS_CONVERSATION, HAS_MESSAGE, HAS_RUN_MESSAGES, KNOWS, LOGGED,
+    HAS_NODE, HAS_DOCUMENT) can never be
     edited/dropped here; `update_node`/`delete_node` reject the protected *vertex* types too.
   - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
     `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
@@ -114,6 +120,49 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   error, bad page) is caught and returned as a structured `error` result, never raised — so a web
   hiccup can't abort the run. Tool calls are logged automatically by the memory capability's
   `after_tool_execute` hook (no extra persistence here).
+- **`backend/schemas/document_schemas.py`** — document tool I/O: `CreateDocumentArgs` (mime-type
+  validator, default `text/markdown`), `UpdateDocumentArgs`, `DocumentInfo` (metadata, no body),
+  `DocumentContent` (full document).
+- **`backend/skills/document_capability.py`** — the `Documents` bundle, exposed via
+  `build_documents()`: lets the agent author durable artifacts (reports, plans, notes, code) the
+  user sees — and can EDIT, when text-based — in the web UI's Documents tab. Tools:
+  `create_document` (markdown by default; returns `document_id`), `update_document` (revise in
+  place — replaces the FULL content), `read_document`, `list_documents` (current conversation,
+  metadata only), `delete_document`. Its instructions enforce the house style: check
+  `list_documents` before creating (no near-duplicates), and **always `read_document` before
+  revising** — the user may have edited the body since the agent last wrote it. Bad ids raise
+  `ModelRetry` (mirroring `update_fact`/`delete_fact`).
+- **`backend/sandbox/runner.py`** — `PythonSandbox`: containerized Python execution via ephemeral
+  `docker run --rm` against the host's Docker daemon (no extra Python dependency). Each call is a
+  fresh, locked-down container: `--network none`, `--memory`/`--cpus`/`--pids-limit` caps,
+  `--cap-drop ALL`, `--read-only` root FS with a small tmpfs `/tmp`, non-root (`--user nobody`),
+  hard wall-clock timeout (default 30s, max 120s), and per-stream output caps. The code is piped
+  over **stdin** (`python -I -`) so nothing is shell-interpolated and there is no argv length
+  limit. On timeout the container is `docker rm -f`'d by name (killing the docker CLI alone would
+  leave it running). **File artifacts:** a host temp dir is mounted at `/out` (also `$OUTPUT_DIR`);
+  files the program writes there come back as `SandboxFile` blobs on the result (max 8 files,
+  5MB each — drops noted in `notes`). Default image is the project's **`agent-sandbox`**
+  (`docker/sandbox/Dockerfile`: python:3.12-slim + **fpdf2** for PDFs; `docker compose build
+  sandbox`); if it isn't built, the run transparently retries on plain `python:3.12-slim`
+  (stdlib only) and says so in `notes`. Env: `SANDBOX_IMAGE`, `SANDBOX_TIMEOUT_SECONDS`,
+  `SANDBOX_MEMORY`, `SANDBOX_CPUS`, `SANDBOX_NETWORK`. **Failure contract:** `run()` never raises
+  for expected problems (Docker missing, timeout) — it returns a `SandboxResult` describing what
+  happened; a non-zero exit + traceback in `stderr` is a normal result the model reads and fixes.
+- **`backend/schemas/sandbox_schemas.py`** — sandbox tool I/O: `RunPythonArgs` (code +
+  optional 1–120s timeout override) and `PythonRunResult` (stdout/stderr/exit_code/timed_out/
+  truncated/`documents` — the /out files already persisted as documents — /notes/error).
+- **`backend/skills/sandbox_capability.py`** — the `PythonSandbox` bundle, exposed via
+  `build_sandbox()`: one tool, `run_python`. **Stateless** (fresh container per call — the
+  instructions tell the model to send complete, self-contained programs), stdlib + fpdf2, no
+  network. Files the program wrote to `/out` are persisted here as `Document` vertices
+  (text mimes as literal text, binary as **base64**; deterministic mime map in `_mime_for`) and
+  returned in `PythonRunResult.documents` so the model references them instead of re-creating
+  them. The capability instructions carry the **PDF skill** (the fpdf2 recipe: write to
+  `/out/report.pdf`, Helvetica/multi_cell, latin-1-safe text). Takes the sandbox from
+  `ctx.deps.sandbox` when present (test seam), else builds one from env. **Tolerant** like
+  `run_query`/`web_search`: every failure becomes a structured `error` result, never an
+  exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
+  a `note`, keeping the code's stdout).
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
@@ -124,16 +173,28 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `build_agent()` adds `build_search()` to the capability list, and `run()` opens a `WebClient`
   alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`. The streaming itself
   lives in `stream_run(prompt, user_id, conversation_id)`, an async generator that maps Pydantic AI
-  events to a **stable event vocabulary** — `thinking`/`text`/`tool_call`/`tool_result`/`final` dicts
-  — so callers never depend on the library's event classes; `run()` just consumes it for the CLI
-  (thinking in blue, text plain). This is the single streaming source of truth, shared with the API.
+  events to a **stable event vocabulary** — `thinking`/`text`/`tool_call`/`tool_result`/`document`/
+  `final` dicts — so callers never depend on the library's event classes; `run()` just consumes it
+  for the CLI (thinking in blue, text plain). `document` frames
+  (`{action, document_id, title, mime_type}`) are emitted right after the tool_result of
+  `create_document`/`update_document`/`run_python` (see `_document_events`; update's id comes from
+  the call args tracked per tool_call_id since its return is a plain string; run_python yields one
+  frame per persisted /out artifact) — the UI uses them to drop artifact cards into the chat and
+  spotlight the document in the side panel. **`_jsonable` recurses** into dicts/lists and dumps
+  Pydantic models (`model_dump(mode="json")`) — tool results can be containers OF models (e.g.
+  `list_documents` → `list[DocumentInfo]`), and a bare `json.dumps` on those used to kill the SSE
+  stream; `api._sse` also passes `default=str` as a net. This is the single streaming source of
+  truth, shared with the API.
 - **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
   DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
   `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
   (read-only model/DB/search/log surface, **no secrets**), `GET|POST /api/conversations` (list /
   create — create mints a uuid `conversation_id`), `GET /api/conversations/{id}/messages`,
   `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
-  summary), and `POST /api/chat/stream` (a `StreamingResponse` of `text/event-stream` that writes each
+  summary), the document surface — `GET /api/conversations/{id}/documents` (metadata list,
+  tolerant), `GET|PUT|DELETE /api/documents/{id}` (PUT applies a **user edit** of title/content via
+  `repo.update_document` and returns the updated record; 404 when not the caller's) — and
+  `POST /api/chat/stream` (a `StreamingResponse` of `text/event-stream` that writes each
   `stream_run` event as one `data:` frame; a failure becomes a final `{"type":"error"}` frame rather
   than a dropped connection). CORS allows the Vite dev origin (`:5173`). This backs the `frontend/` UI.
 
@@ -143,7 +204,24 @@ React + Vite + TypeScript SPA using **shadcn/ui** components (Tailwind + Radix).
 "Mission Control" shell built so future modes (Research/Swarm/Council) slot in as components:
 left `Sidebar` (conversation list + New Chat, with a per-row mode icon — only 💬 Regular today),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
-chain-of-thought timeline), right `ContextPane` (read-only config card + live LLM summary). State is
+chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
+no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
+(config + summary + memory graph) and a *Documents* tab (`panes/DocumentsPane.tsx`) listing the
+active conversation's agent-authored documents. Opening one renders by media type
+(`DocumentBody`): **`text/html` runs as a live interactive app** in a sandboxed iframe
+(`sandbox="allow-scripts allow-forms allow-popups"` — deliberately NO `allow-same-origin`, so
+embedded apps can't reach our cookies/API; a toolbar button toggles preview ⇄ source),
+**`application/pdf`** (base64) shows in an iframe via a data URL, **`image/*`** (base64) as an
+`<img>`, markdown via the shared `Markdown` component, everything else as a monospace `<pre>`;
+every document gets a download button (base64 decoded back to real bytes). Text-encoded documents
+flip into a textarea editor whose Save PUTs `/api/documents/{id}`; base64 artifacts are read-only.
+**Document spotlight:** a `document` stream frame appends an artifact-card step to the assistant
+turn (`ChatBubble`'s `DocumentCard` — a big button, like Claude's artifacts) and, for `created`,
+auto-features the document via `AppContext.featureDocument` → `featuredDoc {id, ts}`; the
+`ContextPane` flips to the Documents tab and `DocumentsCard` opens that document (clicking a card
+re-features it; `featuredDoc` is cleared on conversation switch, and the post-turn refresh no
+longer closes an open document). The list also re-fetches on the same `refreshKey` bump the
+summary uses (after each completed turn). State is
 plain React Context (`AppContext`: `userId`, conversations, active id) + a `useChat` reducer for
 per-conversation message/streaming state — no React Query, to keep the dependency surface small.
 Streaming uses `fetch` + a `ReadableStream` reader (in `api/stream.ts`) since `EventSource` is
@@ -162,14 +240,20 @@ GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxi
   json]`) the `WebClient` calls and turns the bot **`limiter` off** — both are disabled by default,
   so the JSON API is unusable without it. The placeholder `secret_key`/`limiter: false` are dev-only.
   Override the base URL with `SEARXNG_URL` if not on the compose default.
+- **Python sandbox** — `run_python` launches an ephemeral, locked-down container per call via the
+  host's `docker` CLI (see `backend/sandbox/runner.py`), *not* a long-running service. The compose
+  `sandbox` entry is **build-only** (`profiles: [build-only]`, never started by `up`): it builds
+  the `agent-sandbox` image (`docker/sandbox/Dockerfile` = python:3.12-slim + fpdf2 for PDFs) via
+  `docker compose build sandbox`. Unbuilt ⇒ runs fall back to plain `python:3.12-slim`.
 
 ## Commands
 
 ```bash
 docker compose up -d arcadedb searxng  # ArcadeDB (DB AgentMemory auto-created) + SearXNG (web search)
+docker compose build sandbox      # agent-sandbox image for run_python (python:3.12-slim + fpdf2 for PDFs)
 pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv, fastapi, uvicorn
 python -m backend.main "remember I like Recoleta apartments" --user u1 --conversation c1
-python -m pytest backend/tests/   # unit tests run without a DB/network; the integration test skips if :2480 is down
+python -m pytest backend/tests/   # unit tests run without a DB/network/Docker; integration tests skip when :2480 / the sandbox image is unavailable
 uvicorn backend.api:app --reload --port 8000   # HTTP/SSE API backing the web UI
 cd frontend && npm install && npm run dev       # web UI on http://localhost:5173 (proxies /api -> :8000)
 # verify the SearXNG JSON API the WebClient depends on:
@@ -193,3 +277,10 @@ Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL
 - The web tools (`web_search`/`fetch_url`) must stay **tolerant**: catch failures and return an
   `error` result rather than raising, so a SearXNG/network hiccup never aborts the agent run (same
   contract as `run_query`). Keep the `http`/`https`-only validator on `FetchUrlArgs`.
+- `run_python` shares that tolerance contract, and the sandbox hardening in
+  `PythonSandbox._docker_args` (no network, cap-drop, read-only FS, non-root, pids/memory/time
+  caps, code via **stdin**) is the safety boundary for model-authored code — don't relax flags or
+  move the code into a shell string when editing it.
+- Documents are user-editable: agent code must `read_document` before revising, and any new
+  "agent writes / user edits" surface should reuse `repo.update_document` so both paths stay
+  consistent.

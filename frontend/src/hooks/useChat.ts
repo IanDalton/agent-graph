@@ -103,6 +103,23 @@ function reducer(state: ChatMessage[], action: Action): ChatMessage[] {
                 : s
             ),
           }));
+        case "document":
+          // An artifact card in the chain — a big tap target that opens the document
+          // in the side panel (the auto-focus side effect lives in runStream, not here).
+          return patchLast(state, (m) => ({
+            ...m,
+            steps: [
+              ...(m.steps ?? []),
+              {
+                id: newId(),
+                kind: "document",
+                documentId: ev.document_id,
+                title: ev.title,
+                mimeType: ev.mime_type,
+                action: ev.action,
+              },
+            ],
+          }));
         case "final":
           return patchLast(state, (m) => ({
             ...m,
@@ -129,7 +146,7 @@ export function useChat(
   userId: string,
   onTurnComplete?: () => void
 ) {
-  const { model, effort } = useApp();
+  const { model, effort, featureDocument } = useApp();
   const [messages, dispatch] = useReducer(reducer, []);
   const [sending, setSending] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -175,7 +192,14 @@ export function useChat(
             model: model || undefined,
             effort: effort || undefined,
           },
-          (event) => dispatch({ kind: "event", event }),
+          (event) => {
+            dispatch({ kind: "event", event });
+            // Spotlight a freshly created document: the side panel flips to the Documents
+            // tab and opens it while the turn is still streaming.
+            if (event.type === "document" && event.action === "created") {
+              featureDocument(event.document_id);
+            }
+          },
           signal
         );
       } catch (err) {
@@ -187,7 +211,7 @@ export function useChat(
         onTurnComplete?.();
       }
     },
-    [conversationId, userId, model, effort, onTurnComplete]
+    [conversationId, userId, model, effort, onTurnComplete, featureDocument]
   );
 
   const send = useCallback(

@@ -1,4 +1,11 @@
-import type { AppConfig, Conversation, MemoryGraph, StoredMessage } from "@/types";
+import type {
+  AppConfig,
+  Conversation,
+  DocumentFull,
+  DocumentMeta,
+  MemoryGraph,
+  StoredMessage,
+} from "@/types";
 
 const json = async <T>(res: Response): Promise<T> => {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -46,4 +53,33 @@ export const api = {
     fetch(
       `/api/graph?user_id=${encodeURIComponent(userId)}&limit=${limit}`
     ).then(json<MemoryGraph>),
+
+  listDocuments: (conversationId: string, userId: string) =>
+    fetch(
+      `/api/conversations/${conversationId}/documents?user_id=${encodeURIComponent(
+        userId
+      )}`
+    ).then(json<DocumentMeta[]>),
+
+  getDocument: (documentId: string, userId: string) =>
+    fetch(
+      `/api/documents/${documentId}?user_id=${encodeURIComponent(userId)}`
+    ).then(json<DocumentFull>),
+
+  updateDocument: (
+    documentId: string,
+    userId: string,
+    patch: { title?: string; content?: string }
+  ) =>
+    fetch(`/api/documents/${documentId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...patch }),
+    }).then(json<DocumentFull>),
+
+  deleteDocument: (documentId: string, userId: string) =>
+    fetch(
+      `/api/documents/${documentId}?user_id=${encodeURIComponent(userId)}`,
+      { method: "DELETE" }
+    ).then(json<{ deleted: string }>),
 };

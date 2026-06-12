@@ -20,6 +20,13 @@ const USER_ID = "default";
 const MODEL_KEY = "agent-graph:model";
 const EFFORT_KEY = "agent-graph:effort";
 
+/** A document the UI should bring into focus (side panel → Documents tab → open it).
+ *  `ts` makes re-featuring the same document retrigger the effect. */
+export interface FeaturedDoc {
+  id: string;
+  ts: number;
+}
+
 interface AppState {
   userId: string;
   conversations: Conversation[];
@@ -27,6 +34,10 @@ interface AppState {
   loading: boolean;
   /** Runtime config (model/effort options, URLs). Fetched once; null until loaded. */
   config: AppConfig | null;
+  /** The document to spotlight in the side panel (set when the agent creates one, or when the
+   *  user clicks a document card in the chat). */
+  featuredDoc: FeaturedDoc | null;
+  featureDocument: (id: string) => void;
   /** Selected model label, or "" to use the backend default. Sent per chat request. */
   model: string;
   setModel: (model: string) => void;
@@ -45,6 +56,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [featuredDoc, setFeaturedDoc] = useState<FeaturedDoc | null>(null);
+
+  const featureDocument = useCallback((id: string) => {
+    setFeaturedDoc({ id, ts: Date.now() });
+  }, []);
 
   const readStored = (key: string) => {
     try {
@@ -90,9 +106,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const convo = await api.createConversation(USER_ID);
     setConversations((prev) => [convo, ...prev]);
     setActiveId(convo.conversation_id);
+    setFeaturedDoc(null); // a spotlight from another conversation shouldn't follow us here
   }, []);
 
-  const selectConversation = useCallback((id: string) => setActiveId(id), []);
+  const selectConversation = useCallback((id: string) => {
+    setActiveId(id);
+    setFeaturedDoc(null);
+  }, []);
 
   // Initial load: fetch conversations and select the most recent (or create one).
   useEffect(() => {
@@ -121,6 +141,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         activeId,
         loading,
         config,
+        featuredDoc,
+        featureDocument,
         model,
         setModel,
         effort,

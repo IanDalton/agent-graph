@@ -1,10 +1,19 @@
 import { useState } from "react";
-import { Brain, Check, ChevronRight, Copy, Loader2, RefreshCw } from "lucide-react";
+import {
+  Brain,
+  Check,
+  ChevronRight,
+  Copy,
+  FileText,
+  Loader2,
+  RefreshCw,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMessage, Step } from "@/types";
 import { ToolChip } from "@/components/ToolChip";
 import { Markdown } from "@/components/Markdown";
+import { useApp } from "@/state/AppContext";
 
 /** A collapsible reasoning run — one segment of the agent's thinking between tool calls. */
 function ThinkingBlock({ text }: { text: string }) {
@@ -31,11 +40,46 @@ function ThinkingBlock({ text }: { text: string }) {
   );
 }
 
+/** The artifact card: a big tap target dropped into the chat when the agent creates
+ *  (or revises) a document. Clicking it spotlights the document in the side panel. */
+function DocumentCard({
+  step,
+}: {
+  step: Extract<Step, { kind: "document" }>;
+}) {
+  const { featureDocument } = useApp();
+  return (
+    <button
+      type="button"
+      onClick={() => featureDocument(step.documentId)}
+      title="Open in the Documents panel"
+      className="flex w-full items-center gap-3 rounded-xl border border-primary/30 bg-primary/10 px-3 py-3 text-left transition-colors hover:border-primary/60 hover:bg-primary/20"
+    >
+      <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/20">
+        <FileText className="size-5 text-primary" />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-semibold">
+          {step.title || "Document"}
+        </span>
+        <span className="block truncate text-xs text-muted-foreground">
+          {step.action === "created" ? "Document created" : "Document updated"}
+          {step.mimeType ? ` · ${step.mimeType}` : ""} · click to open
+        </span>
+      </span>
+      <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+    </button>
+  );
+}
+
 /** Renders one node of the chronological chain in arrival order. */
 function StepItem({ step }: { step: Step }) {
   if (step.kind === "thinking") {
     if (!step.text.trim()) return null;
     return <ThinkingBlock text={step.text} />;
+  }
+  if (step.kind === "document") {
+    return <DocumentCard step={step} />;
   }
   return <ToolChip tool={step.tool} />;
 }

@@ -9,6 +9,7 @@ from backend.db.arcade_db import ArcadeClient
 
 if TYPE_CHECKING:
     from backend.embeddings import Embedder
+    from backend.sandbox.runner import PythonSandbox
     from backend.schemas.graph_schemas import EdgeProposal, SchemaProposal
     from backend.web.client import WebClient
 
@@ -37,3 +38,7 @@ class GraphDependencies:
     # Text->vector embedder for semantic memory search. Optional and inert when no embedding model
     # is configured (EMBED_MODEL unset): in that case fact search uses substring (LIKE) matching.
     embedder: "Embedder | None" = None
+    # Containerized Python executor for the PythonSandbox capability. Optional (mainly a test
+    # seam); when None, run_python builds one from env per call — the sandbox is stateless, so
+    # there is nothing to share between calls.
+    sandbox: "PythonSandbox | None" = None

@@ -14,6 +14,7 @@ import os
 import sys
 from typing import Any, AsyncIterator
 
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
@@ -33,8 +34,10 @@ from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.embeddings import Embedder
 from backend.model_selection import resolve_model
+from backend.skills.document_capability import build_documents
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
+from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
 from backend.web.client import WebClient
 
@@ -66,6 +69,8 @@ def build_agent(model: str | None = None, effort: str | None = None) -> Agent[Gr
             *build_memory(),
             *build_ontology(),
             *build_search(),
+            *build_documents(),
+            *build_sandbox(),
         ],
     )
 
@@ -95,12 +100,74 @@ def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
 def _jsonable(value: Any) -> Any:
     """Coerce arbitrary tool args/results into something JSON-serializable for an SSE frame.
 
-    Tool args arrive as a dict or a raw JSON string; tool results can be any Python value.
-    Anything that isn't a plain JSON scalar/container is rendered as its ``str``.
+    Tool results can be any Python value — including Pydantic models or containers OF models
+    (e.g. list_documents returns ``list[DocumentInfo]``; passing that list through untouched
+    made ``json.dumps`` kill the stream). Models dump to plain dicts, containers recurse,
+    JSON scalars pass through, and anything else is rendered as its ``str``.
     """
-    if value is None or isinstance(value, (str, int, float, bool, dict, list)):
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _created_frame(info: Any) -> dict[str, Any] | None:
+    """A ``created`` document frame from a DocumentInfo-shaped value (model or dict), or None."""
+    get = info.get if isinstance(info, dict) else lambda k: getattr(info, k, None)
+    document_id = get("document_id")
+    if not document_id:
+        return None
+    return {
+        "type": "document",
+        "action": "created",
+        "document_id": str(document_id),
+        "title": str(get("title") or ""),
+        "mime_type": str(get("mime_type") or "text/markdown"),
+    }
+
+
+def _document_events(
+    tool_name: str | None, content: Any, args: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Map a finished tool call to its ``{"type": "document"}`` frames (usually zero or one).
+
+    The UI uses these frames to drop an artifact card into the chat and flip the side panel to
+    the document. ``create_document`` returns a ``DocumentInfo`` (id/title/mime ride on the tool
+    result); ``run_python`` returns a ``PythonRunResult`` whose ``documents`` lists every /out
+    file persisted as a document (one frame each); ``update_document`` returns a plain string,
+    so the id comes from the call's args (which Pydantic AI nests under the ``args`` parameter
+    of the tool signature).
+    """
+    if tool_name == "create_document":
+        frame = _created_frame(content)
+        return [frame] if frame else []
+    if tool_name == "run_python":
+        docs = (
+            content.get("documents") if isinstance(content, dict)
+            else getattr(content, "documents", None)
+        )
+        return [frame for d in docs or [] if (frame := _created_frame(d))]
+    if tool_name == "update_document":
+        inner = (args or {}).get("args")
+        data = inner if isinstance(inner, dict) else (args or {})
+        document_id = data.get("document_id")
+        if not document_id:
+            return []
+        return [
+            {
+                "type": "document",
+                "action": "updated",
+                "document_id": str(document_id),
+                "title": str(data.get("title") or ""),
+                "mime_type": "",
+            }
+        ]
+    return []
 
 
 async def stream_run(
@@ -120,6 +187,9 @@ async def stream_run(
     - ``{"type": "text", "delta": str}`` — a chunk of the user-facing answer
     - ``{"type": "tool_call", "tool_name", "tool_call_id", "args"}`` — a tool invocation
     - ``{"type": "tool_result", "tool_name", "tool_call_id", "content"}`` — its return
+    - ``{"type": "document", "action", "document_id", "title", "mime_type"}`` — emitted right
+      after the tool_result of create_document/update_document, so the UI can feature the
+      document (artifact card in the chat + side-panel focus)
     - ``{"type": "final", "text": str}`` — the fully assembled answer (always emitted last)
     """
     agent = build_agent(model, effort)
@@ -145,9 +215,13 @@ async def stream_run(
         history = _to_message_history(await repo.get_run_history(db, conversation_id))
 
         final_text = ""
+        # Args of in-flight tool calls, keyed by tool_call_id — _document_event needs the
+        # document_id from update_document's *arguments* (its return is just a string).
+        call_args: dict[str, dict[str, Any]] = {}
         async with agent.run_stream_events(prompt, deps=deps, message_history=history) as stream:
             async for event in stream:
                 if isinstance(event, FunctionToolCallEvent):
+                    call_args[event.part.tool_call_id] = event.part.args_as_dict() or {}
                     yield {
                         "type": "tool_call",
                         "tool_name": event.part.tool_name,
@@ -157,12 +231,19 @@ async def stream_run(
                     continue
                 if isinstance(event, FunctionToolResultEvent):
                     part = event.part
+                    tool_name = getattr(part, "tool_name", None)
                     yield {
                         "type": "tool_result",
-                        "tool_name": getattr(part, "tool_name", None),
+                        "tool_name": tool_name,
                         "tool_call_id": getattr(part, "tool_call_id", None),
                         "content": _jsonable(getattr(part, "content", None)),
                     }
+                    for doc in _document_events(
+                        tool_name,
+                        getattr(part, "content", None),
+                        call_args.get(getattr(part, "tool_call_id", None) or ""),
+                    ):
+                        yield doc
                     continue
 
                 node = event

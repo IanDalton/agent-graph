@@ -19,7 +19,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -205,6 +205,75 @@ async def refresh_summary(conversation_id: str, user_id: str = "default") -> dic
         return {"summary": ""}
 
 
+# ------------------------------------------------------------------------- documents
+
+
+class DocumentEdit(BaseModel):
+    """A user edit from the Documents pane. Only the provided fields change."""
+
+    user_id: str = "default"
+    title: str | None = None
+    content: str | None = None
+
+
+@app.get("/api/conversations/{conversation_id}/documents")
+async def get_documents(conversation_id: str, user_id: str = "default") -> list[dict[str, Any]]:
+    """List a conversation's documents (metadata only — fetch a body via /api/documents/{id}).
+
+    Pure read, tolerant like the other list endpoints: a missing database/type (no documents
+    written yet) yields an empty list rather than a 500.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_documents(db, user_id, conversation_id=conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("list_documents failed", exc_info=True)
+        return []
+
+
+@app.get("/api/documents/{document_id}")
+async def get_document(document_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Return one document with its full content (404 if it doesn't exist for this user)."""
+    try:
+        async with _client_for(user_id) as db:
+            row = await repo.get_document(db, user_id, document_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("get_document failed", exc_info=True)
+        row = None
+    if row is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return row
+
+
+@app.put("/api/documents/{document_id}")
+async def edit_document(document_id: str, body: DocumentEdit) -> dict[str, Any]:
+    """Apply a user edit (title and/or content) to a document and return the updated record.
+
+    This is what makes text documents editable in the UI. A write path, so the database/schema
+    are ensured first; 404 when the document doesn't belong to this user.
+    """
+    if body.title is None and body.content is None:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    async with _client_for(body.user_id, ensure=True) as db:
+        updated = await repo.update_document(
+            db, body.user_id, document_id, title=body.title, content=body.content
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="document not found")
+        row = await repo.get_document(db, body.user_id, document_id)
+    return row or {"document_id": document_id}
+
+
+@app.delete("/api/documents/{document_id}")
+async def remove_document(document_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Delete a document (404 if it doesn't exist for this user)."""
+    async with _client_for(user_id, ensure=True) as db:
+        deleted = await repo.delete_document(db, user_id, document_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="document not found")
+    return {"deleted": document_id}
+
+
 # ---------------------------------------------------------------------------- graph
 
 
@@ -239,7 +308,9 @@ class ChatRequest(BaseModel):
 
 
 def _sse(event: dict[str, Any]) -> str:
-    return f"data: {json.dumps(event)}\n\n"
+    # default=str is a safety net: stream_run._jsonable already coerces tool payloads, but a
+    # stray non-JSON value must degrade to its repr, never kill the stream mid-turn.
+    return f"data: {json.dumps(event, default=str)}\n\n"
 
 
 @app.post("/api/chat/stream")

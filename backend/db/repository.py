@@ -337,6 +337,119 @@ async def delete_fact(db: ArcadeClient, user_id: str, fact_id: str) -> int:
     return _affected(result)
 
 
+async def create_document(
+    db: ArcadeClient,
+    user_id: str,
+    conversation_id: str,
+    title: str,
+    content: str,
+    mime_type: str = "text/markdown",
+    encoding: str = "text",
+) -> str:
+    """Create an agent-authored document, linked to its conversation. Returns the document_id.
+
+    Documents are durable artifacts (reports, notes, code listings) the agent produces for the
+    user. They surface in the web UI's Documents pane, where text-based ones can be edited by
+    the user via :func:`update_document`. ``encoding`` is ``"text"`` for literal text content or
+    ``"base64"`` for binary artifacts (PDFs, images) produced by the Python sandbox.
+    """
+    document_id = _new_id()
+    now = _now()
+    await db.command(
+        "CREATE VERTEX Document SET document_id = :did, conversation_id = :cid, "
+        "user_id = :uid, title = :title, content = :content, mime_type = :mime, "
+        "encoding = :enc, created_at = :ts, updated_at = :ts",
+        {
+            "did": document_id,
+            "cid": conversation_id,
+            "uid": user_id,
+            "title": title,
+            "content": content,
+            "mime": mime_type,
+            "enc": encoding,
+            "ts": now,
+        },
+    )
+    await db.command(
+        "CREATE EDGE HAS_DOCUMENT "
+        "FROM (SELECT FROM Conversation WHERE conversation_id = :cid) "
+        "TO (SELECT FROM Document WHERE document_id = :did)",
+        {"cid": conversation_id, "did": document_id},
+    )
+    return document_id
+
+
+async def update_document(
+    db: ArcadeClient,
+    user_id: str,
+    document_id: str,
+    title: str | None = None,
+    content: str | None = None,
+) -> int:
+    """Revise a document's title and/or content in place (agent revisions AND user edits).
+
+    Returns the number of documents updated (0 if no such document for this user). Scoped by
+    ``user_id`` and matched on the indexed ``document_id``. Pass only the fields to change.
+    """
+    set_clauses = ["updated_at = :ts"]
+    params: dict[str, Any] = {"ts": _now(), "did": document_id, "uid": user_id}
+    if title is not None:
+        set_clauses.append("title = :title")
+        params["title"] = title
+    if content is not None:
+        set_clauses.append("content = :content")
+        params["content"] = content
+    result = await db.command(
+        "UPDATE Document SET " + ", ".join(set_clauses) + " WHERE document_id = :did AND user_id = :uid",
+        params,
+    )
+    return _affected(result)
+
+
+async def get_document(db: ArcadeClient, user_id: str, document_id: str) -> dict[str, Any] | None:
+    """Return one document (full content included), or None if it doesn't exist for this user."""
+    rows = await db.query(
+        "SELECT document_id, conversation_id, title, content, mime_type, encoding, "
+        "created_at, updated_at "
+        "FROM Document WHERE document_id = :did AND user_id = :uid",
+        {"did": document_id, "uid": user_id},
+    )
+    return rows[0] if rows else None
+
+
+async def list_documents(
+    db: ArcadeClient,
+    user_id: str,
+    conversation_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return this user's documents (metadata only, no content), most recently updated first.
+
+    Pass ``conversation_id`` to restrict to one conversation (the Documents pane does); omit it
+    for all of the user's documents. Content is excluded so the list stays light — fetch one
+    document's body with :func:`get_document`.
+    """
+    where = "user_id = :uid"
+    params: dict[str, Any] = {"uid": user_id, "limit": limit}
+    if conversation_id is not None:
+        where += " AND conversation_id = :cid"
+        params["cid"] = conversation_id
+    return await db.query(
+        "SELECT document_id, conversation_id, title, mime_type, encoding, created_at, updated_at "
+        f"FROM Document WHERE {where} ORDER BY updated_at DESC LIMIT :limit",
+        params,
+    )
+
+
+async def delete_document(db: ArcadeClient, user_id: str, document_id: str) -> int:
+    """Delete a document (and its HAS_DOCUMENT edge) by id, if it belongs to ``user_id``."""
+    result = await db.command(
+        "DELETE VERTEX FROM (SELECT FROM Document WHERE document_id = :did AND user_id = :uid)",
+        {"did": document_id, "uid": user_id},
+    )
+    return _affected(result)
+
+
 async def vertex_type_exists(db: ArcadeClient, type_name: str) -> bool:
     """True if a type named ``type_name`` already exists in this database's schema."""
     rows = await db.query("SELECT FROM schema:types")
