@@ -17,7 +17,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -118,6 +118,8 @@ async def get_config() -> dict[str, Any]:
         "model_source": "AGENT_MODEL" if agent_model else "OLLAMA_MODEL (local fallback)",
         "effort": main.DEFAULT_EFFORT,
         "efforts": main.THINKING_EFFORTS,
+        # Conversation modes (agent profiles) selectable at conversation creation.
+        "modes": main.MODES,
         "arcade_url": os.getenv("ARCADE_URL", DEFAULT_URL),
         "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8085"),
         "log_level": os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -133,6 +135,8 @@ async def get_config() -> dict[str, Any]:
 class NewConversation(BaseModel):
     user_id: str = "default"
     title: str | None = None
+    # The conversation's agent profile, fixed at creation (see backend.main.MODES).
+    mode: Literal["regular", "research", "swarm"] = "regular"
 
 
 @app.get("/api/conversations")
@@ -152,11 +156,13 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
     conversation_id = uuid.uuid4().hex
     # The one common write path: ensure the database/schema exist before the first insert.
     async with _client_for(body.user_id, ensure=True) as db:
-        await repo.create_conversation(db, body.user_id, conversation_id, title=body.title)
+        await repo.create_conversation(
+            db, body.user_id, conversation_id, title=body.title, mode=body.mode
+        )
     return {
         "conversation_id": conversation_id,
         "title": body.title,
-        "mode": "regular",
+        "mode": body.mode,
     }
 
 

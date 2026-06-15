@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import {
   Brain,
   Check,
@@ -134,10 +134,13 @@ function MessageActions({
 export function ChatBubble({
   message,
   onRegenerate,
+  renderStep,
 }: {
   message: ChatMessage;
   /** Provided only for the latest assistant turn (re-runs the last prompt). */
   onRegenerate?: () => void;
+  /** Optional custom renderer for steps. If not provided, uses default StepItem. */
+  renderStep?: (step: Step) => React.ReactNode;
 }) {
   const isUser = message.role === "user";
   const steps = message.steps ?? [];
@@ -150,7 +153,9 @@ export function ChatBubble({
         {!isUser && steps.length > 0 && (
           <div className="space-y-1.5">
             {steps.map((s) => (
-              <StepItem key={s.id} step={s} />
+              <React.Fragment key={s.id}>
+                {renderStep ? renderStep(s) : <StepItem step={s} />}
+              </React.Fragment>
             ))}
           </div>
         )}

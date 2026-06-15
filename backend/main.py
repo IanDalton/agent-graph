@@ -37,8 +37,10 @@ from backend.model_selection import resolve_model
 from backend.skills.document_capability import build_documents
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
+from backend.skills.research_capability import build_research
 from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
+from backend.skills.swarm_capability import build_swarm
 from backend.web.client import WebClient
 
 logger = logging.getLogger("agent_graph.main")
@@ -48,8 +50,15 @@ logger = logging.getLogger("agent_graph.main")
 THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
 DEFAULT_EFFORT = "minimal"
 
+# Conversation modes (agent profiles), fixed per conversation at creation. "regular" is the base
+# memory agent; "research" overlays the deep-research method; "swarm" adds the orchestrator tools.
+MODES = ["regular", "research", "swarm"]
+DEFAULT_MODE = "regular"
 
-def build_agent(model: str | None = None, effort: str | None = None) -> Agent[GraphDependencies, str]:
+
+def build_agent(
+    model: str | None = None, effort: str | None = None, mode: str | None = None
+) -> Agent[GraphDependencies, str]:
     """Construct the agent.
 
     ``model`` is an optional explicit model label (from the UI dropdown) — see
@@ -59,19 +68,29 @@ def build_agent(model: str | None = None, effort: str | None = None) -> Agent[Gr
 
     ``effort`` is an optional thinking-effort level (one of :data:`THINKING_EFFORTS`); an unknown
     or missing value falls back to :data:`DEFAULT_EFFORT`.
+
+    ``mode`` is the conversation's agent profile (one of :data:`MODES`). Every mode keeps the full
+    base capability set; ``research`` adds the deep-research methodology, ``swarm`` adds the
+    sub-agent orchestrator tools. Unknown/missing values fall back to :data:`DEFAULT_MODE`.
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
+    mode = mode if mode in MODES else DEFAULT_MODE
+    capabilities = [
+        Thinking(effort=effort),
+        *build_memory(),
+        *build_ontology(),
+        *build_search(),
+        *build_documents(),
+        *build_sandbox(),
+    ]
+    if mode == "research":
+        capabilities += build_research()
+    elif mode == "swarm":
+        capabilities += build_swarm()
     return Agent(
         resolve_model(model),
         deps_type=GraphDependencies,
-        capabilities=[
-            Thinking(effort=effort),
-            *build_memory(),
-            *build_ontology(),
-            *build_search(),
-            *build_documents(),
-            *build_sandbox(),
-        ],
+        capabilities=capabilities,
     )
 
 
@@ -131,6 +150,18 @@ def _created_frame(info: Any) -> dict[str, Any] | None:
     }
 
 
+def _documents_of(value: Any) -> list[Any]:
+    """The ``documents`` list of a result (model or dict), or ``[]``."""
+    docs = value.get("documents") if isinstance(value, dict) else getattr(value, "documents", None)
+    return list(docs or [])
+
+
+# Tools whose result carries a ``documents`` list of artifacts persisted during the call:
+# run_python's /out files, and the documents a delegated sub-agent created (run_agent /
+# deep_research outcomes; run_swarm nests one such report per task).
+_DOCUMENT_BEARING_TOOLS = frozenset({"run_python", "run_agent", "deep_research"})
+
+
 def _document_events(
     tool_name: str | None, content: Any, args: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -138,20 +169,27 @@ def _document_events(
 
     The UI uses these frames to drop an artifact card into the chat and flip the side panel to
     the document. ``create_document`` returns a ``DocumentInfo`` (id/title/mime ride on the tool
-    result); ``run_python`` returns a ``PythonRunResult`` whose ``documents`` lists every /out
-    file persisted as a document (one frame each); ``update_document`` returns a plain string,
-    so the id comes from the call's args (which Pydantic AI nests under the ``args`` parameter
-    of the tool signature).
+    result); ``run_python``/``run_agent``/``deep_research`` results carry a ``documents`` list of
+    everything persisted during the call (one frame each), and ``run_swarm`` nests one such
+    report per dispatched task; ``update_document`` returns a plain string, so the id comes from
+    the call's args (which Pydantic AI nests under the ``args`` parameter of the tool signature).
     """
     if tool_name == "create_document":
         frame = _created_frame(content)
         return [frame] if frame else []
-    if tool_name == "run_python":
-        docs = (
-            content.get("documents") if isinstance(content, dict)
-            else getattr(content, "documents", None)
+    if tool_name in _DOCUMENT_BEARING_TOOLS:
+        return [frame for d in _documents_of(content) if (frame := _created_frame(d))]
+    if tool_name == "run_swarm":
+        reports = (
+            content.get("reports") if isinstance(content, dict)
+            else getattr(content, "reports", None)
         )
-        return [frame for d in docs or [] if (frame := _created_frame(d))]
+        return [
+            frame
+            for report in reports or []
+            for d in _documents_of(report)
+            if (frame := _created_frame(d))
+        ]
     if tool_name == "update_document":
         inner = (args or {}).get("args")
         data = inner if isinstance(inner, dict) else (args or {})
@@ -192,7 +230,6 @@ async def stream_run(
       document (artifact card in the chat + side-panel focus)
     - ``{"type": "final", "text": str}`` — the fully assembled answer (always emitted last)
     """
-    agent = build_agent(model, effort)
     # Each user gets their own database, so no user's data can surface in another
     # user's queries. The database is created on first use.
     async with (
@@ -202,8 +239,21 @@ async def stream_run(
     ):
         await db.ensure_database()
         await db.ensure_schema()
+        # The conversation's mode (fixed at creation) picks the agent profile. Tolerant: a
+        # lookup failure or a CLI conversation that doesn't exist yet means the regular agent.
+        try:
+            mode = await repo.get_conversation_mode(db, conversation_id)
+        except Exception:  # noqa: BLE001 — mode resolution must never block a turn.
+            logger.warning("mode lookup failed; using %r", DEFAULT_MODE, exc_info=True)
+            mode = DEFAULT_MODE
+        agent = build_agent(model, effort, mode=mode)
         deps = GraphDependencies(
-            db=db, user_id=user_id, conversation_id=conversation_id, web=web, embedder=embedder
+            db=db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            web=web,
+            embedder=embedder,
+            model=model,
         )
 
         # Load the prior turns of this thread so the agent retains context. The

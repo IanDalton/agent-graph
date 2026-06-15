@@ -50,8 +50,15 @@ async def create_conversation(
     user_id: str,
     conversation_id: str,
     title: str | None = None,
+    mode: str = "regular",
 ) -> None:
-    """Ensure the User and Conversation vertices (and their link) exist. Idempotent."""
+    """Ensure the User and Conversation vertices (and their link) exist. Idempotent.
+
+    ``mode`` selects the agent profile for this conversation ('regular'/'research'/'swarm' — see
+    ``backend.main.MODES``). It is fixed at creation: the persistence hook's idempotent call (which
+    always passes the default) cannot overwrite a mode the API set, because an existing
+    conversation returns early.
+    """
     existing = await db.query(
         "SELECT count(*) AS n FROM Conversation WHERE conversation_id = :cid",
         {"cid": conversation_id},
@@ -66,8 +73,8 @@ async def create_conversation(
     )
     await db.command(
         "CREATE VERTEX Conversation SET conversation_id = :cid, user_id = :uid, "
-        "title = :title, started_at = :ts",
-        {"cid": conversation_id, "uid": user_id, "title": title, "ts": _now()},
+        "title = :title, mode = :mode, started_at = :ts",
+        {"cid": conversation_id, "uid": user_id, "title": title, "mode": mode, "ts": _now()},
     )
     await db.command(
         "CREATE EDGE HAS_CONVERSATION "
@@ -146,6 +153,23 @@ async def get_conversation_summary(db: ArcadeClient, conversation_id: str) -> di
     }
 
 
+async def get_conversation_title(db: ArcadeClient, conversation_id: str) -> str:
+    """Return the current conversation title, or an empty string when unset."""
+    rows = await db.query(
+        "SELECT title FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return str((rows[0].get("title") if rows else "") or "")
+
+
+async def set_conversation_title(db: ArcadeClient, conversation_id: str, title: str) -> None:
+    """Store a generated or user-edited conversation title in place."""
+    await db.command(
+        "UPDATE Conversation SET title = :title WHERE conversation_id = :cid",
+        {"title": title, "cid": conversation_id},
+    )
+
+
 async def set_conversation_summary(
     db: ArcadeClient,
     conversation_id: str,
@@ -168,17 +192,30 @@ async def list_conversations(
     """Return this user's conversations, most recently started first.
 
     Backs the UI's left-pane conversation list. Scoped by ``user_id`` (defense-in-depth on
-    top of the per-user database). ``mode`` is reported as a constant ``"regular"`` for now —
-    a stable field the frontend's mode-icon logic can read before other modes exist.
+    top of the per-user database). ``mode`` is the stored agent profile; conversations created
+    before modes existed have none and report ``"regular"``.
     """
     rows = await db.query(
-        "SELECT conversation_id, title, started_at FROM Conversation "
+        "SELECT conversation_id, title, mode, started_at FROM Conversation "
         "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
     for row in rows:
-        row["mode"] = "regular"
+        row["mode"] = row.get("mode") or "regular"
     return rows
+
+
+async def get_conversation_mode(db: ArcadeClient, conversation_id: str) -> str:
+    """Return the conversation's agent mode ('regular'/'research'/'swarm').
+
+    Defaults to ``"regular"`` for an unknown conversation or one created before modes existed,
+    so callers never have to special-case missing data.
+    """
+    rows = await db.query(
+        "SELECT mode FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return (rows[0].get("mode") if rows else None) or "regular"
 
 
 async def search_messages(
@@ -446,6 +483,109 @@ async def delete_document(db: ArcadeClient, user_id: str, document_id: str) -> i
     result = await db.command(
         "DELETE VERTEX FROM (SELECT FROM Document WHERE document_id = :did AND user_id = :uid)",
         {"did": document_id, "uid": user_id},
+    )
+    return _affected(result)
+
+
+async def create_agent_spec(
+    db: ArcadeClient,
+    user_id: str,
+    name: str,
+    role: str,
+    instructions: str,
+    tools: list[str],
+) -> str:
+    """Create a swarm sub-agent definition, linked to the User. Returns the agent_id.
+
+    AgentSpec vertices are the swarm's persistent roster: the orchestrator defines a specialist
+    once (name, role, system prompt, granted tool groups) and re-dispatches it across turns and
+    conversations. Name uniqueness per user is enforced by the capability layer (it checks
+    :func:`get_agent_spec` first), not by the database.
+    """
+    agent_id = _new_id()
+    now = _now()
+    await db.command(
+        "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
+        {"uid": user_id},
+    )
+    await db.command(
+        "CREATE VERTEX AgentSpec SET agent_id = :aid, user_id = :uid, name = :name, "
+        "role = :role, instructions = :instructions, tools = :tools, "
+        "created_at = :ts, updated_at = :ts",
+        {
+            "aid": agent_id,
+            "uid": user_id,
+            "name": name,
+            "role": role,
+            "instructions": instructions,
+            "tools": tools,
+            "ts": now,
+        },
+    )
+    await db.command(
+        "CREATE EDGE HAS_AGENT "
+        "FROM (SELECT FROM User WHERE user_id = :uid) "
+        "TO (SELECT FROM AgentSpec WHERE agent_id = :aid)",
+        {"uid": user_id, "aid": agent_id},
+    )
+    return agent_id
+
+
+async def get_agent_spec(db: ArcadeClient, user_id: str, ref: str) -> dict[str, Any] | None:
+    """Return one sub-agent spec by its agent_id OR its name, or None. User-scoped."""
+    rows = await db.query(
+        "SELECT agent_id, name, role, instructions, tools, created_at, updated_at "
+        "FROM AgentSpec WHERE user_id = :uid AND (agent_id = :ref OR name = :ref)",
+        {"uid": user_id, "ref": ref},
+    )
+    return rows[0] if rows else None
+
+
+async def list_agent_specs(db: ArcadeClient, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Return this user's swarm roster (full specs, instructions included), oldest first."""
+    return await db.query(
+        "SELECT agent_id, name, role, instructions, tools, created_at, updated_at "
+        "FROM AgentSpec WHERE user_id = :uid ORDER BY created_at ASC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
+
+
+async def update_agent_spec(
+    db: ArcadeClient,
+    user_id: str,
+    agent_id: str,
+    role: str | None = None,
+    instructions: str | None = None,
+    tools: list[str] | None = None,
+) -> int:
+    """Revise a sub-agent spec in place. Returns the number updated (0 if not this user's).
+
+    Pass only the fields to change; ``name`` is immutable (it is how the orchestrator and the
+    stored reports refer to the agent).
+    """
+    set_clauses = ["updated_at = :ts"]
+    params: dict[str, Any] = {"ts": _now(), "aid": agent_id, "uid": user_id}
+    if role is not None:
+        set_clauses.append("role = :role")
+        params["role"] = role
+    if instructions is not None:
+        set_clauses.append("instructions = :instructions")
+        params["instructions"] = instructions
+    if tools is not None:
+        set_clauses.append("tools = :tools")
+        params["tools"] = tools
+    result = await db.command(
+        "UPDATE AgentSpec SET " + ", ".join(set_clauses) + " WHERE agent_id = :aid AND user_id = :uid",
+        params,
+    )
+    return _affected(result)
+
+
+async def delete_agent_spec(db: ArcadeClient, user_id: str, agent_id: str) -> int:
+    """Delete a sub-agent spec (and its HAS_AGENT edge) by id, if it belongs to ``user_id``."""
+    result = await db.command(
+        "DELETE VERTEX FROM (SELECT FROM AgentSpec WHERE agent_id = :aid AND user_id = :uid)",
+        {"aid": agent_id, "uid": user_id},
     )
     return _affected(result)
 

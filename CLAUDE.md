@@ -27,7 +27,9 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   injected via `deps_type`. The per-user database (carried by `db`) is the real isolation boundary;
   `user_id` still keys the `User`/`Fact` vertices and survives in `WHERE` filters as
   defense-in-depth. `conversation_id` scopes the current thread. `proposed_schemas` is run-scoped
-  state (a fresh dict per run) backing the ontology pipeline's ordering guard.
+  state (a fresh dict per run) backing the ontology pipeline's ordering guard. `model` carries the
+  UI-selected model label so delegated sub-agents (swarm/deep research) run on the conversation's
+  model.
 - **`backend/db/repository.py`** — the only place that runs SQL: `create_conversation`,
   `append_message`, `get_recent_messages`, `search_messages`, `store_fact`, `search_facts`,
   `write_log`, `update_fact`/`delete_fact` (revise/remove a fact by `fact_id`, user-scoped), plus the
@@ -46,6 +48,13 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `update_document` is shared by agent revisions AND user edits from the web UI. A document's
   `encoding` is `"text"` (literal content) or `"base64"` (binary artifacts — PDFs/images the
   sandbox produced).
+  **Modes:** `create_conversation(..., mode=)` stamps the conversation's agent profile at creation
+  (`'regular'`/`'research'`/`'swarm'`; immutable — the idempotent hook call can't overwrite it),
+  `get_conversation_mode` reads it back (default `'regular'` for unknown/pre-mode conversations),
+  and `list_conversations` reports it with the same fallback.
+  **Swarm roster:** `create_agent_spec`/`get_agent_spec` (by id OR name)/`list_agent_specs`/
+  `update_agent_spec`/`delete_agent_spec` persist sub-agent definitions (name, role, system prompt,
+  tool grants) as `AgentSpec` vertices, user-scoped, linked `User -HAS_AGENT-> AgentSpec`.
   **Faithful replay:** `append_run_messages`/`get_run_history` store each run's serialized Pydantic
   AI messages (via `new_messages_json()`) as `RunMessages` vertices — tool calls AND their returns
   included — *separately* from the human-readable `Message` vertices. `Message` rows keep role/content
@@ -55,6 +64,7 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
   `Conversation -HAS_RUN_MESSAGES-> RunMessages`, `Conversation -HAS_DOCUMENT-> Document`,
   `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
+  `User -HAS_AGENT-> AgentSpec`,
   plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
   `MemorySearchResult`/`MemoryHit`, and the ontology models `VertexProperty`, `ProposeSchemaArgs`,
@@ -98,9 +108,9 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
     no proposal but are guarded: they validate the identifier, confirm the type exists *and* matches
     the requested category (`type_category` — so you can't `delete_edge_type` a vertex type, whose
     `UNSAFE` delete would strip records), and refuse the internal types. `_PROTECTED_VERTEX_TYPES`
-    (User, Conversation, Message, Fact, LogEntry, **RunMessages**, **Document**) and
+    (User, Conversation, Message, Fact, LogEntry, **RunMessages**, **Document**, **AgentSpec**) and
     `_PROTECTED_EDGE_TYPES` (HAS_CONVERSATION, HAS_MESSAGE, HAS_RUN_MESSAGES, KNOWS, LOGGED,
-    HAS_NODE, HAS_DOCUMENT) can never be
+    HAS_NODE, HAS_DOCUMENT, HAS_AGENT) can never be
     edited/dropped here; `update_node`/`delete_node` reject the protected *vertex* types too.
   - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
     `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
@@ -163,6 +173,44 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `run_query`/`web_search`: every failure becomes a structured `error` result, never an
   exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
   a `note`, keeping the code's stdout).
+- **`backend/skills/subagent.py`** — the shared **delegated-run machinery**: `run_subagent(deps,
+  instructions=, tool_groups=, prompt=, request_limit=, model=)` builds a fresh single-purpose
+  Pydantic AI agent per dispatch with a granted subset of the existing capability bundles
+  (`capabilities_for`: `web`/`documents`/`sandbox`/`memory` — tool capabilities ONLY, never
+  `persistence_hooks`, since the parent run's `after_run` already records the orchestrating turn)
+  and runs it on the parent's deps (same per-user DB/conversation/web/sandbox; fresh
+  `proposed_*` dicts) with a `UsageLimits(request_limit=)` runaway backstop
+  (`SUBAGENT_REQUEST_LIMIT`, default 25). A `_document_collector` Hooks records every document the
+  delegate persists (create_document results + run_python artifacts) onto
+  `SubagentOutcome.documents`, which is how delegated artifacts reach the UI (see `main`'s
+  document frames). **Tolerant**: `run_subagent` never raises — failures (incl. exhausted limits)
+  come back as `SubagentOutcome.error`, keeping any documents persisted before the failure.
+  `model` is a test seam; production resolves `deps.model` (the UI-selected label) so delegates
+  run on the conversation's model.
+- **`backend/schemas/swarm_schemas.py`** — swarm tool I/O: `TOOL_GROUPS` (the grantable bundles),
+  `CreateAgentArgs` (kebab-case name validator, tools-subset validator, default grant
+  `["web", "documents"]`), `UpdateAgentArgs`, `AgentSpecInfo`, `AgentTask` (agent by id or name +
+  self-contained task/context), `RunSwarmArgs` (1–8 tasks), `AgentRunReport`/`SwarmRunResult`
+  (tolerant — failures land in `error`), `DeepResearchArgs`/`DeepResearchResult`.
+- **`backend/skills/swarm_capability.py`** — the `SwarmOrchestrator` bundle, exposed via
+  `build_swarm()` and added **only in swarm-mode conversations**: the main agent becomes an
+  orchestrator that designs its own specialists. Roster tools `list_agents`/`create_agent`/
+  `update_agent`/`delete_agent` (persisted `AgentSpec`s — durable across turns/conversations;
+  duplicates/unknown names raise `ModelRetry`); dispatch tools `run_agent` (one task) and
+  `run_swarm` (a batch of INDEPENDENT tasks run **concurrently** via `asyncio.gather` under a
+  `SWARM_MAX_PARALLEL` semaphore, default 4; reports return in task order and one failure never
+  affects the rest); plus a built-in `deep_research` tool (web+documents delegate on
+  `DEEP_RESEARCH_INSTRUCTIONS`, request limit `DEEP_RESEARCH_REQUEST_LIMIT`, default 40).
+  Dispatch is tolerant end-to-end: an unknown agent or broken delegate becomes an `error` report,
+  never an exception. Sub-agents don't see the conversation — instructions tell the orchestrator
+  to make every task self-contained and to reference (not recreate) the documents on each report.
+- **`backend/skills/research_capability.py`** — `DeepResearch`: the shared research method
+  (plan sub-questions → fan out searches → fetch/cross-check sources → synthesize a cited
+  markdown report via create_document). `build_research()` returns an **instructions-only**
+  capability overlaid in research-mode conversations (the work runs on the existing
+  web/document tools, so every step streams as normal tool chips);
+  `DEEP_RESEARCH_INSTRUCTIONS` is the same method framed as a delegate's system prompt, used by
+  the swarm's `deep_research` tool.
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
@@ -171,15 +219,25 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   included; a corrupt blob is skipped, not fatal), and streams events using the
   `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
   `build_agent()` adds `build_search()` to the capability list, and `run()` opens a `WebClient`
-  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`. The streaming itself
+  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
+  **Modes:** `build_agent(model, effort, mode)` keeps the full base capability set for every mode
+  and overlays `build_research()` (research) or `build_swarm()` (swarm) on top; `MODES`/
+  `DEFAULT_MODE` are the source of truth, unknown values fall back to regular. `stream_run`
+  resolves the conversation's stored mode via `repo.get_conversation_mode` (tolerantly — a lookup
+  failure means regular) *before* building the agent, and passes the UI model label into
+  `GraphDependencies(model=...)` so swarm/deep-research delegates run on the same model. The
+  streaming itself
   lives in `stream_run(prompt, user_id, conversation_id)`, an async generator that maps Pydantic AI
   events to a **stable event vocabulary** — `thinking`/`text`/`tool_call`/`tool_result`/`document`/
   `final` dicts — so callers never depend on the library's event classes; `run()` just consumes it
   for the CLI (thinking in blue, text plain). `document` frames
   (`{action, document_id, title, mime_type}`) are emitted right after the tool_result of
-  `create_document`/`update_document`/`run_python` (see `_document_events`; update's id comes from
-  the call args tracked per tool_call_id since its return is a plain string; run_python yields one
-  frame per persisted /out artifact) — the UI uses them to drop artifact cards into the chat and
+  `create_document`/`update_document`/`run_python`/`run_agent`/`deep_research`/`run_swarm` (see
+  `_document_events`; update's id comes from
+  the call args tracked per tool_call_id since its return is a plain string; the others yield one
+  frame per document on the result — run_python's /out artifacts, a delegate's
+  `documents`, or each report's documents inside `run_swarm.reports`) — the UI uses them to drop
+  artifact cards into the chat and
   spotlight the document in the side panel. **`_jsonable` recurses** into dicts/lists and dumps
   Pydantic models (`model_dump(mode="json")`) — tool results can be containers OF models (e.g.
   `list_documents` → `list[DocumentInfo]`), and a bare `json.dumps` on those used to kill the SSE
@@ -188,8 +246,10 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 - **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
   DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
   `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
-  (read-only model/DB/search/log surface, **no secrets**), `GET|POST /api/conversations` (list /
-  create — create mints a uuid `conversation_id`), `GET /api/conversations/{id}/messages`,
+  (read-only model/DB/search/log surface incl. the selectable `modes`, **no secrets**),
+  `GET|POST /api/conversations` (list /
+  create — create mints a uuid `conversation_id` and stamps the requested `mode`, validated by a
+  `Literal`), `GET /api/conversations/{id}/messages`,
   `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
   summary), the document surface — `GET /api/conversations/{id}/documents` (metadata list,
   tolerant), `GET|PUT|DELETE /api/documents/{id}` (PUT applies a **user edit** of title/content via
@@ -201,8 +261,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 ## Frontend (`frontend/`)
 
 React + Vite + TypeScript SPA using **shadcn/ui** components (Tailwind + Radix). A three-pane
-"Mission Control" shell built so future modes (Research/Swarm/Council) slot in as components:
-left `Sidebar` (conversation list + New Chat, with a per-row mode icon — only 💬 Regular today),
+"Mission Control" shell built so modes slot in as components (Council still reserved):
+left `Sidebar` (conversation list with a per-row mode icon — 💬 Regular, 🔬 Deep Research,
+🕸 Swarm — and a **split New Chat button**: the main button creates a regular chat, the chevron
+opens a downward mode menu — local to the Sidebar, since the shared `ui/popover.tsx` anchors
+upward for the composer. The chosen mode rides `POST /api/conversations` and is fixed for the
+conversation's life),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
@@ -284,3 +348,9 @@ Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL
 - Documents are user-editable: agent code must `read_document` before revising, and any new
   "agent writes / user edits" surface should reuse `repo.update_document` so both paths stay
   consistent.
+- Delegated runs (`run_agent`/`run_swarm`/`deep_research`) share the tolerance contract too:
+  `run_subagent` must never raise — failures become `error` on the outcome/report. Sub-agents get
+  tool capabilities ONLY, never `persistence_hooks` (the parent run already persists the turn;
+  hooks on a delegate would double-write messages), and always a `UsageLimits` request cap.
+  A conversation's `mode` is fixed at creation — agent-profile changes belong in
+  `main.build_agent`, not per-turn switches.

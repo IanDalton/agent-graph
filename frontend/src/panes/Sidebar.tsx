@@ -13,7 +13,7 @@ function conversationLabel(c: Conversation): string {
 }
 
 export function Sidebar() {
-  const { conversations, activeId, selectConversation, newConversation } = useApp();
+  const { conversations, activeId, selectConversation, openNewChatPicker } = useApp();
 
   return (
     <aside className="flex h-full flex-col border-r border-border bg-card">
@@ -25,7 +25,7 @@ export function Sidebar() {
         <Button
           variant="secondary"
           className="w-full justify-start"
-          onClick={() => void newConversation()}
+          onClick={openNewChatPicker}
         >
           <Plus />
           New Chat

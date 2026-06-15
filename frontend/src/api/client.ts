@@ -4,6 +4,7 @@ import type {
   DocumentFull,
   DocumentMeta,
   MemoryGraph,
+  Mode,
   StoredMessage,
 } from "@/types";
 
@@ -20,11 +21,11 @@ export const api = {
       json<Conversation[]>
     ),
 
-  createConversation: (userId: string, title?: string) =>
+  createConversation: (userId: string, title?: string, mode: Mode = "regular") =>
     fetch("/api/conversations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, title }),
+      body: JSON.stringify({ user_id: userId, title, mode }),
     }).then(json<Conversation>),
 
   getMessages: (conversationId: string, userId: string) =>

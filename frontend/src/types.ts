@@ -1,5 +1,5 @@
-/** Conversation mode. Only "regular" is implemented today; the others are
- *  reserved so the sidebar's mode-icon logic and future canvases have a stable field. */
+/** Conversation mode (the agent profile, fixed at creation). "regular", "research"
+ *  (deep research) and "swarm" are implemented; "council" is reserved. */
 export type Mode = "regular" | "research" | "swarm" | "council";
 
 export interface Conversation {
@@ -76,6 +76,8 @@ export interface AppConfig {
   /** Default thinking-effort level, and the selectable set for the dropdown. */
   effort?: string;
   efforts?: string[];
+  /** Conversation modes (agent profiles) selectable at conversation creation. */
+  modes?: string[];
   arcade_url: string;
   searxng_url: string;
   log_level: string;

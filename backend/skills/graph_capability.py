@@ -23,7 +23,7 @@ from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.capabilities import Capability, Hooks
 from pydantic_ai.messages import TextPart, ToolCallPart, UserPromptPart
 
-from backend import summarization
+from backend import summarization, title_generation
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.schemas.graph_schemas import (
@@ -252,6 +252,11 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
     await _best_effort(
         summarization.maybe_refresh_summary(deps.db, deps.conversation_id),
         what="refresh_summary",
+    )
+    # Fill in a blank conversation title after the first completed turn.
+    await _best_effort(
+        title_generation.maybe_refresh_title(deps.db, deps.conversation_id),
+        what="refresh_title",
     )
     return result
 

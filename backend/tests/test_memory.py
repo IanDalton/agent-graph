@@ -19,6 +19,7 @@ from pydantic_ai.usage import RunUsage
 from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
+from backend import title_generation
 from backend.skills.graph_capability import build_memory, delete_fact, update_fact
 
 EXPECTED_TOOLS = {
@@ -63,6 +64,31 @@ class Failing503Client(RecordingClient):
         raise httpx.HTTPStatusError("503 Service Unavailable", request=req, response=httpx.Response(503, request=req))
 
 
+class TitleRecordingClient(RecordingClient):
+    """Recording client with canned reads for title generation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Repo.get_recent_messages reverses query results, so this is newest-first.
+        self._message_rows = [
+            {"role": "assistant", "content": "Let's narrow it down.", "created_at": "2"},
+            {"role": "user", "content": "I need a hotel in Tokyo", "created_at": "1"},
+        ]
+
+    async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self.queries.append((sql, params or {}))
+        normalized = sql.upper()
+        if "SELECT COUNT(*) AS N FROM CONVERSATION" in normalized:
+            return [{"n": 0}]
+        if "SELECT TITLE FROM CONVERSATION" in normalized:
+            return [{"title": ""}]
+        if "SELECT ROLE, CONTENT, CREATED_AT FROM MESSAGE" in normalized:
+            return self._message_rows
+        if "COUNT(" in normalized:
+            return [{"n": 0}]
+        return []
+
+
 def _make_agent(model: TestModel) -> Agent:
     return Agent(model, deps_type=GraphDependencies, capabilities=[*build_memory()])
 
@@ -93,6 +119,32 @@ def test_hooks_persist_turn() -> None:
     assert "assistant" in roles  # TestModel's reply was persisted
     # The conversation vertex was created exactly once (before_run, idempotent).
     assert sum(1 for sql, _ in db.commands if sql.startswith("CREATE VERTEX Conversation")) == 1
+
+
+def test_hooks_generate_title_after_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After the first completed turn, a blank conversation title is generated automatically."""
+    monkeypatch.setattr(
+        title_generation,
+        "select_model",
+        lambda *_args, **_kwargs: TestModel(custom_output_text="Tokyo hotel search"),
+    )
+    model = TestModel(call_tools=[])
+    agent = _make_agent(model)
+    db = TitleRecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    asyncio.run(agent.run("hello", deps=deps))
+
+    updates = [params for sql, params in db.commands if sql.startswith("UPDATE Conversation SET title")]
+    assert updates and updates[-1]["title"] == "Tokyo hotel search"
+
+
+def test_title_model_label_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TITLE_MODEL", raising=False)
+    monkeypatch.setenv("TITLE_OLLAMA_MODEL", "supra-title-350m-exp")
+    assert title_generation.title_model_label() == "ollama/supra-title-350m-exp"
+
+    monkeypatch.setenv("TITLE_MODEL", "openai:gpt-5.2")
+    assert title_generation.title_model_label() == "openai:gpt-5.2"
 
 
 def test_run_messages_blob_round_trips_tool_calls() -> None:

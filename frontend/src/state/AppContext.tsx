@@ -8,7 +8,7 @@ import {
 } from "react";
 
 import { api } from "@/api/client";
-import type { AppConfig, Conversation } from "@/types";
+import type { AppConfig, Conversation, Mode } from "@/types";
 
 // Single source of the current user. Hardcoded for now; swapping in real auth later
 // is a one-line change here, and every call already threads the id through.
@@ -32,6 +32,8 @@ interface AppState {
   conversations: Conversation[];
   activeId: string | null;
   loading: boolean;
+  /** True when the "new chat" mode picker should be shown in the canvas. */
+  pendingNewChat: boolean;
   /** Runtime config (model/effort options, URLs). Fetched once; null until loaded. */
   config: AppConfig | null;
   /** The document to spotlight in the side panel (set when the agent creates one, or when the
@@ -45,7 +47,10 @@ interface AppState {
   effort: string;
   setEffort: (effort: string) => void;
   selectConversation: (id: string) => void;
-  newConversation: () => Promise<void>;
+  /** Show the mode picker in the canvas (clears active conversation). */
+  openNewChatPicker: () => void;
+  /** Create and select a conversation; `mode` picks its agent profile (default regular chat). */
+  newConversation: (mode?: Mode) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
 }
 
@@ -55,6 +60,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [pendingNewChat, setPendingNewChat] = useState(false);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [featuredDoc, setFeaturedDoc] = useState<FeaturedDoc | null>(null);
 
@@ -102,16 +108,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return rows;
   }, []);
 
-  const newConversation = useCallback(async () => {
-    const convo = await api.createConversation(USER_ID);
+  const openNewChatPicker = useCallback(() => {
+    setActiveId(null);
+    setFeaturedDoc(null);
+    setPendingNewChat(true);
+  }, []);
+
+  const newConversation = useCallback(async (mode: Mode = "regular") => {
+    const convo = await api.createConversation(USER_ID, undefined, mode);
     setConversations((prev) => [convo, ...prev]);
     setActiveId(convo.conversation_id);
-    setFeaturedDoc(null); // a spotlight from another conversation shouldn't follow us here
+    setFeaturedDoc(null);
+    setPendingNewChat(false);
   }, []);
 
   const selectConversation = useCallback((id: string) => {
     setActiveId(id);
     setFeaturedDoc(null);
+    setPendingNewChat(false);
   }, []);
 
   // Initial load: fetch conversations and select the most recent (or create one).
@@ -122,7 +136,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (rows.length > 0) {
           setActiveId(rows[0].conversation_id);
         } else {
-          await newConversation();
+          setPendingNewChat(true);
         }
       } catch (err) {
         console.error("failed to load conversations", err);
@@ -140,6 +154,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         conversations,
         activeId,
         loading,
+        pendingNewChat,
         config,
         featuredDoc,
         featureDocument,
@@ -148,6 +163,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         effort,
         setEffort,
         selectConversation,
+        openNewChatPicker,
         newConversation,
         refreshConversations,
       }}

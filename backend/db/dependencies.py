@@ -42,3 +42,7 @@ class GraphDependencies:
     # seam); when None, run_python builds one from env per call — the sandbox is stateless, so
     # there is nothing to share between calls.
     sandbox: "PythonSandbox | None" = None
+    # The UI-selected model label for this run (see backend.model_selection.resolve_model).
+    # Swarm/deep-research sub-agents read it so delegated work runs on the same model the user
+    # chose for the conversation; None means the env-configured default.
+    model: str | None = None

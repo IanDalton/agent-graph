@@ -146,7 +146,7 @@ export function useChat(
   userId: string,
   onTurnComplete?: () => void
 ) {
-  const { model, effort, featureDocument } = useApp();
+  const { model, effort, featureDocument, refreshConversations } = useApp();
   const [messages, dispatch] = useReducer(reducer, []);
   const [sending, setSending] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -208,10 +208,21 @@ export function useChat(
         }
       } finally {
         setSending(false);
+        await refreshConversations().catch((err) => {
+          console.error("failed to refresh conversations", err);
+        });
         onTurnComplete?.();
       }
     },
-    [conversationId, userId, model, effort, onTurnComplete, featureDocument]
+    [
+      conversationId,
+      userId,
+      model,
+      effort,
+      onTurnComplete,
+      featureDocument,
+      refreshConversations,
+    ]
   );
 
   const send = useCallback(

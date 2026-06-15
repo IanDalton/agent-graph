@@ -226,6 +226,9 @@ class ArcadeClient:
             # Agent-authored documents (reports, notes, code listings) surfaced in the web UI's
             # Documents tab; text-based ones are user-editable there. See repository.create_document.
             "CREATE VERTEX TYPE Document IF NOT EXISTS",
+            # Swarm sub-agent definitions (name, role, system prompt, tool grants) — the roster the
+            # swarm orchestrator builds and dispatches. See repository.create_agent_spec.
+            "CREATE VERTEX TYPE AgentSpec IF NOT EXISTS",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
@@ -235,6 +238,8 @@ class ArcadeClient:
             "CREATE EDGE TYPE HAS_DOCUMENT IF NOT EXISTS",
             # Links the User to agent-created instance nodes (see repository.create_node).
             "CREATE EDGE TYPE HAS_NODE IF NOT EXISTS",
+            # Links the User to their swarm sub-agent definitions.
+            "CREATE EDGE TYPE HAS_AGENT IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
             "CREATE PROPERTY User.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON User (user_id) UNIQUE",
@@ -256,6 +261,10 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Document (conversation_id) NOTUNIQUE",
             "CREATE PROPERTY Document.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Document (user_id) NOTUNIQUE",
+            "CREATE PROPERTY AgentSpec.agent_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON AgentSpec (agent_id) UNIQUE",
+            "CREATE PROPERTY AgentSpec.user_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON AgentSpec (user_id) NOTUNIQUE",
             # Non-unique lookup indexes used by the repository queries.
             "CREATE PROPERTY Message.conversation_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (conversation_id) NOTUNIQUE",
