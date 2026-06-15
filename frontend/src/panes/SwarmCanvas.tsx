@@ -29,14 +29,17 @@ export function SwarmCanvas({
     onTurnComplete
   );
   const bottomRef = useRef<HTMLDivElement>(null);
+  const autoSentRef = useRef(false);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   // Fire the deferred message once on mount (from composing before picking a mode).
+  // The ref guard keeps it to a single send under React StrictMode's double mount.
   useEffect(() => {
-    if (autoSend) {
+    if (autoSend && !autoSentRef.current) {
+      autoSentRef.current = true;
       send(autoSend);
       onAutoSent?.();
     }

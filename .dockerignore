@@ -1,0 +1,32 @@
+# Backend build context (build runs from repo root). Keep it lean.
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+*.egg-info
+
+# Frontend — never part of the backend image.
+frontend
+
+# Notebooks / scratch
+*.ipynb
+.ipynb_checkpoints
+
+# Local env & docker meta
+.env
+docker-compose*.yml
+**/Dockerfile
+.dockerignore
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db

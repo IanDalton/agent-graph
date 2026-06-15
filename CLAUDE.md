@@ -312,9 +312,21 @@ GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxi
 
 ## Commands
 
+The **whole stack is containerized** (arcadedb + searxng + backend + frontend); see `DOCKER.md`.
+
+One `docker-compose.yml` with `dev`/`prod` profiles (infra is profile-less, so it always starts):
+
 ```bash
-docker compose up -d arcadedb searxng  # ArcadeDB (DB AgentMemory auto-created) + SearXNG (web search)
-docker compose build sandbox      # agent-sandbox image for run_python (python:3.12-slim + fpdf2 for PDFs)
+docker compose build sandbox                  # one-time: agent-sandbox image for run_python (python:3.12-slim + fpdf2)
+docker compose --profile prod up -d --build   # prod stack (built images, nginx UI) — UI :8080, API :8000, DB :2480, SearXNG :8085
+# hot-reloading dev stack (uvicorn --reload + Vite HMR; source bind-mounted, saving a file updates it):
+docker compose --profile dev up --build       # UI :5173, API :8000
+```
+
+Run pieces directly (infra in Docker, app on the host) instead:
+
+```bash
+docker compose up -d arcadedb searxng  # just the infra (ArcadeDB DB AgentMemory auto-created + SearXNG)
 pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv, fastapi, uvicorn
 python -m backend.main "remember I like Recoleta apartments" --user u1 --conversation c1
 python -m pytest backend/tests/   # unit tests run without a DB/network/Docker; integration tests skip when :2480 / the sandbox image is unavailable
@@ -326,6 +338,11 @@ curl "http://localhost:8085/search?q=arcadedb&format=json"
 
 Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL` (e.g.
 `openai:gpt-5.2`) to use a hosted provider instead. Secrets load from `.env` via `python-dotenv`.
+
+The **backend image** bundles the Docker CLI and mounts the host `docker.sock` so `run_python`'s
+sandbox containers launch on the host daemon (Docker-out-of-Docker); a same-path
+`SANDBOX_SHARED_DIR`/`TMPDIR` bind lets `/out` artifacts round-trip. The `frontend` prod image is
+nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
 
 ## Conventions / gotchas
 

@@ -150,9 +150,18 @@ export function useChat(
   const [messages, dispatch] = useReducer(reducer, []);
   const [sending, setSending] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // True once a turn has started in this conversation. The component is keyed by
+  // conversation id (Canvas), so a real conversation switch remounts useChat and this
+  // ref starts false again — we deliberately never reset it within the effect below.
+  const turnStartedRef = useRef(false);
 
   // Load persisted history whenever the active conversation changes.
   useEffect(() => {
+    // A turn has already started here — the first message of a brand-new chat is
+    // auto-sent on mount, and React StrictMode invokes this effect a second time.
+    // Nothing is persisted server-side yet, so re-loading would fetch [] and wipe the
+    // live turn (and the abort below would kill its stream). Leave local state intact.
+    if (turnStartedRef.current) return;
     abortRef.current?.abort();
     dispatch({ kind: "load", messages: [] });
     if (!conversationId) return;
@@ -160,7 +169,7 @@ export function useChat(
     (async () => {
       try {
         const stored = await api.getMessages(conversationId, userId);
-        if (cancelled) return;
+        if (cancelled || turnStartedRef.current) return;
         dispatch({
           kind: "load",
           messages: stored.map((m) => ({
@@ -230,6 +239,7 @@ export function useChat(
       if (!conversationId || !prompt.trim() || sending) return;
       const controller = new AbortController();
       abortRef.current = controller;
+      turnStartedRef.current = true;
       setSending(true);
       dispatch({ kind: "user", id: newId(), content: prompt, assistantId: newId() });
       await runStream(prompt, controller.signal);
@@ -252,6 +262,7 @@ export function useChat(
     if (!lastUser) return;
     const controller = new AbortController();
     abortRef.current = controller;
+    turnStartedRef.current = true;
     setSending(true);
     dispatch({ kind: "regenerate", assistantId: newId() });
     await runStream(lastUser.content, controller.signal);
