@@ -70,3 +70,8 @@ class GraphDependencies:
     # conversation's values apply at every hop of the agency.
     swarm_max_parallel: int | None = None
     swarm_max_depth: int | None = None
+    # Files the user uploaded this turn, already persisted as Documents by stream_run, as
+    # ``[{document_id, filename, mime_type}]``. The after_run persistence hook stamps these onto
+    # the human-readable user Message so a reloaded bubble can re-open them. Run-scoped; empty when
+    # the turn carried no uploads.
+    uploaded_attachments: list[dict[str, Any]] = field(default_factory=list)

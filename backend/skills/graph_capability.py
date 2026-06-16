@@ -263,6 +263,9 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
                     repo.append_message(
                         deps.db, deps.user_id, deps.conversation_id, "user", content,
                         embedding=await _embed(ctx, content),
+                        # Files uploaded this turn (persisted as Documents by stream_run) so a
+                        # reloaded user bubble can re-open them; None for a text-only turn.
+                        attachments=getattr(deps, "uploaded_attachments", None) or None,
                     ),
                     what="append_user_message",
                 )

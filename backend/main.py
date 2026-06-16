@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from typing import Any, AsyncIterator
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
+    BinaryContent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessage,
@@ -33,7 +35,7 @@ from backend.db import repository as repo
 from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.embeddings import Embedder
-from backend.model_selection import resolve_model
+from backend.model_selection import default_model_label, is_vision_capable, resolve_model
 from backend.reasoning_split import ReasoningSplitter
 from backend.serialization import _jsonable
 from backend.skills.document_capability import build_documents
@@ -44,7 +46,7 @@ from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
 from backend.skills.swarm_capability import build_swarm
 from backend.skills.system_prompt import BASE_SYSTEM_PROMPT, register_system_prompt
-from backend.web.client import WebClient
+from backend.web.client import WebClient, html_to_text
 
 logger = logging.getLogger("agent_graph.main")
 
@@ -315,12 +317,91 @@ def _document_events(
     return []
 
 
+# --- File attachments (user uploads the agent reads) ----------------------------------------
+# Images and PDFs are handed to the model as BinaryContent (native vision / PDF reading); every
+# textual type is decoded and inlined as text so it works on ANY provider, including non-vision
+# models. Unknown mime types are skipped (the API layer also filters by mime). The inlined-text cap
+# bounds context growth — and note that BinaryContent parts are re-sent on every subsequent turn
+# (faithful replay; see _to_message_history), so attachment count/size are bounded in api.py too.
+_BINARY_PREFIXES = ("image/",)
+_BINARY_EXACT = frozenset({"application/pdf"})
+_TEXT_EXACT = frozenset(
+    {"text/html", "text/plain", "text/csv", "text/markdown", "application/json"}
+)
+_MAX_INLINE_TEXT_CHARS = 200_000
+
+
+def _is_binary_attachment(mime: str) -> bool:
+    """True for mime types passed to the model as BinaryContent (images + PDF), else inlined/skipped."""
+    mime = (mime or "").lower()
+    return mime in _BINARY_EXACT or any(mime.startswith(p) for p in _BINARY_PREFIXES)
+
+
+def build_user_content(
+    prompt: str, attachments: list[dict[str, Any]], vision: bool = True
+) -> str | list[Any]:
+    """Build the agent's user-prompt content from typed text + uploaded files.
+
+    Returns the bare ``prompt`` string when there are no usable attachments (the original
+    text-only path, unchanged). Otherwise returns a list: a single leading text element (the user's
+    prompt, an optional non-vision note, and every inlined text file) followed by one
+    ``BinaryContent`` per image/PDF. Tolerant: a file that can't be decoded is skipped, never
+    raising — a bad upload must not abort the turn.
+
+    ``vision`` is the selected model's best-effort vision capability; when False and binary files
+    are present, a short note is prepended so the model knows it may not be able to see them.
+    """
+    if not attachments:
+        return prompt
+    text_blocks: list[str] = []
+    binaries: list[Any] = []
+    for att in attachments:
+        mime = str(att.get("mime_type") or "").lower()
+        name = str(att.get("filename") or "file")
+        data = att.get("data") or ""
+        try:
+            if _is_binary_attachment(mime):
+                binaries.append(BinaryContent(data=base64.b64decode(data), media_type=mime))
+            elif mime in _TEXT_EXACT:
+                raw = base64.b64decode(data).decode("utf-8", errors="replace")
+                if mime == "text/html":
+                    raw = html_to_text(raw)
+                if len(raw) > _MAX_INLINE_TEXT_CHARS:
+                    raw = raw[:_MAX_INLINE_TEXT_CHARS] + "\n…[truncated]"
+                text_blocks.append(f'Attached file "{name}" ({mime}):\n{raw}')
+            # else: unsupported mime — skipped (the API layer filters these out too).
+        except Exception:  # noqa: BLE001 — one bad attachment must not abort the turn.
+            logger.warning("skipping undecodable attachment %r (%s)", name, mime, exc_info=True)
+
+    # Nothing usable (all unsupported / undecodable): keep the original text-only path.
+    if not binaries and not text_blocks:
+        return prompt
+
+    leading = prompt
+    if not leading and (binaries or text_blocks):
+        leading = "Please review the attached file(s)."
+    if binaries and not vision:
+        leading = (
+            "[Note: the selected model may not be able to view images/PDFs; describe what you "
+            "need from them if it cannot read them directly.]\n\n" + (leading or "")
+        ).strip()
+
+    content: list[Any] = []
+    lead_text = "\n\n".join(t for t in [leading, *text_blocks] if t).strip()
+    if lead_text:
+        content.append(lead_text)
+    content.extend(binaries)
+    # If nothing usable was produced (all attachments unsupported/undecodable), fall back to text.
+    return content or prompt
+
+
 async def stream_run(
     prompt: str,
     user_id: str = "default",
     conversation_id: str = "default",
     model: str | None = None,
     effort: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one turn and yield structured events as they stream from the model.
 
@@ -390,6 +471,46 @@ async def stream_run(
         # agent sees the tool work it already did. after_run persists only the current
         # run's new_messages(), so reloaded history isn't re-written.
         history = _to_message_history(await repo.get_run_history(db, conversation_id))
+
+        # Persist each uploaded file as a Document (durable + visible in the Documents tab) and
+        # record its metadata so the user's message bubble can show it again after a reload. The
+        # agent still receives the file content directly via build_user_content below; this is just
+        # the durable copy. Best-effort per file — a storage hiccup never blocks the turn.
+        uploaded: list[dict[str, Any]] = []
+        if attachments:
+            # The before_run hook creates the Conversation vertex, but that runs *after* this
+            # block — and create_document links each Document to it. Ensure it exists first
+            # (idempotent) so the HAS_DOCUMENT edge has a valid endpoint.
+            try:
+                await repo.create_conversation(db, user_id, conversation_id)
+            except Exception:  # noqa: BLE001 — best-effort; create_document still sets the property.
+                logger.warning("ensuring conversation before uploads failed", exc_info=True)
+        for att in attachments or []:
+            mime = str(att.get("mime_type") or "application/octet-stream")
+            name = str(att.get("filename") or "upload")
+            data = att.get("data") or ""
+            try:
+                if _is_binary_attachment(mime):
+                    body, encoding = data, "base64"
+                else:
+                    body, encoding = base64.b64decode(data).decode("utf-8", errors="replace"), "text"
+                document_id = await repo.create_document(
+                    db, user_id, conversation_id, title=name, content=body,
+                    mime_type=mime, encoding=encoding,
+                )
+                uploaded.append(
+                    {"document_id": document_id, "filename": name, "mime_type": mime}
+                )
+            except Exception:  # noqa: BLE001 — a failed upload-persist must not block the turn.
+                logger.warning("failed to persist uploaded file %r", name, exc_info=True)
+        # The after_run persistence hook reads this to stamp the saved attachments onto the
+        # human-readable user Message (so a reloaded bubble can re-open them).
+        deps.uploaded_attachments = uploaded
+
+        # Compose the model's user prompt: typed text + inlined text files + BinaryContent images/
+        # PDFs. A non-vision model gets a soft note rather than a hard block (decided per request).
+        vision = is_vision_capable(model or default_model_label())
+        user_content = build_user_content(prompt, attachments or [], vision=vision)
 
         final_text = ""
         # Args of in-flight tool calls, keyed by tool_call_id — _document_event needs the
@@ -463,7 +584,7 @@ async def stream_run(
             """Run the parent agent, feeding frames onto the sink; always end with the sentinel."""
             try:
                 async with agent.run_stream_events(
-                    prompt, deps=deps, message_history=history
+                    user_content, deps=deps, message_history=history
                 ) as stream:
                     async for event in stream:
                         _emit_parent(event)

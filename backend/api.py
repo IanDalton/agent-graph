@@ -12,6 +12,8 @@ Run it with::
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -457,6 +459,19 @@ async def update_fact_importance(fact_id: str, body: FactImportance) -> dict[str
 # ----------------------------------------------------------------------------- chat
 
 
+# Upload limits. Enforced here (authoritative) as well as client-side (fast UX feedback).
+_MAX_ATTACHMENTS = 5
+_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB decoded per file
+
+
+class Attachment(BaseModel):
+    """One uploaded file: base64-encoded bytes plus its name and mime type."""
+
+    filename: str = ""
+    mime_type: str
+    data: str  # base64-encoded file bytes (no "data:" URL prefix)
+
+
 class ChatRequest(BaseModel):
     user_id: str = "default"
     conversation_id: str
@@ -467,6 +482,9 @@ class ChatRequest(BaseModel):
     # Optional per-request thinking-effort override (a value from /api/config "efforts"). When
     # omitted/unknown, the agent uses DEFAULT_EFFORT. Also browser-side, not stored on the server.
     effort: str | None = None
+    # Files the user attached to this message (images/PDFs the agent reads as multimodal content,
+    # text files inlined). Empty for a plain text turn. See backend.main.build_user_content.
+    attachments: list[Attachment] = Field(default_factory=list)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -484,6 +502,24 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
     instead of a dropped connection.
     """
 
+    # Validate uploads up front (before the stream opens) so an oversized/garbled file is a clean
+    # 400, not a mid-stream failure.
+    if len(body.attachments) > _MAX_ATTACHMENTS:
+        raise HTTPException(
+            status_code=400, detail=f"too many attachments (max {_MAX_ATTACHMENTS})"
+        )
+    for att in body.attachments:
+        try:
+            size = len(base64.b64decode(att.data, validate=True))
+        except (binascii.Error, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"attachment {att.filename!r} is not valid base64"
+            )
+        if size > _MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=400, detail=f"attachment {att.filename!r} exceeds the size limit"
+            )
+
     async def event_source() -> AsyncIterator[str]:
         try:
             async for event in main.stream_run(
@@ -492,6 +528,7 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
                 conversation_id=body.conversation_id,
                 model=body.model,
                 effort=body.effort,
+                attachments=[a.model_dump() for a in body.attachments],
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 — surface the failure to the client, don't 500 mid-stream.

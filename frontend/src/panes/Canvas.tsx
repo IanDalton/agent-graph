@@ -8,7 +8,10 @@ import { ChatBubble } from "@/components/ChatBubble";
 import { Composer } from "@/components/Composer";
 import { ModeIcon } from "@/components/ModeIcon";
 import { SwarmCanvas } from "@/panes/SwarmCanvas";
-import type { Conversation, Mode } from "@/types";
+import type { Attachment, Conversation, Mode } from "@/types";
+
+/** A message composed before a conversation exists (new-chat flow), replayed once on mount. */
+type PendingMessage = { text: string; attachments: Attachment[] };
 
 const MODE_OPTIONS: { mode: Mode; label: string; desc: string }[] = [
   { mode: "regular", label: "Regular chat", desc: "Memory-backed assistant" },
@@ -23,7 +26,7 @@ function PendingCanvas({
   onSend,
 }: {
   onPick: (mode: Mode) => void;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: Attachment[]) => void;
 }) {
   return (
     <div className="flex h-full flex-col bg-slate-950">
@@ -75,7 +78,7 @@ function RegularCanvas({
   conversation: Conversation;
   userId: string;
   onTurnComplete: () => void;
-  autoSend?: string;
+  autoSend?: PendingMessage;
   onAutoSent?: () => void;
 }) {
   const { messages, sending, send, stop, regenerate } = useChat(
@@ -91,7 +94,7 @@ function RegularCanvas({
   useEffect(() => {
     if (autoSend && !autoSentRef.current) {
       autoSentRef.current = true;
-      send(autoSend);
+      send(autoSend.text, autoSend.attachments);
       onAutoSent?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -136,7 +139,7 @@ function RegularCanvas({
 
 export function Canvas({ onTurnComplete }: { onTurnComplete: () => void }) {
   const { conversations, activeId, userId, pendingNewChat, newConversation } = useApp();
-  const pendingMessageRef = useRef<string | null>(null);
+  const pendingMessageRef = useRef<PendingMessage | null>(null);
   const conversation = conversations.find((c) => c.conversation_id === activeId);
 
   if (!conversation) {
@@ -144,8 +147,8 @@ export function Canvas({ onTurnComplete }: { onTurnComplete: () => void }) {
       return (
         <PendingCanvas
           onPick={(mode) => void newConversation(mode)}
-          onSend={(text) => {
-            pendingMessageRef.current = text;
+          onSend={(text, attachments) => {
+            pendingMessageRef.current = { text, attachments };
             void newConversation("regular");
           }}
         />

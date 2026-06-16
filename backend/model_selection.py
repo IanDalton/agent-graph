@@ -117,6 +117,27 @@ def context_window_for(label: str) -> int:
     return CONTEXT_WINDOWS.get(label, DEFAULT_CONTEXT_WINDOW)
 
 
+# Model-label prefixes assumed NOT to support image/PDF (vision) input. Local Ollama models are
+# treated as text-only by default; a multimodal local model can opt in via the VISION_MODELS env
+# (a comma-separated list of labels that ARE vision-capable). Used only for a soft warning in
+# stream_run, so an over/under-guess is harmless — it never blocks a turn.
+NON_VISION_PREFIXES = ("ollama/",)
+
+
+def is_vision_capable(label: str) -> bool:
+    """Best-effort guess at whether a UI model label can read image/PDF input.
+
+    The hosted defaults (Anthropic, OpenAI) are vision-capable; local Ollama labels are assumed
+    text-only unless listed in ``VISION_MODELS``. This drives only the "this model may not be able
+    to see images" note attached to uploads, never any hard behaviour.
+    """
+    label = (label or "").strip()
+    overrides = {m.strip() for m in os.getenv("VISION_MODELS", "").split(",") if m.strip()}
+    if label in overrides:
+        return True
+    return not any(label.startswith(prefix) for prefix in NON_VISION_PREFIXES)
+
+
 def resolve_model(model: str | None) -> Model | str:
     """Resolve an explicit UI-selected model label, falling back to the env default.
 

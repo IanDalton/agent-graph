@@ -3,7 +3,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { api } from "@/api/client";
 import { streamChat } from "@/api/stream";
 import { useApp } from "@/state/AppContext";
-import type { AgentRef, ChatMessage, StreamEvent, SwarmFlowState } from "@/types";
+import type { AgentRef, Attachment, ChatMessage, StreamEvent, SwarmFlowState } from "@/types";
 
 const newId = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -67,7 +67,7 @@ function reduceFlow(prev: SwarmFlowState | null, ev: StreamEvent): SwarmFlowStat
 
 type Action =
   | { kind: "load"; messages: ChatMessage[] }
-  | { kind: "user"; id: string; content: string; assistantId: string }
+  | { kind: "user"; id: string; content: string; assistantId: string; attachments?: Attachment[] }
   | { kind: "regenerate"; assistantId: string }
   | { kind: "stopped" }
   | { kind: "event"; event: StreamEvent };
@@ -91,7 +91,7 @@ function reducer(state: ChatMessage[], action: Action): ChatMessage[] {
     case "user":
       return [
         ...state,
-        { id: action.id, role: "user", content: action.content },
+        { id: action.id, role: "user", content: action.content, attachments: action.attachments },
         { id: action.assistantId, role: "assistant", content: "", streaming: true, steps: [] },
       ];
     case "regenerate": {
@@ -279,6 +279,7 @@ export function useChat(
             id: newId(),
             role: m.role,
             content: m.content,
+            attachments: m.attachments,
           })),
         });
       } catch (err) {
@@ -293,7 +294,7 @@ export function useChat(
   // Shared streaming core for both fresh sends and regenerations. Dispatches each
   // event into the reducer; a user-initiated abort is swallowed (no error frame).
   const runStream = useCallback(
-    async (prompt: string, signal: AbortSignal) => {
+    async (prompt: string, signal: AbortSignal, attachments: Attachment[] = []) => {
       try {
         await streamChat(
           {
@@ -303,6 +304,10 @@ export function useChat(
             // Omit when unset so the backend falls back to its configured defaults.
             model: model || undefined,
             effort: effort || undefined,
+            // Only the live base64 bytes are uploaded; reload-only refs (document_id) are skipped.
+            attachments: attachments
+              .filter((a) => a.data)
+              .map((a) => ({ filename: a.filename, mime_type: a.mime_type, data: a.data! })),
           },
           (event) => {
             dispatch({ kind: "event", event });
@@ -345,16 +350,16 @@ export function useChat(
   );
 
   const send = useCallback(
-    async (prompt: string) => {
-      if (!conversationId || !prompt.trim() || sending) return;
+    async (prompt: string, attachments: Attachment[] = []) => {
+      if (!conversationId || (!prompt.trim() && attachments.length === 0) || sending) return;
       const controller = new AbortController();
       abortRef.current = controller;
       turnStartedRef.current = true;
       setSending(true);
       flowRef.current = null;
       setSwarmFlow(null);
-      dispatch({ kind: "user", id: newId(), content: prompt, assistantId: newId() });
-      await runStream(prompt, controller.signal);
+      dispatch({ kind: "user", id: newId(), content: prompt, assistantId: newId(), attachments });
+      await runStream(prompt, controller.signal, attachments);
     },
     [conversationId, sending, runStream, setSwarmFlow]
   );
@@ -379,7 +384,9 @@ export function useChat(
     flowRef.current = null;
     setSwarmFlow(null);
     dispatch({ kind: "regenerate", assistantId: newId() });
-    await runStream(lastUser.content, controller.signal);
+    // Re-send the same uploads — but only those still carrying live bytes. After a reload the
+    // attachments are reload-only refs (document_id, no data), so a regenerated turn omits them.
+    await runStream(lastUser.content, controller.signal, lastUser.attachments ?? []);
   }, [conversationId, sending, messages, runStream, setSwarmFlow]);
 
   return { messages, sending, send, stop, regenerate };

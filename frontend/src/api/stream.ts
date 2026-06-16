@@ -15,6 +15,7 @@ export async function streamChat(
     prompt: string;
     model?: string;
     effort?: string;
+    attachments?: { filename: string; mime_type: string; data: string }[];
   },
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal

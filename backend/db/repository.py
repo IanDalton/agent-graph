@@ -91,12 +91,18 @@ async def append_message(
     role: str,
     content: str,
     embedding: list[float] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> None:
     """Persist a single message and link it to its conversation.
 
     When ``embedding`` is given (semantic search is enabled), it is stored on the Message's vector
     property so :func:`search_messages` can rank by similarity. Omitted ⇒ the message is still
     searchable via substring matching.
+
+    ``attachments`` is the metadata of files uploaded with this (user) message —
+    ``[{document_id, filename, mime_type}]`` — stored as a JSON string so a reloaded bubble can
+    re-open them (the file bodies live in their own Document vertices). Omitted for a text-only
+    message.
     """
     message_id = _new_id()
     set_clause = (
@@ -114,6 +120,9 @@ async def append_message(
     if embedding is not None:
         set_clause += ", embedding = :emb"
         params["emb"] = embedding
+    if attachments:
+        set_clause += ", attachments = :att"
+        params["att"] = json.dumps(attachments)
     await db.command(f"CREATE VERTEX Message SET {set_clause}", params)
     await db.command(
         "CREATE EDGE HAS_MESSAGE "
@@ -128,12 +137,23 @@ async def get_recent_messages(
     conversation_id: str,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Return the most recent messages of a conversation in chronological order."""
+    """Return the most recent messages of a conversation in chronological order.
+
+    Each row carries ``role``/``content``/``created_at`` and, for messages saved with uploaded
+    files, an ``attachments`` list (parsed from its stored JSON; absent/empty otherwise).
+    """
     rows = await db.query(
-        "SELECT role, content, created_at FROM Message "
+        "SELECT role, content, created_at, attachments FROM Message "
         "WHERE conversation_id = :cid ORDER BY created_at DESC LIMIT :limit",
         {"cid": conversation_id, "limit": limit},
     )
+    for row in rows:
+        att = row.get("attachments")
+        if isinstance(att, str) and att:
+            try:
+                row["attachments"] = json.loads(att)
+            except json.JSONDecodeError:
+                row["attachments"] = []
     return list(reversed(rows))
 
 

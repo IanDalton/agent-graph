@@ -6,7 +6,7 @@ import { useStickyScroll } from "@/hooks/useStickyScroll";
 import { ChatBubble } from "@/components/ChatBubble";
 import { Composer } from "@/components/Composer";
 import { ModeIcon } from "@/components/ModeIcon";
-import type { Conversation } from "@/types";
+import type { Attachment, Conversation } from "@/types";
 import { SwarmSteps } from "@/swarm/SwarmSteps";
 
 export function SwarmCanvas({
@@ -19,7 +19,7 @@ export function SwarmCanvas({
   conversation: Conversation;
   userId: string;
   onTurnComplete: () => void;
-  autoSend?: string;
+  autoSend?: { text: string; attachments: Attachment[] };
   onAutoSent?: () => void;
 }) {
   const { messages, sending, send, stop, regenerate } = useChat(
@@ -35,7 +35,7 @@ export function SwarmCanvas({
   useEffect(() => {
     if (autoSend && !autoSentRef.current) {
       autoSentRef.current = true;
-      send(autoSend);
+      send(autoSend.text, autoSend.attachments);
       onAutoSent?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

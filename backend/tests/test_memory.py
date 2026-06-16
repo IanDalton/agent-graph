@@ -82,7 +82,7 @@ class TitleRecordingClient(RecordingClient):
             return [{"n": 0}]
         if "SELECT TITLE FROM CONVERSATION" in normalized:
             return [{"title": ""}]
-        if "SELECT ROLE, CONTENT, CREATED_AT FROM MESSAGE" in normalized:
+        if "CONTENT, CREATED_AT" in normalized and "FROM MESSAGE" in normalized:
             return self._message_rows
         if "COUNT(" in normalized:
             return [{"n": 0}]

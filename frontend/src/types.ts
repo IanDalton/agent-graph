@@ -14,10 +14,24 @@ export interface Conversation {
   swarm_max_depth?: number | null;
 }
 
+/** A user-uploaded file attached to a message. During the live turn `data` holds the base64 bytes
+ *  (so the bubble can render a thumbnail inline); after a reload only `document_id` is present —
+ *  the file was persisted as a Document, and its card opens it in the Documents tab. */
+export interface Attachment {
+  filename: string;
+  mime_type: string;
+  /** base64 bytes (no "data:" prefix) — present only for the live, in-session turn. */
+  data?: string;
+  /** id of the persisted Document — present once saved (i.e. on reload). */
+  document_id?: string;
+}
+
 export interface StoredMessage {
   role: "user" | "assistant";
   content: string;
   created_at?: string;
+  /** Files uploaded with this message (user turns), as persisted (no `data`, has `document_id`). */
+  attachments?: Attachment[];
 }
 
 export interface ToolEvent {
@@ -63,6 +77,8 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** Files the user attached to this turn (user turns only). */
+  attachments?: Attachment[];
   /** Ordered reasoning/tool chain (assistant turns only). */
   steps?: Step[];
   /** Swarm-mode per-instance run state, keyed by instanceId — drives each agent bubble's

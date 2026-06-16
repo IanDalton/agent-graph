@@ -5,12 +5,13 @@ import {
   ChevronRight,
   Copy,
   FileText,
+  Image as ImageIcon,
   Loader2,
   RefreshCw,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import type { ChatMessage, Step } from "@/types";
+import type { Attachment, ChatMessage, Step } from "@/types";
 import { ToolChip } from "@/components/ToolChip";
 import { Markdown } from "@/components/Markdown";
 import { useApp } from "@/state/AppContext";
@@ -69,6 +70,54 @@ function DocumentCard({
       </span>
       <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
     </button>
+  );
+}
+
+/** The files a user attached to their message. A live turn carries base64 `data` (images render
+ *  inline); after a reload only `document_id` is present, so the card opens the persisted document
+ *  in the Documents panel. */
+function AttachmentThumbs({ attachments }: { attachments: Attachment[] }) {
+  const { featureDocument } = useApp();
+  return (
+    <div className="flex flex-wrap justify-end gap-2">
+      {attachments.map((a, i) => {
+        const isImage = a.mime_type.startsWith("image/");
+        if (isImage && a.data) {
+          return (
+            <img
+              key={i}
+              src={`data:${a.mime_type};base64,${a.data}`}
+              alt={a.filename}
+              className="max-h-40 max-w-[12rem] rounded-xl border border-white/10 object-cover"
+            />
+          );
+        }
+        const Icon = isImage ? ImageIcon : FileText;
+        const label = <span className="max-w-[10rem] truncate">{a.filename}</span>;
+        const base =
+          "flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/40 px-3 py-2 text-left text-xs text-muted-foreground";
+        if (a.document_id) {
+          return (
+            <button
+              key={i}
+              type="button"
+              onClick={() => featureDocument(a.document_id!)}
+              title="Open in the Documents panel"
+              className={cn(base, "transition-colors hover:border-white/20 hover:bg-white/5")}
+            >
+              <Icon className="size-4 shrink-0" />
+              {label}
+            </button>
+          );
+        }
+        return (
+          <div key={i} title={a.filename} className={base}>
+            <Icon className="size-4 shrink-0" />
+            {label}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -163,6 +212,10 @@ export function ChatBubble({
   return (
     <div className={cn("group flex w-full", isUser ? "justify-end" : "justify-start")}>
       <div className={cn("max-w-[80%] space-y-2", isUser ? "items-end" : "items-start")}>
+        {isUser && message.attachments && message.attachments.length > 0 && (
+          <AttachmentThumbs attachments={message.attachments} />
+        )}
+
         {!isUser && steps.length > 0 &&
           (renderSteps ? (
             renderSteps(steps)
