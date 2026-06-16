@@ -91,9 +91,9 @@ export function SwarmStepItem({ step }: { step: Step }) {
   const toolName = step.tool.toolName || "";
 
   switch (toolName) {
-    case "run_swarm":
+    case "send_messages":
       return <SwarmTaskBoard tool={step.tool} />;
-    case "run_agent":
+    case "send_message":
       return <RunAgentCard tool={step.tool} />;
     case "deep_research":
       return <DeepResearchPanel tool={step.tool} />;

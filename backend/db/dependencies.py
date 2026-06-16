@@ -53,3 +53,14 @@ class GraphDependencies:
     # tracing (CLI / non-streamed / tests) — sub-agents run via the plain blocking path.
     # Run-scoped, and copied through dataclasses.replace() so nested dispatches share one sink.
     event_sink: "asyncio.Queue[dict[str, Any]] | None" = None
+    # --- Swarm "agency" communication chart (swarm mode only) -------------------------------
+    # The agent names the CURRENTLY-running agent may `send_message` to. ``None`` marks the
+    # entry-point orchestrator (the agent the user talks to), which may message any roster agent;
+    # a non-None list scopes a dispatched specialist to the recipients its AgentSpec declares, so
+    # multi-hop flows (orchestrator -> A -> B) follow the explicit chart. Run-scoped; set per hop
+    # by run_subagent via dataclasses.replace().
+    agency_recipients: list[str] | None = None
+    # Current hop depth in the agency: 0 at the entry point, +1 per delegation. run_subagent only
+    # grants a dispatched specialist its own send_message tool while depth stays under
+    # SWARM_MAX_DEPTH, bounding recursion alongside the per-run request limit.
+    agency_depth: int = 0

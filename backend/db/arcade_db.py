@@ -265,6 +265,9 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON AgentSpec (agent_id) UNIQUE",
             "CREATE PROPERTY AgentSpec.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON AgentSpec (user_id) NOTUNIQUE",
+            # The agency communication chart: the names of teammates this specialist may
+            # send_message to. Missing/NULL on pre-agency rows reads back as no edges (a leaf).
+            "CREATE PROPERTY AgentSpec.recipients IF NOT EXISTS LIST",
             # Non-unique lookup indexes used by the repository queries.
             "CREATE PROPERTY Message.conversation_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (conversation_id) NOTUNIQUE",

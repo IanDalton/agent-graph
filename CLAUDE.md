@@ -175,37 +175,59 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `run_query`/`web_search`: every failure becomes a structured `error` result, never an
   exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
   a `note`, keeping the code's stdout).
-- **`backend/skills/subagent.py`** — the shared **delegated-run machinery**: `run_subagent(deps,
-  instructions=, tool_groups=, prompt=, request_limit=, model=)` builds a fresh single-purpose
-  Pydantic AI agent per dispatch with a granted subset of the existing capability bundles
-  (`capabilities_for`: `web`/`documents`/`sandbox`/`memory` — tool capabilities ONLY, never
-  `persistence_hooks`, since the parent run's `after_run` already records the orchestrating turn)
-  and runs it on the parent's deps (same per-user DB/conversation/web/sandbox; fresh
-  `proposed_*` dicts) with a `UsageLimits(request_limit=)` runaway backstop
-  (`SUBAGENT_REQUEST_LIMIT`, default 25). A `_document_collector` Hooks records every document the
-  delegate persists (create_document results + run_python artifacts) onto
-  `SubagentOutcome.documents`, which is how delegated artifacts reach the UI (see `main`'s
-  document frames). **Tolerant**: `run_subagent` never raises — failures (incl. exhausted limits)
-  come back as `SubagentOutcome.error`, keeping any documents persisted before the failure.
-  `model` is a test seam; production resolves `deps.model` (the UI-selected label) so delegates
-  run on the conversation's model.
+- **`backend/skills/subagent.py`** — the shared **delegated-run machinery** + the agency
+  communication primitive: `run_subagent(deps, instructions=, tool_groups=, prompt=, recipients=,
+  request_limit=, model=)` builds a fresh single-purpose Pydantic AI agent per dispatch with a
+  granted subset of the existing capability bundles (`capabilities_for`:
+  `web`/`documents`/`sandbox`/`memory` — tool capabilities ONLY, never `persistence_hooks`, since
+  the parent run's `after_run` already records the orchestrating turn) and runs it on the parent's
+  deps (same per-user DB/conversation/web/sandbox; fresh `proposed_*` dicts) with a
+  `UsageLimits(request_limit=)` runaway backstop (`SUBAGENT_REQUEST_LIMIT`, default 25). A
+  `_document_collector` Hooks records every document the delegate persists (create_document results
+  + run_python artifacts) onto `SubagentOutcome.documents`, which is how delegated artifacts reach
+  the UI (see `main`'s document frames). **Agency multi-hop:** when the dispatched specialist has
+  its own chart edges (`recipients`) and its depth is under `SWARM_MAX_DEPTH` (default 3), it is
+  granted its own `send_message` tool via `build_communication_capability()`, and its deps are
+  stamped with `agency_recipients`/`agency_depth` so its own dispatches are chart-enforced and
+  depth-bounded. `dispatch_message(deps, recipient, message, context)` is the shared send_message
+  mechanism (used by the orchestrator's tools AND every specialist's granted send_message): it
+  enforces the caller's chart (`deps.agency_recipients` — `None` = entry point, may message anyone),
+  resolves the recipient spec, and runs it one hop deeper. **Tolerant**: `run_subagent` /
+  `dispatch_message` never raise — failures (incl. exhausted limits, bad/out-of-chart recipients)
+  come back as `SubagentOutcome.error` / an `error` report, keeping any documents persisted before
+  the failure. `model` is a test seam; production resolves `deps.model` (the UI-selected label) so
+  delegates run on the conversation's model.
 - **`backend/schemas/swarm_schemas.py`** — swarm tool I/O: `TOOL_GROUPS` (the grantable bundles),
   `CreateAgentArgs` (kebab-case name validator, tools-subset validator, default grant
-  `["web", "documents"]`), `UpdateAgentArgs`, `AgentSpecInfo`, `AgentTask` (agent by id or name +
-  self-contained task/context), `RunSwarmArgs` (1–8 tasks), `AgentRunReport`/`SwarmRunResult`
-  (tolerant — failures land in `error`), `DeepResearchArgs`/`DeepResearchResult`.
+  `["web", "documents"]`, `recipients` = the agent's outgoing chart edges, validated kebab-case),
+  `UpdateAgentArgs`, `AgentSpecInfo` (carries `recipients`), `SendMessageArgs` (recipient by id or
+  name + self-contained message/context), `SendMessagesArgs` (1–8 independent messages),
+  `AgentRunReport`/`SwarmRunResult` (tolerant — failures land in `error`),
+  `DeepResearchArgs`/`DeepResearchResult`.
 - **`backend/skills/swarm_capability.py`** — the `SwarmOrchestrator` bundle, exposed via
-  `build_swarm()` and added **only in swarm-mode conversations**: the main agent becomes an
-  orchestrator that designs its own specialists. Roster tools `list_agents`/`create_agent`/
-  `update_agent`/`delete_agent` (persisted `AgentSpec`s — durable across turns/conversations;
-  duplicates/unknown names raise `ModelRetry`); dispatch tools `run_agent` (one task) and
-  `run_swarm` (a batch of INDEPENDENT tasks run **concurrently** via `asyncio.gather` under a
-  `SWARM_MAX_PARALLEL` semaphore, default 4; reports return in task order and one failure never
-  affects the rest); plus a built-in `deep_research` tool (web+documents delegate on
-  `DEEP_RESEARCH_INSTRUCTIONS`, request limit `DEEP_RESEARCH_REQUEST_LIMIT`, default 40).
-  Dispatch is tolerant end-to-end: an unknown agent or broken delegate becomes an `error` report,
-  never an exception. Sub-agents don't see the conversation — instructions tell the orchestrator
-  to make every task self-contained and to reference (not recreate) the documents on each report.
+  `build_swarm()` and added **only in swarm-mode conversations**: the main agent becomes the
+  **entry point of an agency** — a **pure router** that designs its own specialists AND the
+  communication chart between them (each `AgentSpec.recipients` are the teammates that agent may
+  `send_message`). **The orchestrator has NO "doing" tools** — `build_agent` gives swarm mode only
+  memory + this bundle, so it can't browse, run code, grow the ontology, or write documents; it
+  *must* delegate. Roster tools `list_agents`/`create_agent`/`update_agent`/`delete_agent`
+  (persisted `AgentSpec`s — durable across turns/conversations; duplicates/unknown names raise
+  `ModelRetry`); communication tools `send_message` (one recipient) and `send_messages` (a batch of
+  INDEPENDENT messages delivered **concurrently** via `asyncio.gather` under a `SWARM_MAX_PARALLEL`
+  semaphore, default 4; reports return in message order and one failure never affects the rest) —
+  both delegate to `subagent.dispatch_message`; plus a built-in `deep_research` tool (web+documents
+  delegate on `DEEP_RESEARCH_INSTRUCTIONS`, request limit `DEEP_RESEARCH_REQUEST_LIMIT`, default
+  40). The entry point may message any roster agent; a dispatched specialist may only message its
+  own `recipients`, and those messages flow multi-hop along the chart (bounded by
+  `SWARM_MAX_DEPTH`). **Seeded roster:** `swarm_seed_hooks` (a `before_run` hook in `build_swarm`)
+  creates `DEFAULT_SWARM_AGENTS` — `web-researcher`, `report-writer`, `website-builder` (live HTML
+  doc), `pdf-author` (fpdf2 PDF), `presentation-designer` (slide-deck PDF) — on a user's **first**
+  swarm turn (seed-when-empty: skipped if the user already has any agent, so later edits/deletes
+  aren't fought); best-effort, never blocks the turn. Deliverables are the documents the specialists
+  produce; the orchestrator references (never recreates) them. Communication is tolerant end-to-end:
+  an unknown/out-of-chart recipient or broken delegate becomes an `error` report, never an
+  exception. Specialists don't see the conversation — instructions make every message
+  self-contained.
 - **`backend/skills/research_capability.py`** — `DeepResearch`: the shared research method
   (plan sub-questions → fan out searches → fetch/cross-check sources → synthesize a cited
   markdown report via create_document). `build_research()` returns an **instructions-only**
@@ -240,9 +262,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `BASE_SYSTEM_PROMPT` and calls `register_system_prompt(agent)` (see
   `backend/skills/system_prompt.py` — base prompt + auto-loaded relevant user facts), and `run()`
   opens a `WebClient` alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
-  **Modes:** `build_agent(model, effort, mode)` keeps the full base capability set for every mode
-  and overlays `build_research()` (research) or `build_swarm()` (swarm) on top; `MODES`/
-  `DEFAULT_MODE` are the source of truth, unknown values fall back to regular. `stream_run`
+  **Modes:** `build_agent(model, effort, mode)` keeps the full base capability set for `regular`
+  and `research` (the latter overlays `build_research()`); `swarm` instead builds a **lean
+  pure-router** set — only `Thinking` + `build_memory()` (tools + persistence hooks) +
+  `build_swarm()`, NO web/sandbox/ontology/documents — so the orchestrator can't do work itself and
+  must delegate. `MODES`/`DEFAULT_MODE` are the source of truth, unknown values fall back to
+  regular. `stream_run`
   resolves the conversation's stored mode via `repo.get_conversation_mode` and its custom prompt via
   `repo.get_conversation_system_prompt` (both tolerantly — a lookup failure means regular / no custom
   prompt) *before* building the agent, and passes the UI model label into
@@ -253,11 +278,11 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `final` dicts — so callers never depend on the library's event classes; `run()` just consumes it
   for the CLI (thinking in blue, text plain). `document` frames
   (`{action, document_id, title, mime_type}`) are emitted right after the tool_result of
-  `create_document`/`update_document`/`run_python`/`run_agent`/`deep_research`/`run_swarm` (see
-  `_document_events`; update's id comes from
+  `create_document`/`update_document`/`run_python`/`send_message`/`deep_research`/`send_messages`
+  (see `_document_events`; update's id comes from
   the call args tracked per tool_call_id since its return is a plain string; the others yield one
   frame per document on the result — run_python's /out artifacts, a delegate's
-  `documents`, or each report's documents inside `run_swarm.reports`) — the UI uses them to drop
+  `documents`, or each report's documents inside `send_messages.reports`) — the UI uses them to drop
   artifact cards into the chat and
   spotlight the document in the side panel. **`_jsonable` recurses** into dicts/lists and dumps
   Pydantic models (`model_dump(mode="json")`) — tool results can be containers OF models (e.g.
@@ -393,10 +418,13 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
 - Documents are user-editable: agent code must `read_document` before revising, and any new
   "agent writes / user edits" surface should reuse `repo.update_document` so both paths stay
   consistent.
-- Delegated runs (`run_agent`/`run_swarm`/`deep_research`) share the tolerance contract too:
-  `run_subagent` must never raise — failures become `error` on the outcome/report. Sub-agents get
-  tool capabilities ONLY, never `persistence_hooks` (the parent run already persists the turn;
-  hooks on a delegate would double-write messages), and always a `UsageLimits` request cap.
+- Delegated runs (`send_message`/`send_messages`/`deep_research`) share the tolerance contract too:
+  `run_subagent`/`dispatch_message` must never raise — failures (incl. out-of-chart recipients)
+  become `error` on the outcome/report. Specialists get tool capabilities ONLY, never
+  `persistence_hooks` (the parent run already persists the turn; hooks on a delegate would
+  double-write messages), and always a `UsageLimits` request cap. The agency communication chart
+  lives on `AgentSpec.recipients`; multi-hop delegation is bounded by `SWARM_MAX_DEPTH` and enforced
+  by `dispatch_message` against `deps.agency_recipients` — keep that enforcement when editing.
   A conversation's `mode` is stamped at creation but user-changeable later via
   `PATCH /api/conversations/{id}` → `repo.set_conversation_mode`; the same endpoint also sets a
   conversation's custom `system_prompt` (→ `repo.set_conversation_system_prompt`, appended to the

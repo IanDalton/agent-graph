@@ -4,21 +4,21 @@ import { AlertCircle, CheckCircle2, ChevronRight, FileText, Loader2 } from "luci
 import { cn } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
 import { colorForAgent } from "./agentColors";
-import type { AgentRunReport, AgentTask } from "./swarmTypes";
+import type { AgentRunReport, SendMessageArgs } from "./swarmTypes";
 
 export function AgentTaskCard({
-  task,
+  message,
   report,
   index,
 }: {
-  task: AgentTask;
+  message: SendMessageArgs;
   report: AgentRunReport | null;
   index: number;
 }) {
   const [outputOpen, setOutputOpen] = useState(false);
   const isLoading = report === null;
   const isError = report?.error;
-  const color = colorForAgent(report?.agent_id || task.agent);
+  const color = colorForAgent(report?.agent_id || message.recipient);
 
   return (
     <div className="rounded-lg border border-white/10 bg-slate-900/40 overflow-hidden">
@@ -26,11 +26,11 @@ export function AgentTaskCard({
       <div className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-[10px] font-mono uppercase tracking-wide text-muted-foreground">
-            Task {index + 1}
+            Message {index + 1}
           </span>
           <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-mono", color.text)}>
             <span className={cn("inline-block size-2 rounded-full", color.dot)} />
-            {report?.name || task.agent}
+            {report?.name || message.recipient}
           </span>
         </div>
         <div className="shrink-0">
@@ -44,9 +44,9 @@ export function AgentTaskCard({
         </div>
       </div>
 
-      {/* Task description */}
+      {/* Message / assignment text */}
       <div className="px-3 py-1 text-xs text-muted-foreground border-t border-white/5">
-        {task.task}
+        {message.message}
       </div>
 
       {/* Output section (when report available) */}

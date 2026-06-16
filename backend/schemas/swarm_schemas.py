@@ -1,9 +1,12 @@
 """Pydantic models for the Swarm capability's tool inputs/outputs.
 
-The swarm orchestrator defines specialist sub-agents (persisted as ``AgentSpec`` vertices) and
-dispatches tasks to them — singly via ``run_agent`` or concurrently via ``run_swarm``. The
-identifier validators here are the safety boundary for agent names (they are stored as data, never
-interpolated into DDL, so this is hygiene rather than injection defense — unlike graph_schemas).
+The swarm follows the "agency" communication model: the entry-point orchestrator defines specialist
+sub-agents (persisted as ``AgentSpec`` vertices) AND the communication chart between them (each
+agent's ``recipients`` — the teammates it may ``send_message``). Agents communicate with the single
+``send_message`` primitive (one recipient) or ``send_messages`` (an independent batch run
+concurrently); messages flow multi-hop along the chart. The identifier validators here are the
+safety boundary for agent names (they are stored as data, never interpolated into DDL, so this is
+hygiene rather than injection defense — unlike graph_schemas).
 """
 
 from __future__ import annotations
@@ -38,6 +41,22 @@ def _valid_tools(tools: list[str]) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _valid_recipients(recipients: list[str]) -> list[str]:
+    """Normalize the agency-chart edges: kebab-case teammate names, de-duplicated.
+
+    The names are validated for shape only; whether each names a real roster agent is checked
+    tolerantly at dispatch (an agent may list a teammate created later in the same turn).
+    """
+    cleaned = [r.strip().lower() for r in recipients]
+    bad = [r for r in cleaned if not _AGENT_NAME_RE.match(r)]
+    if bad:
+        raise ValueError(
+            f"Invalid recipient name(s) {bad}; each must be a kebab-case agent name, "
+            "e.g. 'market-researcher'."
+        )
+    return list(dict.fromkeys(cleaned))
+
+
 class CreateAgentArgs(BaseModel):
     """A new specialist sub-agent for the swarm roster."""
 
@@ -60,6 +79,14 @@ class CreateAgentArgs(BaseModel):
         default_factory=lambda: ["web", "documents"],
         description=f"Tool groups to grant, from {sorted(TOOL_GROUPS)}.",
     )
+    recipients: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The agency communication chart for this agent: the kebab-case names of teammates it "
+            "may `send_message` (delegate to). Leave empty for a leaf specialist that only reports "
+            "back. Recipients may name agents you create later in the same turn."
+        ),
+    )
 
     @field_validator("name")
     @classmethod
@@ -77,6 +104,11 @@ class CreateAgentArgs(BaseModel):
     def _check_tools(cls, v: list[str]) -> list[str]:
         return _valid_tools(v)
 
+    @field_validator("recipients")
+    @classmethod
+    def _check_recipients(cls, v: list[str]) -> list[str]:
+        return _valid_recipients(v)
+
 
 class UpdateAgentArgs(BaseModel):
     """Revise an existing sub-agent in place (instead of creating a near-duplicate)."""
@@ -89,11 +121,23 @@ class UpdateAgentArgs(BaseModel):
     tools: list[str] | None = Field(
         None, description=f"New tool-group list (replaces the old one), from {sorted(TOOL_GROUPS)}."
     )
+    recipients: list[str] | None = Field(
+        None,
+        description=(
+            "New communication-chart edges (replaces the old list): kebab-case teammate names this "
+            "agent may `send_message`. Pass [] to make it a leaf; omit to keep the current edges."
+        ),
+    )
 
     @field_validator("tools")
     @classmethod
     def _check_tools(cls, v: list[str] | None) -> list[str] | None:
         return _valid_tools(v) if v is not None else None
+
+    @field_validator("recipients")
+    @classmethod
+    def _check_recipients(cls, v: list[str] | None) -> list[str] | None:
+        return _valid_recipients(v) if v is not None else None
 
 
 class AgentSpecInfo(BaseModel):
@@ -104,51 +148,63 @@ class AgentSpecInfo(BaseModel):
     role: str = ""
     instructions: str = ""
     tools: list[str] = Field(default_factory=list)
+    recipients: list[str] = Field(
+        default_factory=list,
+        description="Teammates this agent may send_message (its outgoing communication-chart edges).",
+    )
     created_at: str | None = None
     updated_at: str | None = None
 
 
-class AgentTask(BaseModel):
-    """One unit of work to dispatch to a sub-agent."""
+class SendMessageArgs(BaseModel):
+    """One message to send to a teammate agent (the agency `send_message` primitive)."""
 
-    agent: str = Field(..., description="The target agent's id or name (from list_agents).")
-    task: str = Field(..., min_length=1, description="The full task assignment for the agent.")
+    recipient: str = Field(
+        ..., description="The teammate agent's id or name (from list_agents), per the chart."
+    )
+    message: str = Field(
+        ..., min_length=1, description="The full, self-contained assignment/question for the agent."
+    )
     context: str | None = Field(
         None,
         description=(
-            "Optional context the agent needs (findings so far, constraints, source material). "
-            "Sub-agents do NOT see this conversation — pass everything they need here."
+            "Optional context the recipient needs (findings so far, constraints, source material). "
+            "Recipients do NOT see this conversation — pass everything they need here."
         ),
     )
 
 
-class RunSwarmArgs(BaseModel):
-    """A batch of independent tasks to run concurrently."""
+class SendMessagesArgs(BaseModel):
+    """A batch of INDEPENDENT messages to send concurrently (parallel agency fan-out)."""
 
-    tasks: list[AgentTask] = Field(
+    messages: list[SendMessageArgs] = Field(
         ...,
         min_length=1,
         max_length=8,
-        description="Independent tasks (max 8); they run in parallel and must not depend on each other.",
+        description=(
+            "Independent messages (max 8); they are delivered in parallel and must not depend on "
+            "each other's results. Recipients may differ or repeat."
+        ),
     )
 
 
 class AgentRunReport(BaseModel):
-    """The outcome of one dispatched task (tolerant: failures land in `error`, never raise)."""
+    """The report from one delivered message (tolerant: failures land in `error`, never raise)."""
 
     agent_id: str
     name: str = ""
+    # The assignment the agent was sent (kept as ``task`` for stable tool-result/UI contracts).
     task: str = ""
     output: str = ""
     documents: list[DocumentInfo] = Field(
         default_factory=list,
-        description="Documents the sub-agent created (already persisted; reference, don't recreate).",
+        description="Documents the agent created (already persisted; reference, don't recreate).",
     )
     error: str | None = None
 
 
 class SwarmRunResult(BaseModel):
-    """All reports of a run_swarm dispatch, in the same order as the submitted tasks."""
+    """All reports of a send_messages batch, in the same order as the submitted messages."""
 
     reports: list[AgentRunReport] = Field(default_factory=list)
 

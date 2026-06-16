@@ -90,9 +90,13 @@ def build_agent(
     ``effort`` is an optional thinking-effort level (one of :data:`THINKING_EFFORTS`); an unknown
     or missing value falls back to :data:`DEFAULT_EFFORT`.
 
-    ``mode`` is the conversation's agent profile (one of :data:`MODES`). Every mode keeps the full
-    base capability set; ``research`` adds the deep-research methodology, ``swarm`` adds the
-    sub-agent orchestrator tools. Unknown/missing values fall back to :data:`DEFAULT_MODE`.
+    ``mode`` is the conversation's agent profile (one of :data:`MODES`). ``regular`` and
+    ``research`` keep the full base capability set (``research`` adds the deep-research
+    methodology). ``swarm`` is different: the orchestrator is a **pure router** — it gets ONLY
+    memory (incl. the persistence hooks) and the swarm roster/communication tools, NOT the
+    "doing" tools (web/sandbox/ontology/documents). It can't browse or run code itself; it must
+    delegate work to specialist sub-agents (which get their own tools via ``run_subagent``).
+    Unknown/missing values fall back to :data:`DEFAULT_MODE`.
 
     ``system_prompt`` is the conversation's optional custom prompt, appended to
     :data:`BASE_SYSTEM_PROMPT` (see :func:`compose_instructions`). Main agent only — delegated
@@ -100,18 +104,23 @@ def build_agent(
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     mode = mode if mode in MODES else DEFAULT_MODE
-    capabilities = [
-        Thinking(effort=effort),
-        *build_memory(),
-        *build_ontology(),
-        *build_search(),
-        *build_documents(),
-        *build_sandbox(),
-    ]
-    if mode == "research":
-        capabilities += build_research()
-    elif mode == "swarm":
-        capabilities += build_swarm()
+    if mode == "swarm":
+        # Pure orchestrator: no web/sandbox/ontology/document tools, so it cannot do the work
+        # itself — it can only manage the roster, delegate via send_message/send_messages, run
+        # deep_research (its own sub-agent), and use memory. build_memory() also carries the
+        # persistence hooks that save the turn, so it must stay.
+        capabilities = [Thinking(effort=effort), *build_memory(), *build_swarm()]
+    else:
+        capabilities = [
+            Thinking(effort=effort),
+            *build_memory(),
+            *build_ontology(),
+            *build_search(),
+            *build_documents(),
+            *build_sandbox(),
+        ]
+        if mode == "research":
+            capabilities += build_research()
     agent = Agent(
         resolve_model(model),
         deps_type=GraphDependencies,
@@ -167,9 +176,9 @@ def _documents_of(value: Any) -> list[Any]:
 
 
 # Tools whose result carries a ``documents`` list of artifacts persisted during the call:
-# run_python's /out files, and the documents a delegated sub-agent created (run_agent /
-# deep_research outcomes; run_swarm nests one such report per task).
-_DOCUMENT_BEARING_TOOLS = frozenset({"run_python", "run_agent", "deep_research"})
+# run_python's /out files, and the documents a delegated specialist created (send_message /
+# deep_research outcomes; send_messages nests one such report per message).
+_DOCUMENT_BEARING_TOOLS = frozenset({"run_python", "send_message", "deep_research"})
 
 
 def _document_events(
@@ -179,9 +188,9 @@ def _document_events(
 
     The UI uses these frames to drop an artifact card into the chat and flip the side panel to
     the document. ``create_document`` returns a ``DocumentInfo`` (id/title/mime ride on the tool
-    result); ``run_python``/``run_agent``/``deep_research`` results carry a ``documents`` list of
-    everything persisted during the call (one frame each), and ``run_swarm`` nests one such
-    report per dispatched task; ``update_document`` returns a plain string, so the id comes from
+    result); ``run_python``/``send_message``/``deep_research`` results carry a ``documents`` list
+    of everything persisted during the call (one frame each), and ``send_messages`` nests one such
+    report per delivered message; ``update_document`` returns a plain string, so the id comes from
     the call's args (which Pydantic AI nests under the ``args`` parameter of the tool signature).
     """
     if tool_name == "create_document":
@@ -189,7 +198,7 @@ def _document_events(
         return [frame] if frame else []
     if tool_name in _DOCUMENT_BEARING_TOOLS:
         return [frame for d in _documents_of(content) if (frame := _created_frame(d))]
-    if tool_name == "run_swarm":
+    if tool_name == "send_messages":
         reports = (
             content.get("reports") if isinstance(content, dict)
             else getattr(content, "reports", None)

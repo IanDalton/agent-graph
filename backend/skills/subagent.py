@@ -19,8 +19,9 @@ import logging
 import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
+from uuid import uuid4
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import Capability, Hooks
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -35,15 +36,23 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
+from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.model_selection import resolve_model
 from backend.schemas.document_schemas import DocumentInfo
+from backend.schemas.swarm_schemas import AgentRunReport, SendMessageArgs
 from backend.serialization import _jsonable
 
 logger = logging.getLogger("agent_graph.subagent")
 
 # Ceiling on a sub-agent's model round-trips (a runaway-loop backstop, not a quality knob).
 DEFAULT_REQUEST_LIMIT = int(os.getenv("SUBAGENT_REQUEST_LIMIT", "25"))
+
+# How many hops deep the agency communication chart may recurse. The entry-point orchestrator is
+# at depth 0; each send_message delegation is one hop. A specialist is granted its own
+# send_message tool only while its depth stays under this ceiling, so multi-hop flows
+# (orchestrator -> A -> B -> ...) can't recurse without bound. Caps depth, not breadth.
+SWARM_MAX_DEPTH = int(os.getenv("SWARM_MAX_DEPTH", "3"))
 
 
 def _tool_group_builders() -> dict[str, Callable[[], list[Capability]]]:
@@ -81,6 +90,137 @@ def capabilities_for(tool_groups: list[str]) -> list[Capability]:
             continue
         capabilities.extend(builder())
     return capabilities
+
+
+def _can_delegate(depth: int, recipients: list[str] | None) -> bool:
+    """Whether an agent at ``depth`` with these chart edges may be granted its own send_message.
+
+    The child of this dispatch runs at ``depth + 1``; it may delegate further only while that
+    stays under :data:`SWARM_MAX_DEPTH` and it actually has teammates to message.
+    """
+    return bool(recipients) and (depth + 1) < SWARM_MAX_DEPTH
+
+
+def _subagent_system_prompt(row: dict, can_delegate: bool) -> str:
+    """The dispatched agent's system prompt: its spec, framed as a member of the agency.
+
+    When ``can_delegate`` the prompt lists the teammates it may ``send_message`` (its chart edges),
+    matching the send_message tool it is actually granted.
+    """
+    recipients = list(row.get("recipients") or [])
+    prompt = (
+        f"You are '{row.get('name')}', a specialist agent in an agency.\n"
+        f"ROLE: {row.get('role') or 'specialist'}\n"
+        f"{row.get('instructions') or ''}\n"
+        "A teammate dispatched you with ONE assignment. You cannot see the wider conversation — "
+        "work only from the assignment you were given. Do it completely, then reply with a focused "
+        "report of what you did and found (your reply goes to the agent that messaged you, not the "
+        "end user). If you created documents, name them in the report instead of pasting their "
+        "full content."
+    )
+    if can_delegate and recipients:
+        prompt += (
+            "\nYou may delegate parts of this work to your teammates via `send_message`: "
+            f"{', '.join(recipients)}. Give each a self-contained assignment (they cannot see your "
+            "context) and fold their reports into your own."
+        )
+    return prompt
+
+
+async def dispatch_message(
+    deps: GraphDependencies,
+    recipient: str,
+    message: str,
+    context: str | None = None,
+) -> AgentRunReport:
+    """Deliver one message to a teammate and return its report. Tolerant: never raises.
+
+    This is the shared agency ``send_message`` mechanism, used by the orchestrator's
+    ``send_message``/``send_messages`` tools and by every specialist that is granted the
+    communication capability. It enforces the caller's communication chart
+    (``deps.agency_recipients``: ``None`` = the entry point, which may message anyone; otherwise
+    the recipient must be on the list), looks up the recipient spec (a bad name becomes an error
+    report, not an exception), and runs it via :func:`run_subagent` one hop deeper.
+    """
+    try:
+        row = await repo.get_agent_spec(deps.db, deps.user_id, recipient)
+    except Exception as exc:  # noqa: BLE001 — a DB hiccup must not abort a parallel batch.
+        logger.warning("agent lookup failed for %r: %s", recipient, exc, exc_info=True)
+        return AgentRunReport(
+            agent_id=recipient, task=message, error=f"Agent lookup failed: {exc}"
+        )
+    if row is None:
+        return AgentRunReport(
+            agent_id=recipient,
+            task=message,
+            error=(
+                f"No agent named or with id {recipient!r}. Call list_agents to see the roster, "
+                "or create_agent to define this specialist first."
+            ),
+        )
+    # Chart enforcement: a dispatched specialist (agency_recipients set) may only message the
+    # teammates its spec declares. The entry-point orchestrator (None) may message anyone.
+    if deps.agency_recipients is not None and row.get("name") not in deps.agency_recipients:
+        allowed = ", ".join(deps.agency_recipients) or "(none)"
+        return AgentRunReport(
+            agent_id=row.get("agent_id", recipient),
+            name=row.get("name") or "",
+            task=message,
+            error=(
+                f"{row.get('name') or recipient!r} is not in your communication chart. You may "
+                f"send_message only to: {allowed}."
+            ),
+        )
+    recipients = list(row.get("recipients") or [])
+    can_delegate = _can_delegate(deps.agency_depth, recipients)
+    prompt = message
+    if context:
+        prompt += f"\n\nCONTEXT FROM THE SENDER:\n{context}"
+    outcome = await run_subagent(
+        deps,
+        instructions=_subagent_system_prompt(row, can_delegate),
+        tool_groups=list(row.get("tools") or []),
+        prompt=prompt,
+        recipients=recipients,
+        agent_id=row.get("agent_id", recipient),
+        agent_name=row.get("name") or recipient,
+        instance_id=uuid4().hex[:8],
+    )
+    return AgentRunReport(
+        agent_id=row.get("agent_id", recipient),
+        name=row.get("name") or "",
+        task=message,
+        output=outcome.output,
+        documents=outcome.documents,
+        error=outcome.error,
+    )
+
+
+_SEND_MESSAGE_INSTRUCTIONS = (
+    "You are part of an agency and may consult teammates with `send_message`: give a teammate a "
+    "self-contained assignment (they cannot see your context — include everything they need) and "
+    "use their report. You can only message the teammates named in your instructions; an "
+    "out-of-chart or failed message comes back as a report with an `error` you should handle."
+)
+
+
+def build_communication_capability() -> Capability:
+    """A capability granting a dispatched specialist its own ``send_message`` tool (multi-hop).
+
+    Added by :func:`run_subagent` to a delegate that has chart edges and is within the depth
+    ceiling, so flows can recurse along the agency chart. The orchestrator gets its richer
+    send_message/send_messages tools from the swarm capability instead.
+    """
+    capability = Capability(id="AgencyComms", instructions=_SEND_MESSAGE_INSTRUCTIONS)
+
+    @capability.tool
+    async def send_message(
+        ctx: RunContext[GraphDependencies], args: SendMessageArgs
+    ) -> AgentRunReport:
+        """Send one self-contained assignment to a teammate agent and get its report back."""
+        return await dispatch_message(ctx.deps, args.recipient, args.message, args.context)
+
+    return capability
 
 
 def _document_collector(bucket: list[DocumentInfo]) -> Hooks:
@@ -122,6 +262,7 @@ async def run_subagent(
     instructions: str,
     tool_groups: list[str],
     prompt: str,
+    recipients: list[str] | None = None,
     request_limit: int | None = None,
     model: Model | str | None = None,
     agent_id: str = "",
@@ -135,6 +276,12 @@ async def run_subagent(
     (the test seam). Documents it creates are collected onto the outcome so the caller can
     reference them instead of recreating them.
 
+    ``recipients`` are this delegate's agency communication-chart edges. When it has any and the
+    depth ceiling (:data:`SWARM_MAX_DEPTH`) is not yet reached, it is granted its own
+    ``send_message`` tool so flows can recurse one hop further; its dependencies are stamped with
+    the chart position (``agency_recipients``/``agency_depth``) so its own dispatches are enforced
+    and bounded.
+
     When ``deps.event_sink`` is set, the delegate's work is *streamed* and each event is pushed
     onto the sink as a frame tagged with ``agent_id``/``name``/``instance_id`` (plus
     ``agent_start``/``agent_end`` lifecycle frames), so ``stream_run`` can render the sub-agent's
@@ -143,12 +290,19 @@ async def run_subagent(
     ``SubagentOutcome.error``.
     """
     documents: list[DocumentInfo] = []
-    sub_deps = replace(deps, proposed_schemas={}, proposed_edges={})
+    sub_deps = replace(
+        deps,
+        proposed_schemas={},
+        proposed_edges={},
+        agency_recipients=recipients,
+        agency_depth=deps.agency_depth + 1,
+    )
+    comms = [build_communication_capability()] if _can_delegate(deps.agency_depth, recipients) else []
     agent: Agent[GraphDependencies, str] = Agent(
         model if model is not None else resolve_model(deps.model),
         deps_type=GraphDependencies,
         instructions=instructions,
-        capabilities=[*capabilities_for(tool_groups), _document_collector(documents)],
+        capabilities=[*capabilities_for(tool_groups), *comms, _document_collector(documents)],
     )
     limits = UsageLimits(request_limit=request_limit or DEFAULT_REQUEST_LIMIT)
 

@@ -1,10 +1,9 @@
 import type {
   AgentRunReport,
-  AgentTask,
   DeepResearchArgs,
   DeepResearchResult,
-  RunAgentArgs,
-  SwarmArgs,
+  SendMessageArgs,
+  SendMessagesArgs,
   SwarmDocumentInfo,
   SwarmResult,
 } from "./swarmTypes";
@@ -41,23 +40,24 @@ function parseReport(raw: unknown): AgentRunReport | null {
   };
 }
 
-export function parseSwarmArgs(raw: unknown): SwarmArgs | null {
+export function parseSendMessagesArgs(raw: unknown): SendMessagesArgs | null {
   if (raw == null || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
-  if (!Array.isArray(o.tasks)) return null;
-  const tasks: AgentTask[] = o.tasks
-    .filter((t) => t != null && typeof t === "object")
-    .map((t) => {
-      const item = t as Record<string, unknown>;
-      if (typeof item.agent !== "string" || typeof item.task !== "string") return null as AgentTask | null;
+  if (!Array.isArray(o.messages)) return null;
+  const messages: SendMessageArgs[] = o.messages
+    .filter((m) => m != null && typeof m === "object")
+    .map((m) => {
+      const item = m as Record<string, unknown>;
+      if (typeof item.recipient !== "string" || typeof item.message !== "string")
+        return null as SendMessageArgs | null;
       return {
-        agent: item.agent,
-        task: item.task,
+        recipient: item.recipient,
+        message: item.message,
         context: typeof item.context === "string" ? item.context : undefined,
-      } as AgentTask;
+      } as SendMessageArgs;
     })
-    .filter((t): t is AgentTask => t !== null);
-  return { tasks };
+    .filter((m): m is SendMessageArgs => m !== null);
+  return { messages };
 }
 
 export function parseSwarmResult(raw: unknown): SwarmResult | null {
@@ -70,18 +70,18 @@ export function parseSwarmResult(raw: unknown): SwarmResult | null {
   return { reports };
 }
 
-export function parseRunAgentArgs(raw: unknown): RunAgentArgs | null {
+export function parseSendMessageArgs(raw: unknown): SendMessageArgs | null {
   if (raw == null || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
-  if (typeof o.agent !== "string" || typeof o.task !== "string") return null;
+  if (typeof o.recipient !== "string" || typeof o.message !== "string") return null;
   return {
-    agent: o.agent,
-    task: o.task,
+    recipient: o.recipient,
+    message: o.message,
     context: typeof o.context === "string" ? o.context : undefined,
   };
 }
 
-export function parseRunAgentResult(raw: unknown): AgentRunReport | null {
+export function parseSendMessageResult(raw: unknown): AgentRunReport | null {
   return parseReport(raw);
 }
 

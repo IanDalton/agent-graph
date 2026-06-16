@@ -3,17 +3,17 @@ import { CheckCircle2, Loader2, Network } from "lucide-react";
 import { ToolChip } from "@/components/ToolChip";
 import type { ToolEvent } from "@/types";
 import { AgentTaskCard } from "./AgentTaskCard";
-import { parseSwarmArgs, parseSwarmResult } from "./parseSwarm";
+import { parseSendMessagesArgs, parseSwarmResult } from "./parseSwarm";
 
 export function SwarmTaskBoard({ tool }: { tool: ToolEvent }) {
-  const args = parseSwarmArgs(tool.args);
+  const args = parseSendMessagesArgs(tool.args);
   if (!args) {
     return <ToolChip tool={tool} />;
   }
 
   const result = parseSwarmResult(tool.result);
 
-  const allDone = result && result.reports.length === args.tasks.length;
+  const allDone = result && result.reports.length === args.messages.length;
   const hasError = result?.reports.some((r) => r.error);
 
   return (
@@ -22,11 +22,11 @@ export function SwarmTaskBoard({ tool }: { tool: ToolEvent }) {
       <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
         <div className="flex items-center gap-2">
           <Network className="size-4 text-sky-400" />
-          <span className="text-sm font-medium">Agent Swarm</span>
+          <span className="text-sm font-medium">Agency Messages</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="inline-flex rounded-full bg-white/10 px-2 py-0.5 text-xs font-mono text-muted-foreground">
-            {args.tasks.length} tasks
+            {args.messages.length} messages
           </span>
           <div>
             {!allDone ? (
@@ -40,15 +40,15 @@ export function SwarmTaskBoard({ tool }: { tool: ToolEvent }) {
         </div>
       </div>
 
-      {/* Task grid */}
+      {/* Message grid */}
       <div
-        className={`grid gap-2 p-3 ${args.tasks.length === 1 ? "grid-cols-1" : "grid-cols-2"
+        className={`grid gap-2 p-3 ${args.messages.length === 1 ? "grid-cols-1" : "grid-cols-2"
           }`}
       >
-        {args.tasks.map((task, i) => (
+        {args.messages.map((message, i) => (
           <AgentTaskCard
             key={i}
-            task={task}
+            message={message}
             report={result?.reports[i] ?? null}
             index={i}
           />

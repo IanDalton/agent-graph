@@ -1,14 +1,16 @@
 """Tests for the Swarm capability (orchestrated sub-agents) and conversation modes.
 
 All unit tests use a duck-typed fake ArcadeClient and stubbed/Test models, so they need no
-database, network, or LLM. Dispatch tests monkeypatch ``run_subagent`` in the swarm module's
-namespace — the seam between orchestration (tested here) and delegated execution (tested via
-``run_subagent`` with a TestModel).
+database, network, or LLM. Communication tests monkeypatch ``run_subagent`` in the *subagent*
+module's namespace (where ``dispatch_message`` calls it) — the seam between agency routing (tested
+here) and delegated execution (tested via ``run_subagent`` with a TestModel). ``deep_research``
+still calls ``run_subagent`` from the swarm module's namespace, so its tests patch there.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -20,21 +22,29 @@ from pydantic_ai.usage import RunUsage
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.schemas.swarm_schemas import (
-    AgentTask,
     CreateAgentArgs,
     DeepResearchArgs,
-    RunSwarmArgs,
+    SendMessageArgs,
+    SendMessagesArgs,
     UpdateAgentArgs,
 )
+from backend.skills import subagent as subagent_mod
 from backend.skills import swarm_capability as swarm_mod
-from backend.skills.subagent import SubagentOutcome, capabilities_for, run_subagent
+from backend.skills.subagent import (
+    SWARM_MAX_DEPTH,
+    SubagentOutcome,
+    capabilities_for,
+    dispatch_message,
+    run_subagent,
+)
 from backend.skills.swarm_capability import (
+    DEFAULT_SWARM_AGENTS,
     build_swarm,
     create_agent,
     deep_research,
     delete_agent,
-    run_agent,
-    run_swarm,
+    send_message,
+    send_messages,
     update_agent,
 )
 
@@ -43,8 +53,8 @@ EXPECTED_TOOLS = {
     "create_agent",
     "update_agent",
     "delete_agent",
-    "run_agent",
-    "run_swarm",
+    "send_message",
+    "send_messages",
     "deep_research",
 }
 
@@ -54,6 +64,7 @@ SPEC_ROW = {
     "role": "Researches markets",
     "instructions": "You research markets thoroughly.",
     "tools": ["web", "documents"],
+    "recipients": [],
 }
 
 
@@ -126,7 +137,51 @@ def test_build_agent_unknown_mode_falls_back_to_regular() -> None:
     with agent.override(model=model):
         asyncio.run(agent.run("hi", deps=_deps(FakeDb())))
     names = {t.name for t in model.last_model_request_parameters.function_tools}
-    assert "run_swarm" not in names
+    assert "send_messages" not in names
+
+
+# --------------------------------------------------------------------------- #
+# Pure-orchestrator wiring + default-roster seeding
+# --------------------------------------------------------------------------- #
+def test_swarm_orchestrator_has_no_work_tools() -> None:
+    """The swarm orchestrator can only route/synthesize — no web, sandbox, ontology, documents."""
+    from backend.main import build_agent
+
+    agent = build_agent(model="test", mode="swarm")
+    model = TestModel(call_tools=[])
+    with agent.override(model=model):
+        asyncio.run(agent.run("hi", deps=_deps(FakeDb())))
+    names = {t.name for t in model.last_model_request_parameters.function_tools}
+    # Has the swarm/communication tools...
+    assert EXPECTED_TOOLS <= names
+    # ...but NOT the "doing" tools (it must delegate those to specialists).
+    work_tools = {
+        "web_search", "fetch_url", "run_python",
+        "create_vertex_type", "create_node",
+        "create_document", "list_documents",
+    }
+    assert not (work_tools & names), f"orchestrator unexpectedly has: {work_tools & names}"
+
+
+def test_swarm_seeds_default_roster_when_empty() -> None:
+    from backend.main import build_agent
+
+    db = FakeDb(rows=[])  # empty roster
+    agent = build_agent(model="test", mode="swarm")
+    with agent.override(model=TestModel(call_tools=[])):
+        asyncio.run(agent.run("hi", deps=_deps(db)))
+    created = [p["name"] for s, p in db.commands if s.startswith("CREATE VERTEX AgentSpec")]
+    assert set(created) == {a["name"] for a in DEFAULT_SWARM_AGENTS}
+
+
+def test_swarm_does_not_seed_when_roster_present() -> None:
+    from backend.main import build_agent
+
+    db = FakeDb(rows=[SPEC_ROW])  # user already has an agent
+    agent = build_agent(model="test", mode="swarm")
+    with agent.override(model=TestModel(call_tools=[])):
+        asyncio.run(agent.run("hi", deps=_deps(db)))
+    assert not any(s.startswith("CREATE VERTEX AgentSpec") for s, _ in db.commands)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,10 +202,23 @@ def test_create_agent_args_reject_bad_name_and_unknown_tools() -> None:
         CreateAgentArgs(name="ok-name", role="r", instructions="i", tools=["filesystem"])
 
 
-def test_run_swarm_args_cap_batch_size() -> None:
-    tasks = [AgentTask(agent="a", task="t")] * 9
+def test_create_agent_args_normalize_and_reject_recipients() -> None:
+    # The communication chart edges are kebab-cased, lowered and de-duplicated.
+    args = CreateAgentArgs(
+        name="lead", role="r", instructions="i", recipients=["Market-Researcher", "market-researcher"]
+    )
+    assert args.recipients == ["market-researcher"]
+    # Bad recipient names are rejected (same shape rule as agent names).
     with pytest.raises(ValidationError):
-        RunSwarmArgs(tasks=tasks)
+        CreateAgentArgs(name="lead", role="r", instructions="i", recipients=["Not Valid!"])
+    # recipients default to empty (a leaf specialist).
+    assert CreateAgentArgs(name="lead", role="r", instructions="i").recipients == []
+
+
+def test_send_messages_args_cap_batch_size() -> None:
+    messages = [SendMessageArgs(recipient="a", message="t")] * 9
+    with pytest.raises(ValidationError):
+        SendMessagesArgs(messages=messages)
 
 
 # --------------------------------------------------------------------------- #
@@ -161,13 +229,20 @@ def test_create_agent_persists_and_links() -> None:
     info = asyncio.run(
         create_agent(
             _ctx(db),
-            CreateAgentArgs(name="pitch-deck-designer", role="Designs decks", instructions="x"),
+            CreateAgentArgs(
+                name="pitch-deck-designer",
+                role="Designs decks",
+                instructions="x",
+                recipients=["market-researcher"],
+            ),
         )
     )
     assert info.agent_id
     assert info.tools == ["web", "documents"]  # the default grant
+    assert info.recipients == ["market-researcher"]  # the chart edge round-trips
     create = next(p for s, p in db.commands if s.startswith("CREATE VERTEX AgentSpec"))
     assert create["name"] == "pitch-deck-designer" and create["uid"] == "u"
+    assert create["recipients"] == ["market-researcher"]
     assert any(s.startswith("CREATE EDGE HAS_AGENT") for s, _ in db.commands)
 
 
@@ -208,26 +283,31 @@ def test_delete_agent_unknown_is_model_retry() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Dispatch (run_agent / run_swarm / deep_research)
+# Communication (send_message / send_messages / deep_research)
 # --------------------------------------------------------------------------- #
-def test_run_agent_unknown_agent_is_error_report_not_exception() -> None:
-    report = asyncio.run(run_agent(_ctx(FakeDb(rows=[])), AgentTask(agent="ghost", task="t")))
+def test_send_message_unknown_recipient_is_error_report_not_exception() -> None:
+    report = asyncio.run(
+        send_message(_ctx(FakeDb(rows=[])), SendMessageArgs(recipient="ghost", message="t"))
+    )
     assert report.error and "list_agents" in report.error
     assert report.output == ""
 
 
-def test_run_agent_maps_subagent_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_send_message_maps_subagent_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
 
     async def stub(deps: Any, *, instructions: str, tool_groups: list[str], prompt: str, **kw: Any) -> SubagentOutcome:
-        seen.update(instructions=instructions, tool_groups=tool_groups, prompt=prompt)
+        seen.update(instructions=instructions, tool_groups=tool_groups, prompt=prompt, kw=kw)
         return SubagentOutcome(output="deck outline done")
 
-    monkeypatch.setattr(swarm_mod, "run_subagent", stub)
+    # dispatch_message lives in the subagent module and calls run_subagent there.
+    monkeypatch.setattr(subagent_mod, "run_subagent", stub)
     report = asyncio.run(
-        run_agent(
+        send_message(
             _ctx(FakeDb(rows=[SPEC_ROW])),
-            AgentTask(agent="market-researcher", task="size the market", context="ACME, B2B"),
+            SendMessageArgs(
+                recipient="market-researcher", message="size the market", context="ACME, B2B"
+            ),
         )
     )
     assert report.error is None and report.output == "deck outline done"
@@ -235,9 +315,18 @@ def test_run_agent_maps_subagent_outcome(monkeypatch: pytest.MonkeyPatch) -> Non
     assert seen["tool_groups"] == ["web", "documents"]
     assert "size the market" in seen["prompt"] and "ACME, B2B" in seen["prompt"]
     assert "market-researcher" in seen["instructions"]
+    assert seen["kw"]["recipients"] == []  # the spec's chart edges flow to run_subagent
 
 
-def test_run_swarm_runs_tasks_concurrently_and_keeps_order(
+def test_send_message_enforces_communication_chart() -> None:
+    # A dispatched specialist (agency_recipients set) may only message its charted teammates.
+    deps = replace(_deps(FakeDb(rows=[SPEC_ROW])), agency_recipients=["someone-else"])
+    report = asyncio.run(dispatch_message(deps, "market-researcher", "do a thing"))
+    assert report.error and "communication chart" in report.error
+    assert report.output == ""  # never dispatched
+
+
+def test_send_messages_run_concurrently_and_keep_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     active = 0
@@ -251,25 +340,29 @@ def test_run_swarm_runs_tasks_concurrently_and_keeps_order(
         active -= 1
         return SubagentOutcome(output=f"done: {prompt}")
 
-    monkeypatch.setattr(swarm_mod, "run_subagent", stub)
-    tasks = [AgentTask(agent="market-researcher", task=f"t{i}") for i in range(3)]
-    result = asyncio.run(run_swarm(_ctx(FakeDb(rows=[SPEC_ROW])), RunSwarmArgs(tasks=tasks)))
+    monkeypatch.setattr(subagent_mod, "run_subagent", stub)
+    messages = [SendMessageArgs(recipient="market-researcher", message=f"t{i}") for i in range(3)]
+    result = asyncio.run(
+        send_messages(_ctx(FakeDb(rows=[SPEC_ROW])), SendMessagesArgs(messages=messages))
+    )
     assert [r.output for r in result.reports] == ["done: t0", "done: t1", "done: t2"]
-    assert max_active > 1  # tasks genuinely overlapped
+    assert max_active > 1  # messages genuinely overlapped
 
 
-def test_run_swarm_isolates_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_send_messages_isolates_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     async def stub(deps: Any, *, prompt: str, **kw: Any) -> SubagentOutcome:
         if "bad" in prompt:
             return SubagentOutcome(error="model exploded")
         return SubagentOutcome(output="fine")
 
-    monkeypatch.setattr(swarm_mod, "run_subagent", stub)
-    tasks = [
-        AgentTask(agent="market-researcher", task="good one"),
-        AgentTask(agent="market-researcher", task="bad one"),
+    monkeypatch.setattr(subagent_mod, "run_subagent", stub)
+    messages = [
+        SendMessageArgs(recipient="market-researcher", message="good one"),
+        SendMessageArgs(recipient="market-researcher", message="bad one"),
     ]
-    result = asyncio.run(run_swarm(_ctx(FakeDb(rows=[SPEC_ROW])), RunSwarmArgs(tasks=tasks)))
+    result = asyncio.run(
+        send_messages(_ctx(FakeDb(rows=[SPEC_ROW])), SendMessagesArgs(messages=messages))
+    )
     assert result.reports[0].output == "fine" and result.reports[0].error is None
     assert result.reports[1].error == "model exploded"
 
@@ -431,6 +524,41 @@ def test_capabilities_for_skips_unknown_groups() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Multi-hop agency chart: when a delegate gets its own send_message tool
+# --------------------------------------------------------------------------- #
+def _subagent_tool_names(deps: GraphDependencies, recipients: list[str]) -> set[str]:
+    """Tool names a delegate is built with, for the given chart edges/depth."""
+    model = TestModel(call_tools=[])
+    asyncio.run(
+        run_subagent(
+            deps,
+            instructions="x",
+            tool_groups=[],
+            prompt="go",
+            recipients=recipients,
+            model=model,
+        )
+    )
+    return {t.name for t in model.last_model_request_parameters.function_tools}
+
+
+def test_run_subagent_grants_send_message_within_depth() -> None:
+    # A delegate dispatched from the entry point (depth 0) with chart edges may delegate further.
+    assert "send_message" in _subagent_tool_names(_deps(FakeDb()), recipients=["teammate"])
+
+
+def test_run_subagent_withholds_send_message_at_depth_ceiling() -> None:
+    # Past the depth ceiling the delegate is a leaf even though it has chart edges.
+    deep = replace(_deps(FakeDb()), agency_depth=SWARM_MAX_DEPTH)
+    assert "send_message" not in _subagent_tool_names(deep, recipients=["teammate"])
+
+
+def test_run_subagent_leaf_has_no_send_message() -> None:
+    # No chart edges → no send_message tool, regardless of depth.
+    assert "send_message" not in _subagent_tool_names(_deps(FakeDb()), recipients=[])
+
+
+# --------------------------------------------------------------------------- #
 # run_subagent live-trace streaming (event_sink path)
 # --------------------------------------------------------------------------- #
 def _drain(queue: "asyncio.Queue[dict[str, Any]]") -> list[dict[str, Any]]:
@@ -583,7 +711,7 @@ def test_compose_instructions_appends_custom_prompt() -> None:
 # --------------------------------------------------------------------------- #
 # stream_run's document frames for delegated work
 # --------------------------------------------------------------------------- #
-def test_document_events_from_run_agent_report() -> None:
+def test_document_events_from_send_message_report() -> None:
     from backend.main import _document_events
     from backend.schemas.document_schemas import DocumentInfo
     from backend.schemas.swarm_schemas import AgentRunReport
@@ -592,11 +720,11 @@ def test_document_events_from_run_agent_report() -> None:
         agent_id="a1",
         documents=[DocumentInfo(document_id="d1", title="Deck", mime_type="text/markdown")],
     )
-    events = _document_events("run_agent", report, args=None)
+    events = _document_events("send_message", report, args=None)
     assert [(e["document_id"], e["action"]) for e in events] == [("d1", "created")]
 
 
-def test_document_events_from_run_swarm_reports() -> None:
+def test_document_events_from_send_messages_reports() -> None:
     from backend.main import _document_events
     from backend.schemas.document_schemas import DocumentInfo
     from backend.schemas.swarm_schemas import AgentRunReport, SwarmRunResult
@@ -614,5 +742,5 @@ def test_document_events_from_run_swarm_reports() -> None:
             ),
         ]
     )
-    events = _document_events("run_swarm", result, args=None)
+    events = _document_events("send_messages", result, args=None)
     assert [e["document_id"] for e in events] == ["d1", "d2"]

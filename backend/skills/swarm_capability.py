@@ -1,21 +1,26 @@
-"""SwarmOrchestrator capability: define specialist sub-agents and dispatch work to them.
+"""SwarmOrchestrator capability: design an agency of specialists and route work through it.
 
 Exposed via :func:`build_swarm`, added to ``Agent(capabilities=...)`` when a conversation's mode
-is ``swarm``. The main agent becomes an orchestrator that:
+is ``swarm``. The main agent becomes the **entry point of an agency** (the agent the user talks to)
+that:
 
-- manages a persistent roster of specialist sub-agents (``AgentSpec`` vertices, user-scoped):
-  ``list_agents`` / ``create_agent`` / ``update_agent`` / ``delete_agent``;
-- dispatches work: ``run_agent`` (one task) and ``run_swarm`` (several independent tasks run
-  CONCURRENTLY, capped by ``SWARM_MAX_PARALLEL``);
-- carries a built-in ``deep_research`` sub-agent (web + documents, the deep-research method from
+- manages a persistent roster of specialist agents (``AgentSpec`` vertices, user-scoped) AND the
+  communication chart between them — each agent's ``recipients`` are the teammates it may
+  ``send_message``: ``list_agents`` / ``create_agent`` / ``update_agent`` / ``delete_agent``;
+- communicates with the single agency primitive ``send_message`` (one recipient) or
+  ``send_messages`` (a batch of INDEPENDENT messages delivered CONCURRENTLY, capped by
+  ``SWARM_MAX_PARALLEL``). Messages flow MULTI-HOP along the chart: a dispatched specialist that
+  has its own ``recipients`` is granted its own ``send_message`` tool (within ``SWARM_MAX_DEPTH``);
+- carries a built-in ``deep_research`` specialist (web + documents, the deep-research method from
   :mod:`backend.skills.research_capability`) so heavy research can be delegated without first
   defining an agent for it.
 
-Sub-agents run via :func:`backend.skills.subagent.run_subagent` on the parent run's dependencies,
-so their documents/facts persist into the same conversation; documents they create ride back on
-the tool results (``AgentRunReport.documents``) and become UI artifact cards via
-``main._document_events``. Dispatch is tolerant (a failed delegate is an ``error`` in its report,
-never an exception); roster mistakes (unknown/duplicate names) raise ``ModelRetry`` like the
+Specialists run via :func:`backend.skills.subagent.dispatch_message` →
+:func:`backend.skills.subagent.run_subagent` on the parent run's dependencies, so their
+documents/facts persist into the same conversation; documents they create ride back on the tool
+results (``AgentRunReport.documents``) and become UI artifact cards via ``main._document_events``.
+Communication is tolerant (a bad/out-of-chart recipient or a failed delegate is an ``error`` in its
+report, never an exception); roster mistakes (unknown/duplicate names) raise ``ModelRetry`` like the
 document tools.
 """
 
@@ -27,7 +32,7 @@ import os
 from uuid import uuid4
 
 from pydantic_ai import ModelRetry, RunContext
-from pydantic_ai.capabilities import Capability
+from pydantic_ai.capabilities import Capability, Hooks
 
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
@@ -36,11 +41,11 @@ from backend.schemas.swarm_schemas import (
     TOOL_GROUPS,
     AgentRunReport,
     AgentSpecInfo,
-    AgentTask,
     CreateAgentArgs,
     DeepResearchArgs,
     DeepResearchResult,
-    RunSwarmArgs,
+    SendMessageArgs,
+    SendMessagesArgs,
     SwarmRunResult,
     UpdateAgentArgs,
 )
@@ -48,45 +53,142 @@ from backend.skills.research_capability import (
     DEEP_RESEARCH_INSTRUCTIONS,
     DEEP_RESEARCH_REQUEST_LIMIT,
 )
-from backend.skills.subagent import run_subagent
+from backend.skills.subagent import dispatch_message, run_subagent
 
 logger = logging.getLogger("agent_graph.swarm")
 
-# How many sub-agents may run at the same moment inside one run_swarm call. Each one is a full
-# agent loop (model calls + tools), so this caps model-provider and DB pressure, not correctness:
-# excess tasks simply queue on the semaphore.
+# How many specialists may run at the same moment inside one send_messages batch. Each one is a
+# full agent loop (model calls + tools), so this caps model-provider and DB pressure, not
+# correctness: excess messages simply queue on the semaphore.
 DEFAULT_MAX_PARALLEL = int(os.getenv("SWARM_MAX_PARALLEL", "4"))
 
 _TOOL_GROUP_LINES = "\n".join(f"  - {name}: {desc}" for name, desc in sorted(TOOL_GROUPS.items()))
 
 INSTRUCTIONS = (
-    "This conversation is in SWARM mode: you are the ORCHESTRATOR of a team of specialist "
-    "sub-agents that you design yourself. Your job is to decompose the user's goal, staff it, "
-    "dispatch the work, and synthesize the results — not to grind through every subtask "
-    "personally.\n"
-    "THE ROSTER: sub-agents are durable — they persist across turns and conversations. ALWAYS "
-    "call `list_agents` before creating one: reuse a fitting specialist, or `update_agent` to "
-    "sharpen its instructions/tools, instead of creating a near-duplicate. Create new agents "
-    "with `create_agent` (kebab-case name, one-line role, a focused system prompt written like "
-    "a job description, and only the tool groups the job needs):\n"
+    "This conversation is in SWARM mode: you are the ENTRY POINT and ORCHESTRATOR of an AGENCY of "
+    "specialist sub-agents. CRITICAL: you have NO tools to browse the web, run code, or write "
+    "documents yourself — you cannot do the work directly. Your ONLY way to get anything done is to "
+    "delegate to specialists and synthesize their reports. The user only talks to you.\n"
+    "THE ROSTER: a standard team already exists — ALWAYS call `list_agents` first to see it "
+    "(typically web-researcher, report-writer, website-builder, pdf-author, presentation-designer, "
+    "each granted the tools its job needs). Reuse a fitting specialist; `update_agent` to sharpen "
+    "one; only `create_agent` for a genuine gap (kebab-case name, one-line role, a focused "
+    "job-description prompt, the tool groups the job needs, and `recipients` if it should delegate "
+    "onward). The tool groups specialists can be granted:\n"
     f"{_TOOL_GROUP_LINES}\n"
-    "Retire obsolete specialists with `delete_agent`.\n"
-    "DISPATCHING: send one task with `run_agent`. When subtasks are INDEPENDENT of each other "
-    "(e.g. researching the market, drafting slide copy, and building a financial model for a "
-    "pitch deck), batch them into ONE `run_swarm` call — its tasks run in PARALLEL, which is "
-    "much faster than sequential run_agent calls. Sub-agents do NOT see this conversation: every "
-    "task must be self-contained, with the goal, constraints, audience and any needed findings "
-    "passed in `task`/`context`. For work that needs serious multi-source investigation, use the "
-    "built-in `deep_research` instead of a hand-rolled researcher.\n"
-    "SYNTHESIS: sub-agent reports come back as tool results, and documents they produced are "
-    "listed on each report — reference those documents, don't recreate their content. After a "
-    "dispatch, weave the reports into one coherent answer (or a final document) yourself; "
-    "resolve conflicts between reports, and re-dispatch with sharper instructions when a result "
-    "is weak. If a report carries an `error`, tell the user honestly and decide whether to "
+    "`recipients` are the communication chart: a specialist may only `send_message` the teammates "
+    "in its own `recipients`, and those messages flow multi-hop along the chart. Leave recipients "
+    "empty for a leaf worker that only reports back. Retire obsolete specialists with "
+    "`delete_agent`.\n"
+    "DELEGATING — PREFER PARALLEL: when subtasks are INDEPENDENT (e.g. research the market AND draft "
+    "the copy AND build a model), you MUST batch them into ONE `send_messages` call so they run in "
+    "PARALLEL — do NOT issue them as separate sequential `send_message` calls. Use a single "
+    "`send_message` only for a one-off task or a step that depends on a previous result. For "
+    "serious multi-source investigation, use the built-in `deep_research`. Specialists do NOT see "
+    "this conversation: every message must be self-contained — put the goal, constraints, audience "
+    "and any findings to build on in `message`/`context`.\n"
+    "DELIVERABLES & SYNTHESIS: the specialists produce the artifacts (documents, PDFs, sites), "
+    "which are listed on each report. You cannot create documents yourself, so REFERENCE those "
+    "documents in your answer — never paste or recreate their content. Weave the reports into one "
+    "coherent reply, resolve conflicts between them, and re-dispatch with sharper instructions when "
+    "a result is weak. If a report carries an `error`, tell the user honestly and decide whether to "
     "retry, reassign, or proceed without it."
 )
 
 swarm_capability = Capability(id="SwarmOrchestrator", instructions=INSTRUCTIONS)
+
+
+# The standard specialist roster seeded on a user's first swarm turn (see ``swarm_seed_hooks``).
+# Each is a leaf worker (no ``recipients``) that the orchestrator messages directly; together they
+# cover the common deliverables (research, markdown reports, interactive sites, PDFs, slide decks)
+# so the agency is useful out of the box without the user hand-defining agents.
+DEFAULT_SWARM_AGENTS: list[dict] = [
+    {
+        "name": "web-researcher",
+        "role": "Runs targeted web searches and reads the sources",
+        "instructions": (
+            "You are a web researcher. Use web_search to find authoritative sources and fetch_url "
+            "to read them, then answer the assignment with the concrete facts you found, each with "
+            "its source URL. If asked to save your findings, use create_document (markdown). Never "
+            "invent a source or a fact; if something can't be confirmed, say so."
+        ),
+        "tools": ["web", "documents"],
+    },
+    {
+        "name": "report-writer",
+        "role": "Writes polished markdown reports and notes as documents",
+        "instructions": (
+            "You write clear, well-structured markdown documents from the material you are given. "
+            "Call create_document exactly once with the full report (headings, bullet lists, "
+            "tables where useful) and reply with the document title. Do NOT browse or invent "
+            "facts — work only from the content in your assignment."
+        ),
+        "tools": ["documents"],
+    },
+    {
+        "name": "website-builder",
+        "role": "Builds a self-contained interactive HTML website",
+        "instructions": (
+            "You build a single self-contained web page. Call create_document with "
+            "mime_type='text/html' and content that is ONE complete HTML document with all CSS and "
+            "JavaScript INLINE — no external files, CDNs, or network calls (it runs in a sandboxed "
+            "iframe). Make it clean and responsive, and reply with the document title. Work only "
+            "from the content in your assignment."
+        ),
+        "tools": ["documents"],
+    },
+    {
+        "name": "pdf-author",
+        "role": "Produces polished PDF documents with fpdf2",
+        "instructions": (
+            "You produce PDF documents. Write a complete, self-contained Python program (stdlib + "
+            "fpdf2 only, no network) that builds the PDF and saves it to /out/<name>.pdf, then call "
+            "run_python with it. Use Helvetica and multi_cell for wrapping, and keep text "
+            "latin-1-safe. The saved /out PDF is your deliverable — reply with its filename. Work "
+            "only from the content in your assignment."
+        ),
+        "tools": ["sandbox"],
+    },
+    {
+        "name": "presentation-designer",
+        "role": "Builds slide-deck PDFs, one slide per page",
+        "instructions": (
+            "You build slide-deck presentations as a PDF. Write a self-contained Python program "
+            "(stdlib + fpdf2 only) that creates a LANDSCAPE PDF with ONE slide per page — a large "
+            "title, a few concise bullet points, generous spacing — saved to /out/<name>.pdf, then "
+            "call run_python. Keep text latin-1-safe and reply with the saved filename."
+        ),
+        "tools": ["sandbox"],
+    },
+]
+
+swarm_seed_hooks = Hooks()
+
+
+@swarm_seed_hooks.on.before_run
+async def _seed_default_agents(ctx: RunContext[GraphDependencies]) -> None:
+    """Seed the standard specialist roster on a user's first swarm turn. Best-effort.
+
+    Seed-when-empty: if the user already has any ``AgentSpec``, the roster is left untouched (so
+    later renames/edits/deletes are never fought). A DB hiccup is logged and swallowed — seeding
+    must never block the turn (same tolerance contract as the other hooks).
+    """
+    deps = ctx.deps
+    try:
+        existing = await repo.list_agent_specs(deps.db, deps.user_id)
+        if existing:
+            return
+        for spec in DEFAULT_SWARM_AGENTS:
+            await repo.create_agent_spec(
+                deps.db,
+                deps.user_id,
+                name=spec["name"],
+                role=spec["role"],
+                instructions=spec["instructions"],
+                tools=spec["tools"],
+            )
+    except Exception:  # noqa: BLE001 — seeding is best-effort; never block the turn.
+        logger.warning("default-agent seeding failed; continuing", exc_info=True)
 
 
 def _spec_info(row: dict) -> AgentSpecInfo:
@@ -96,70 +198,18 @@ def _spec_info(row: dict) -> AgentSpecInfo:
         role=row.get("role") or "",
         instructions=row.get("instructions") or "",
         tools=list(row.get("tools") or []),
+        recipients=list(row.get("recipients") or []),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )
 
 
-def _subagent_system_prompt(row: dict) -> str:
-    """The delegated agent's system prompt: its spec, framed as a swarm member."""
-    return (
-        f"You are '{row.get('name')}', a specialist sub-agent in a swarm.\n"
-        f"ROLE: {row.get('role') or 'specialist'}\n"
-        f"{row.get('instructions') or ''}\n"
-        "You were dispatched by an orchestrator with ONE task. You cannot see the wider "
-        "conversation — work only from the assignment you were given. Do the task completely, "
-        "then reply with a focused report of what you did and found (your reply goes to the "
-        "orchestrator, not the end user). If you created documents, name them in the report "
-        "instead of pasting their full content."
-    )
-
-
-async def _dispatch(deps: GraphDependencies, task: AgentTask) -> AgentRunReport:
-    """Run one task on its sub-agent. Tolerant: every failure becomes an error report."""
-    try:
-        row = await repo.get_agent_spec(deps.db, deps.user_id, task.agent)
-    except Exception as exc:  # noqa: BLE001 — a DB hiccup must not abort a parallel batch.
-        logger.warning("agent lookup failed for %r: %s", task.agent, exc, exc_info=True)
-        return AgentRunReport(
-            agent_id=task.agent, task=task.task, error=f"Agent lookup failed: {exc}"
-        )
-    if row is None:
-        return AgentRunReport(
-            agent_id=task.agent,
-            task=task.task,
-            error=(
-                f"No agent named or with id {task.agent!r}. Call list_agents to see the roster, "
-                "or create_agent to define this specialist first."
-            ),
-        )
-    prompt = task.task
-    if task.context:
-        prompt += f"\n\nCONTEXT FROM THE ORCHESTRATOR:\n{task.context}"
-    # A per-dispatch instance id distinguishes concurrent dispatches of the SAME spec in a
-    # run_swarm batch (so the live UI groups and namespaces each one separately).
-    outcome = await run_subagent(
-        deps,
-        instructions=_subagent_system_prompt(row),
-        tool_groups=list(row.get("tools") or []),
-        prompt=prompt,
-        agent_id=row.get("agent_id", task.agent),
-        agent_name=row.get("name") or task.agent,
-        instance_id=uuid4().hex[:8],
-    )
-    return AgentRunReport(
-        agent_id=row.get("agent_id", task.agent),
-        name=row.get("name") or "",
-        task=task.task,
-        output=outcome.output,
-        documents=outcome.documents,
-        error=outcome.error,
-    )
-
-
 @swarm_capability.tool
 async def list_agents(ctx: RunContext[GraphDependencies]) -> list[AgentSpecInfo]:
-    """List the swarm roster: every sub-agent's id, name, role, instructions and tool groups."""
+    """List the agency roster: every agent's id, name, role, instructions, tools and recipients.
+
+    The `recipients` of each agent are the communication chart — who that agent may send_message.
+    """
     rows = await repo.list_agent_specs(ctx.deps.db, ctx.deps.user_id)
     return [_spec_info(r) for r in rows if r.get("agent_id")]
 
@@ -168,10 +218,11 @@ async def list_agents(ctx: RunContext[GraphDependencies]) -> list[AgentSpecInfo]
 async def create_agent(
     ctx: RunContext[GraphDependencies], args: CreateAgentArgs
 ) -> AgentSpecInfo:
-    """Define a new specialist sub-agent for the swarm. Returns its agent_id.
+    """Define a new specialist agent for the agency. Returns its agent_id.
 
     Check list_agents first — update an existing specialist with update_agent rather than
-    creating a near-duplicate.
+    creating a near-duplicate. `recipients` are the teammates this agent may message (its
+    outgoing edges in the communication chart); they may name agents you create later this turn.
     """
     deps = ctx.deps
     existing = await repo.get_agent_spec(deps.db, deps.user_id, args.name)
@@ -187,6 +238,7 @@ async def create_agent(
         role=args.role,
         instructions=args.instructions,
         tools=args.tools,
+        recipients=args.recipients,
     )
     return AgentSpecInfo(
         agent_id=agent_id,
@@ -194,17 +246,26 @@ async def create_agent(
         role=args.role,
         instructions=args.instructions,
         tools=args.tools,
+        recipients=args.recipients,
     )
 
 
 @swarm_capability.tool
 async def update_agent(ctx: RunContext[GraphDependencies], args: UpdateAgentArgs) -> str:
-    """Revise an existing sub-agent's role, instructions and/or tools (its name is immutable).
+    """Revise an existing agent's role, instructions, tools and/or recipients (name is immutable).
 
-    `instructions` and `tools` REPLACE the old values — send the complete new prompt/list.
+    `instructions`, `tools` and `recipients` REPLACE the old values — send the complete new
+    prompt/lists. Pass `recipients=[]` to cut an agent's outgoing edges (make it a leaf).
     """
-    if args.role is None and args.instructions is None and args.tools is None:
-        raise ModelRetry("Nothing to update: pass a new role, instructions and/or tools.")
+    if (
+        args.role is None
+        and args.instructions is None
+        and args.tools is None
+        and args.recipients is None
+    ):
+        raise ModelRetry(
+            "Nothing to update: pass a new role, instructions, tools and/or recipients."
+        )
     deps = ctx.deps
     row = await repo.get_agent_spec(deps.db, deps.user_id, args.agent)
     if row is None:
@@ -218,13 +279,14 @@ async def update_agent(ctx: RunContext[GraphDependencies], args: UpdateAgentArgs
         role=args.role,
         instructions=args.instructions,
         tools=args.tools,
+        recipients=args.recipients,
     )
     return f"Updated agent {row.get('name') or row['agent_id']}."
 
 
 @swarm_capability.tool
 async def delete_agent(ctx: RunContext[GraphDependencies], agent: str) -> str:
-    """Retire a sub-agent from the roster, by id or name (from list_agents)."""
+    """Retire an agent from the roster, by id or name (from list_agents)."""
     deps = ctx.deps
     row = await repo.get_agent_spec(deps.db, deps.user_id, agent)
     if row is None:
@@ -234,32 +296,36 @@ async def delete_agent(ctx: RunContext[GraphDependencies], agent: str) -> str:
 
 
 @swarm_capability.tool
-async def run_agent(ctx: RunContext[GraphDependencies], args: AgentTask) -> AgentRunReport:
-    """Dispatch ONE self-contained task to a sub-agent and return its report.
+async def send_message(
+    ctx: RunContext[GraphDependencies], args: SendMessageArgs
+) -> AgentRunReport:
+    """Send ONE self-contained assignment to a teammate agent and return its report.
 
-    The sub-agent cannot see this conversation — put everything it needs in task/context. A
-    failure inside the delegate comes back as the report's `error`, with whatever documents it
-    managed to produce.
+    The recipient cannot see this conversation — put everything it needs in message/context. A
+    failure inside the delegate (or a bad recipient) comes back as the report's `error`, with
+    whatever documents it managed to produce.
     """
-    return await _dispatch(ctx.deps, args)
+    return await dispatch_message(ctx.deps, args.recipient, args.message, args.context)
 
 
 @swarm_capability.tool
-async def run_swarm(ctx: RunContext[GraphDependencies], args: RunSwarmArgs) -> SwarmRunResult:
-    """Dispatch several INDEPENDENT tasks concurrently; reports return in task order.
+async def send_messages(
+    ctx: RunContext[GraphDependencies], args: SendMessagesArgs
+) -> SwarmRunResult:
+    """Send several INDEPENDENT messages concurrently; reports return in message order.
 
-    Much faster than sequential run_agent calls — use it whenever subtasks don't depend on each
-    other's results. Tasks may target the same agent or different ones. Each report is
-    independent: one failing task never affects the others.
+    Much faster than sequential send_message calls — use it whenever the assignments don't depend
+    on each other's results. Messages may target the same agent or different ones. Each report is
+    independent: one failing message never affects the others.
     """
     deps = ctx.deps
     semaphore = asyncio.Semaphore(DEFAULT_MAX_PARALLEL)
 
-    async def _guarded(task: AgentTask) -> AgentRunReport:
+    async def _guarded(msg: SendMessageArgs) -> AgentRunReport:
         async with semaphore:
-            return await _dispatch(deps, task)
+            return await dispatch_message(deps, msg.recipient, msg.message, msg.context)
 
-    reports = await asyncio.gather(*(_guarded(t) for t in args.tasks))
+    reports = await asyncio.gather(*(_guarded(m) for m in args.messages))
     return SwarmRunResult(reports=list(reports))
 
 
@@ -267,7 +333,7 @@ async def run_swarm(ctx: RunContext[GraphDependencies], args: RunSwarmArgs) -> S
 async def deep_research(
     ctx: RunContext[GraphDependencies], args: DeepResearchArgs
 ) -> DeepResearchResult:
-    """Delegate a question to the built-in deep-research sub-agent (web + documents).
+    """Delegate a question to the built-in deep-research specialist (web + documents).
 
     It plans sub-questions, fans out searches, reads and cross-checks sources, and saves a cited
     markdown report document; the returned digest summarizes the findings. Use it for anything
@@ -319,9 +385,13 @@ async def deep_research(
 
 
 def build_swarm() -> list[Capability]:
-    """Return the swarm-orchestrator capability to add to ``Agent(capabilities=...)``.
+    """Return the swarm-orchestrator capability + seeding hook for ``Agent(capabilities=...)``.
 
-    Dependencies (db/web/sandbox/model) are supplied per-run through ``GraphDependencies``, so
-    nothing needs to be wired in here.
+    The entry-point orchestrator gets the roster tools plus ``send_message``/``send_messages``
+    here; dispatched specialists are granted their own ``send_message`` by ``run_subagent`` when
+    their chart and depth allow. ``swarm_seed_hooks`` seeds the standard roster on the user's
+    first swarm turn. These are added to the orchestrator only (sub-agents never receive
+    ``build_swarm``), so there is no double-seeding and no hooks on delegates. Dependencies
+    (db/web/sandbox/model) are supplied per-run through ``GraphDependencies``.
     """
-    return [swarm_capability]
+    return [swarm_capability, swarm_seed_hooks]
