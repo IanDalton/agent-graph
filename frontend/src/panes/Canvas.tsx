@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useApp } from "@/state/AppContext";
 import { useChat } from "@/hooks/useChat";
+import { useStickyScroll } from "@/hooks/useStickyScroll";
 import { ChatBubble } from "@/components/ChatBubble";
 import { Composer } from "@/components/Composer";
 import { ModeIcon } from "@/components/ModeIcon";
@@ -82,12 +83,8 @@ function RegularCanvas({
     userId,
     onTurnComplete
   );
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useStickyScroll(messages);
   const autoSentRef = useRef(false);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
 
   // Fire the deferred message once on mount (from composing before picking a mode).
   // The ref guard keeps it to a single send under React StrictMode's double mount.
@@ -109,7 +106,7 @@ function RegularCanvas({
         </span>
       </header>
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" viewportRef={viewportRef}>
         <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4">
           {messages.length === 0 && (
             <div className="py-16 text-center text-sm text-muted-foreground">
@@ -127,7 +124,6 @@ function RegularCanvas({
               />
             );
           })}
-          <div ref={bottomRef} />
         </div>
       </ScrollArea>
 
