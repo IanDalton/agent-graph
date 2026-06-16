@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -105,32 +106,95 @@ def build_agent(
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     mode = mode if mode in MODES else DEFAULT_MODE
+    agent = Agent(
+        resolve_model(model),
+        deps_type=GraphDependencies,
+        instructions=compose_instructions(system_prompt),
+        capabilities=_capabilities_for_mode(mode, effort),
+    )
+    # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
+    register_system_prompt(agent)
+    return agent
+
+
+def _capabilities_for_mode(mode: str, effort: str) -> list[Any]:
+    """The capability bundles for an agent profile (see :func:`build_agent` for the rationale).
+
+    Factored out so the context-window meter can introspect the exact tool set a mode exposes
+    without rebuilding the agent's other wiring.
+    """
     if mode == "swarm":
         # Pure orchestrator: no web/sandbox/ontology/document tools, so it cannot do the work
         # itself — it can only manage the roster, delegate via send_message/send_messages, run
         # deep_research (its own sub-agent), and use memory. build_memory() also carries the
         # persistence hooks that save the turn, so it must stay.
-        capabilities = [Thinking(effort=effort), *build_memory(), *build_swarm()]
-    else:
-        capabilities = [
-            Thinking(effort=effort),
-            *build_memory(),
-            *build_ontology(),
-            *build_search(),
-            *build_documents(),
-            *build_sandbox(),
-        ]
-        if mode == "research":
-            capabilities += build_research()
-    agent = Agent(
-        resolve_model(model),
-        deps_type=GraphDependencies,
-        instructions=compose_instructions(system_prompt),
-        capabilities=capabilities,
-    )
-    # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
-    register_system_prompt(agent)
-    return agent
+        return [Thinking(effort=effort), *build_memory(), *build_swarm()]
+    capabilities = [
+        Thinking(effort=effort),
+        *build_memory(),
+        *build_ontology(),
+        *build_search(),
+        *build_documents(),
+        *build_sandbox(),
+    ]
+    if mode == "research":
+        capabilities += build_research()
+    return capabilities
+
+
+def tool_definitions_json(mode: str | None = None) -> str:
+    """Serialize the tool definitions a given ``mode`` exposes, for context-window sizing.
+
+    The tool schemas depend only on the agent *profile* (mode), not on the selected model — so this
+    builds a throwaway agent with a deferred, credential-free model (``defer_model_check=True`` skips
+    provider/credential resolution) and walks its toolsets to gather each tool's static
+    ``ToolDefinition`` (name + description + JSON parameter schema). Returns the concatenated JSON,
+    which the caller token-counts to estimate how much of the context window the tool definitions
+    consume. Tolerant: any failure yields ``""`` (the meter shows zero tools rather than breaking).
+    """
+    mode = mode if mode in MODES else DEFAULT_MODE
+    try:
+        agent = Agent(
+            "openai:gpt-5.2",
+            deps_type=GraphDependencies,
+            instructions="",
+            capabilities=_capabilities_for_mode(mode, DEFAULT_EFFORT),
+            defer_model_check=True,
+        )
+    except Exception:  # noqa: BLE001 — sizing must never break the context endpoint.
+        logger.warning("tool definition introspection failed to build agent", exc_info=True)
+        return ""
+
+    defs: dict[str, Any] = {}
+    seen: set[int] = set()
+
+    def collect(toolset: Any) -> None:
+        if id(toolset) in seen:
+            return
+        seen.add(id(toolset))
+        tools = getattr(toolset, "tools", None)
+        if isinstance(tools, dict):
+            for tool in tools.values():
+                td = getattr(tool, "tool_def", None)
+                if td is not None:
+                    defs[td.name] = {
+                        "name": td.name,
+                        "description": td.description,
+                        "parameters": td.parameters_json_schema,
+                    }
+        for sub in getattr(toolset, "toolsets", None) or []:
+            collect(sub)
+        wrapped = getattr(toolset, "wrapped", None)
+        if wrapped is not None:
+            collect(wrapped)
+
+    try:
+        for toolset in agent.toolsets:
+            collect(toolset)
+        return "".join(json.dumps(d, default=str) for d in defs.values())
+    except Exception:  # noqa: BLE001
+        logger.warning("tool definition introspection failed to walk toolsets", exc_info=True)
+        return ""
 
 
 def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
@@ -153,6 +217,29 @@ def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
         except Exception:  # noqa: BLE001 — a single bad blob must not blind the agent to the rest.
             logger.warning("skipping unparseable run-message blob", exc_info=True)
     return history
+
+
+def message_history_text(rows: list[dict[str, Any]]) -> str:
+    """All text the stored message history contributes to the model's context, for sizing.
+
+    Reuses :func:`_to_message_history` (the same blobs reloaded into ``message_history`` each turn)
+    and flattens every part's text-bearing content — user/assistant text, tool-call arguments, tool
+    returns, tool names — so the context-window meter can token-count "what the model sees" from the
+    history. Tolerant: a deserialization hiccup just contributes less text, never raises.
+    """
+    chunks: list[str] = []
+    for message in _to_message_history(rows):
+        for part in getattr(message, "parts", ()):
+            content = getattr(part, "content", None)
+            if content is not None:
+                chunks.append(content if isinstance(content, str) else json.dumps(content, default=str))
+            args = getattr(part, "args", None)
+            if args is not None:
+                chunks.append(args if isinstance(args, str) else json.dumps(args, default=str))
+            tool_name = getattr(part, "tool_name", None)
+            if tool_name:
+                chunks.append(str(tool_name))
+    return "\n".join(c for c in chunks if c)
 
 
 def _created_frame(info: Any) -> dict[str, Any] | None:

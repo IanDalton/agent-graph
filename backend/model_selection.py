@@ -72,6 +72,51 @@ def available_models() -> list[str]:
     return models
 
 
+# Approximate context-window sizes (in tokens) for the known model labels, used by the
+# context-window usage meter. These are deliberately rough — exact numbers vary by provider tier and
+# change over time — and fully overridable via the ``MODEL_CONTEXT_WINDOWS`` env var (a
+# comma-separated list of ``label=size`` pairs, e.g. ``"openai:gpt-5.2=400000,ollama/qwen3=32768"``).
+CONTEXT_WINDOWS: dict[str, int] = {
+    "anthropic:claude-opus-4-8": 200_000,
+    "anthropic:claude-sonnet-4-6": 200_000,
+    "openai:gpt-5.2": 400_000,
+    "ollama/qwen3": 32_768,
+}
+
+# Fallback window for an unknown model label (a conservative modern default).
+DEFAULT_CONTEXT_WINDOW = 128_000
+
+
+def _env_context_windows() -> dict[str, int]:
+    """Parse ``MODEL_CONTEXT_WINDOWS`` (``label=size`` pairs) into a mapping; ignore bad entries."""
+    raw = os.getenv("MODEL_CONTEXT_WINDOWS")
+    if not raw:
+        return {}
+    out: dict[str, int] = {}
+    for pair in raw.split(","):
+        label, _, size = pair.partition("=")
+        label = label.strip()
+        try:
+            if label and size.strip():
+                out[label] = int(size.strip())
+        except ValueError:
+            continue  # a malformed override entry is skipped, not fatal
+    return out
+
+
+def context_window_for(label: str) -> int:
+    """The context-window size (tokens) for a UI model label.
+
+    Env overrides (``MODEL_CONTEXT_WINDOWS``) win over the built-in :data:`CONTEXT_WINDOWS`; an
+    unknown label falls back to :data:`DEFAULT_CONTEXT_WINDOW`.
+    """
+    label = (label or "").strip()
+    overrides = _env_context_windows()
+    if label in overrides:
+        return overrides[label]
+    return CONTEXT_WINDOWS.get(label, DEFAULT_CONTEXT_WINDOW)
+
+
 def resolve_model(model: str | None) -> Model | str:
     """Resolve an explicit UI-selected model label, falling back to the env default.
 

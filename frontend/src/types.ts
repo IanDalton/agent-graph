@@ -145,6 +145,23 @@ export interface AppConfig {
   embed_model?: string | null;
 }
 
+/** Estimated context-window usage for a conversation (see GET /api/conversations/{id}/context).
+ *  `used` is the sum of the three components; `counter` reports how tokens were measured
+ *  ("tiktoken:<encoding>" precise, "heuristic:chars/4" fallback, or "unavailable"). */
+export interface ContextUsage {
+  model: string;
+  context_window: number;
+  counter: string;
+  components: {
+    system_prompt: number;
+    tools: number;
+    messages: number;
+  };
+  used: number;
+  free: number;
+  percent: number;
+}
+
 /** One node of the agent-built knowledge graph (see backend repo.get_user_graph).
  *  `id` is a DOM-safe sanitized record id (e.g. "38_0"). */
 export interface GraphNode {

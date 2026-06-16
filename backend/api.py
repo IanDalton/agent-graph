@@ -38,7 +38,8 @@ from backend.db.arcade_db import (
     database_name_for_user,
 )
 from backend.embeddings import embeddings_enabled
-from backend.model_selection import available_models, default_model_label
+from backend.model_selection import available_models, context_window_for, default_model_label
+from backend.token_count import count_tokens
 
 logger = logging.getLogger("agent_graph.api")
 
@@ -286,6 +287,60 @@ class DocumentEdit(BaseModel):
     user_id: str = "default"
     title: str | None = None
     content: str | None = None
+
+
+@app.get("/api/conversations/{conversation_id}/context")
+async def get_context_usage(
+    conversation_id: str,
+    user_id: str = "default",
+    model: str = "",
+    mode: str = "",
+) -> dict[str, Any]:
+    """Estimate how much of the model's context window this conversation consumes, by component.
+
+    Breaks the window into **system prompt** (base + the conversation's custom prompt — the per-turn
+    dynamic facts/date block is variable and excluded), **tool definitions** (the exact tools the
+    conversation's ``mode`` exposes), and **messages** (the faithful run history reloaded each turn).
+    ``model`` is the UI-selected label (defaults to the server default); ``mode`` is read from the DB
+    when not supplied. Token counts use :mod:`backend.token_count` (precise tiktoken, heuristic
+    fallback). Tolerant: any failure returns zeros so the config pane never breaks.
+    """
+    label = model or default_model_label()
+    window = context_window_for(label)
+    try:
+        async with _client_for(user_id) as db:
+            resolved_mode = mode or await repo.get_conversation_mode(db, conversation_id)
+            custom_prompt = await repo.get_conversation_system_prompt(db, conversation_id)
+            history_rows = await repo.get_run_history(db, conversation_id)
+
+        sys_tokens, counter = count_tokens(main.compose_instructions(custom_prompt), label)
+        tool_tokens, _ = count_tokens(main.tool_definitions_json(resolved_mode), label)
+        msg_tokens, _ = count_tokens(main.message_history_text(history_rows), label)
+        used = sys_tokens + tool_tokens + msg_tokens
+        return {
+            "model": label,
+            "context_window": window,
+            "counter": counter,
+            "components": {
+                "system_prompt": sys_tokens,
+                "tools": tool_tokens,
+                "messages": msg_tokens,
+            },
+            "used": used,
+            "free": max(0, window - used),
+            "percent": round(used / window * 100, 1) if window else 0.0,
+        }
+    except Exception:  # noqa: BLE001 — the context meter must never break the page.
+        logger.warning("context usage failed", exc_info=True)
+        return {
+            "model": label,
+            "context_window": window,
+            "counter": "unavailable",
+            "components": {"system_prompt": 0, "tools": 0, "messages": 0},
+            "used": 0,
+            "free": window,
+            "percent": 0.0,
+        }
 
 
 @app.get("/api/conversations/{conversation_id}/documents")

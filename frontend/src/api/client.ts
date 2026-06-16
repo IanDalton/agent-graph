@@ -1,5 +1,6 @@
 import type {
   AppConfig,
+  ContextUsage,
   Conversation,
   DocumentFull,
   DocumentMeta,
@@ -70,6 +71,20 @@ export const api = {
       )}`,
       { method: "POST" }
     ).then(json<{ summary: string }>),
+
+  // Estimated context-window usage for a conversation, broken into system/tools/messages. `model`
+  // and `mode` size the window and tool set for the currently-selected profile.
+  getContextUsage: (
+    conversationId: string,
+    userId: string,
+    model: string,
+    mode: string
+  ) =>
+    fetch(
+      `/api/conversations/${conversationId}/context?user_id=${encodeURIComponent(
+        userId
+      )}&model=${encodeURIComponent(model)}&mode=${encodeURIComponent(mode)}`
+    ).then(json<ContextUsage>),
 
   getGraph: (userId: string, limit = 100) =>
     fetch(

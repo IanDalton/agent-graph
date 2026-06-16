@@ -1,4 +1,5 @@
 pydantic-ai-slim[openai]
+tiktoken
 httpx
 python-dotenv
 fastapi

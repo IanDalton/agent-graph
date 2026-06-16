@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Brain, Cpu, Database, FileText, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Bot, Brain, Cpu, Database, FileText, Gauge, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,6 +14,7 @@ import { DocumentsCard } from "@/panes/DocumentsPane";
 import { FactsCard } from "@/panes/FactsPane";
 import { SwarmFlowCard } from "@/swarm/SwarmFlowCard";
 import { Markdown } from "@/components/Markdown";
+import type { ContextUsage } from "@/types";
 
 function ConfigRow({
   icon: Icon,
@@ -228,6 +229,117 @@ function ConfigCard() {
   );
 }
 
+// The three context components, each with a fixed colour so the bar segments and rows line up.
+const CONTEXT_PARTS = [
+  { key: "system_prompt", label: "System prompt", bar: "bg-sky-500", dot: "bg-sky-500" },
+  { key: "tools", label: "Tool defs", bar: "bg-amber-500", dot: "bg-amber-500" },
+  { key: "messages", label: "Messages", bar: "bg-violet-500", dot: "bg-violet-500" },
+] as const;
+
+/** Estimated context-window usage for the active conversation, broken into system prompt / tool
+ *  definitions / message history. Refetches on conversation switch, model change, and after each
+ *  completed turn (the shared `refreshKey` bump). Mirrors SummaryCard's fetch/cancel pattern. */
+function ContextWindowCard({ refreshKey }: { refreshKey: number }) {
+  const { activeId, userId, model, config, conversations } = useApp();
+  const mode = conversations.find((c) => c.conversation_id === activeId)?.mode ?? "regular";
+  // The model that will actually be used for the next turn (selection overrides the server default).
+  const effectiveModel = model || config?.model || "";
+  const [usage, setUsage] = useState<ContextUsage | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!activeId) {
+      setUsage(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    api
+      .getContextUsage(activeId, userId, effectiveModel, mode)
+      .then((r) => !cancelled && setUsage(r))
+      .catch(() => !cancelled && setUsage(null))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, userId, effectiveModel, mode, refreshKey]);
+
+  const fmt = (n: number) => n.toLocaleString();
+  const pct = (n: number) =>
+    usage && usage.context_window ? Math.min(100, (n / usage.context_window) * 100) : 0;
+  const estimated = usage ? !usage.counter.startsWith("tiktoken") : false;
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Gauge className="size-3.5 text-muted-foreground" />
+          Context window
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {loading && !usage ? (
+          <div className="space-y-2">
+            <Skeleton className="h-3 w-full" />
+            <Skeleton className="h-2 w-full" />
+            <Skeleton className="h-3 w-2/3" />
+          </div>
+        ) : !activeId ? (
+          <p className="text-xs text-muted-foreground">Select a conversation to see usage.</p>
+        ) : usage ? (
+          <>
+            <div className="flex items-baseline justify-between text-xs">
+              <span className="truncate font-mono text-muted-foreground" title={usage.model}>
+                {usage.model}
+              </span>
+              <span className="shrink-0 font-medium">
+                {usage.percent}% of {fmt(usage.context_window)}
+              </span>
+            </div>
+
+            {/* Stacked usage bar: system → tools → messages, then the remaining free space. */}
+            <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
+              {CONTEXT_PARTS.map((p) => (
+                <div
+                  key={p.key}
+                  className={p.bar}
+                  style={{ width: `${pct(usage.components[p.key])}%` }}
+                  title={`${p.label}: ${fmt(usage.components[p.key])}`}
+                />
+              ))}
+            </div>
+
+            <div className="space-y-1 pt-1">
+              {CONTEXT_PARTS.map((p) => (
+                <div key={p.key} className="flex items-center gap-2 text-xs">
+                  <span className={`size-2 shrink-0 rounded-full ${p.dot}`} />
+                  <span className="flex-1 text-muted-foreground">{p.label}</span>
+                  <span className="font-mono">{fmt(usage.components[p.key])}</span>
+                </div>
+              ))}
+              <div className="flex items-center gap-2 border-t border-border/50 pt-1 text-xs">
+                <span className="size-2 shrink-0 rounded-full bg-muted-foreground/30" />
+                <span className="flex-1 text-muted-foreground">Free</span>
+                <span className="font-mono">{fmt(usage.free)}</span>
+              </div>
+            </div>
+
+            <p className="text-[10px] text-muted-foreground/70">
+              {usage.counter === "unavailable"
+                ? "Counts unavailable."
+                : estimated
+                  ? "Estimated tokens (system prompt = base + custom; excludes per-turn facts)."
+                  : "Token counts (system prompt = base + custom; excludes per-turn facts)."}
+            </p>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">Usage unavailable.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function SummaryCard({ refreshKey }: { refreshKey: number }) {
   const { activeId, userId } = useApp();
   const [summary, setSummary] = useState<string>("");
@@ -338,6 +450,7 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
         <TabsContent value="context" className="min-h-0 flex-1 overflow-y-auto">
           <div className="space-y-3 p-3">
             <ConfigCard />
+            <ContextWindowCard refreshKey={refreshKey} />
             {isSwarm && <SwarmFlowCard />}
             <SummaryCard refreshKey={refreshKey} />
             <MemoryGraphCard refreshKey={refreshKey} />
