@@ -22,15 +22,28 @@ from backend.skills.system_prompt import (
 
 
 class FactsClient:
-    """Duck-typed ArcadeClient stand-in: query() returns canned Fact rows for the LIKE path."""
+    """Duck-typed ArcadeClient stand-in returning canned Fact rows.
 
-    def __init__(self, facts: list[dict[str, Any]] | None = None) -> None:
+    The hybrid fact block issues two reads per turn: ``list_facts`` (the always-included important
+    facts) and ``search_facts`` (the semantic LIKE path). With ``relevant`` unset both reads see the
+    same ``facts`` list; pass ``relevant`` to route the LIKE path separately and exercise the merge.
+    """
+
+    def __init__(
+        self,
+        facts: list[dict[str, Any]] | None = None,
+        *,
+        relevant: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._facts = facts if facts is not None else []
+        self._relevant = relevant
 
     async def command(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return []
 
     async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if self._relevant is not None and "LIKE" in sql.upper():
+            return list(self._relevant)
         return list(self._facts)
 
 
@@ -78,9 +91,27 @@ def test_relevant_facts_block_empty_when_no_facts() -> None:
     assert asyncio.run(relevant_facts_block(_deps(FactsClient([])), "anything")) == ""
 
 
-def test_relevant_facts_block_empty_for_blank_query() -> None:
-    # No query ⇒ no lookup at all.
-    assert asyncio.run(relevant_facts_block(_deps(FactsClient([{"text": "x"}])), "")) == ""
+def test_relevant_facts_block_includes_important_on_blank_query() -> None:
+    # Important facts are query-independent: they load even with no current prompt.
+    db = FactsClient([{"fact_id": "f1", "text": "lives in Buenos Aires"}])
+    block = asyncio.run(relevant_facts_block(_deps(db), ""))
+    assert "lives in Buenos Aires" in block
+
+
+def test_relevant_facts_block_empty_when_nothing_important_and_blank_query() -> None:
+    assert asyncio.run(relevant_facts_block(_deps(FactsClient([])), "")) == ""
+
+
+def test_relevant_facts_block_merges_important_then_relevant_deduped() -> None:
+    # Hybrid: important facts come first; a semantic hit already shown (same fact_id) isn't repeated.
+    important = [{"fact_id": "f1", "text": "important one"}]
+    relevant = [
+        {"fact_id": "f1", "text": "important one"},
+        {"fact_id": "f2", "text": "relevant two"},
+    ]
+    block = asyncio.run(relevant_facts_block(_deps(FactsClient(important, relevant=relevant)), "q"))
+    assert block.count("important one") == 1  # deduped
+    assert block.index("important one") < block.index("relevant two")  # important first
 
 
 def test_relevant_facts_block_is_tolerant_of_db_errors() -> None:

@@ -350,6 +350,98 @@ def test_delete_fact_removes_by_id() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Fact importance (curated context) + message embeddings
+# --------------------------------------------------------------------------- #
+def test_store_fact_tool_marks_important_by_default() -> None:
+    from backend.schemas.graph_schemas import StoreFactArgs
+    from backend.skills.graph_capability import store_fact
+
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    asyncio.run(store_fact(_ctx(deps), StoreFactArgs(text="likes Recoleta")))
+    created = [p for sql, p in db.commands if sql.startswith("CREATE VERTEX Fact SET")]
+    assert created and created[0]["imp"] is True and created[0]["text"] == "likes Recoleta"
+
+
+def test_store_fact_tool_respects_important_false() -> None:
+    from backend.schemas.graph_schemas import StoreFactArgs
+    from backend.skills.graph_capability import store_fact
+
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    asyncio.run(store_fact(_ctx(deps), StoreFactArgs(text="incidental", important=False)))
+    created = [p for sql, p in db.commands if sql.startswith("CREATE VERTEX Fact SET")]
+    assert created and created[0]["imp"] is False
+
+
+def test_update_fact_tool_can_flag_importance() -> None:
+    db = RecordingClient()
+    deps = GraphDependencies(db=db, user_id="u", conversation_id="c")
+    asyncio.run(update_fact(_ctx(deps), "fid123", "revised", important=False))
+    updates = [(sql, p) for sql, p in db.commands if sql.startswith("UPDATE Fact SET text")]
+    assert updates
+    sql, params = updates[0]
+    assert "important = :imp" in sql and params["imp"] is False
+
+
+def test_set_fact_importance_repo_builds_scoped_update() -> None:
+    db = RecordingClient()
+    n = asyncio.run(repo.set_fact_importance(db, "u", "fid123", True))
+    updates = [(sql, p) for sql, p in db.commands if sql.startswith("UPDATE Fact SET important")]
+    assert updates and n == 1
+    sql, params = updates[0]
+    assert "WHERE fact_id = :fid AND user_id = :uid" in sql
+    assert params["imp"] is True and params["fid"] == "fid123" and params["uid"] == "u"
+
+
+def test_list_facts_important_only_filters() -> None:
+    # important_only adds the `important <> false` guard (NULL legacy rows count as important).
+    db = RecordingClient()
+    asyncio.run(repo.list_facts(db, "u", important_only=True))
+    asyncio.run(repo.list_facts(db, "u"))
+    sqls = [sql for sql, _ in db.queries if sql.startswith("SELECT fact_id, text, important")]
+    assert len(sqls) == 2
+    assert "important <> false" in sqls[0]
+    assert "important <> false" not in sqls[1]
+
+
+class VectorRoutingClient(RecordingClient):
+    """Routes Message reads: vectorNeighbors → ``vector`` rows, LIKE → ``like`` rows."""
+
+    def __init__(self, vector: list[dict[str, Any]], like: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self._vector = vector
+        self._like = like
+
+    async def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        self.queries.append((sql, params or {}))
+        if "vectorNeighbors" in sql:
+            return list(self._vector)
+        if "LIKE" in sql.upper():
+            return list(self._like)
+        return []
+
+
+def test_search_messages_uses_vector_path_when_it_has_hits() -> None:
+    db = VectorRoutingClient(vector=[{"content": "semantic hit"}], like=[{"content": "like hit"}])
+    hits = asyncio.run(repo.search_messages(db, "u", "probe", embedding=[0.1, 0.2]))
+    assert hits == [{"content": "semantic hit"}]
+
+
+def test_search_messages_falls_back_to_like_when_vector_empty() -> None:
+    db = VectorRoutingClient(vector=[], like=[{"content": "like hit"}])
+    hits = asyncio.run(repo.search_messages(db, "u", "probe", embedding=[0.1, 0.2]))
+    assert hits == [{"content": "like hit"}]
+
+
+def test_search_messages_like_only_without_embedding() -> None:
+    db = VectorRoutingClient(vector=[{"content": "should-not-appear"}], like=[{"content": "like hit"}])
+    hits = asyncio.run(repo.search_messages(db, "u", "probe"))
+    assert hits == [{"content": "like hit"}]
+    assert not any("vectorNeighbors" in sql for sql, _ in db.queries)
+
+
+# --------------------------------------------------------------------------- #
 # Integration test (requires a running ArcadeDB)
 # --------------------------------------------------------------------------- #
 def _db_reachable() -> bool:
@@ -377,6 +469,14 @@ def test_repository_roundtrip_integration() -> None:
                 assert any("recoleta probe" in m["content"] for m in msgs)
                 hits = await repo.search_messages(db, "itest-user", "recoleta probe")
                 assert hits
+
+                # Facts default to important; list_facts surfaces them and set_fact_importance toggles.
+                await repo.store_fact(db, "itest-user", "integration likes empanadas")
+                facts = await repo.list_facts(db, "itest-user")
+                assert facts and facts[0]["important"] is True
+                fid = facts[0]["fact_id"]
+                assert await repo.set_fact_importance(db, "itest-user", fid, False) == 1
+                assert await repo.list_facts(db, "itest-user", important_only=True) == []
             finally:
                 # Self-cleaning: drop the throwaway per-user database.
                 await db._server_command(f"drop database {db_name}")

@@ -32,6 +32,9 @@ logger = logging.getLogger("agent_graph.system_prompt")
 # How many of the most relevant stored facts to inject into the system prompt each turn. A small
 # cap keeps the prompt focused; the model can always call search_memory for more.
 _MAX_FACTS = 8
+# Cap on the always-included "important" facts the user (or agent) curated. Bounds the prompt even
+# when a user marks many facts important.
+_MAX_IMPORTANT = 20
 
 BASE_SYSTEM_PROMPT = (
     "You are a helpful, capable assistant backed by a persistent graph memory of THIS user. "
@@ -87,24 +90,39 @@ def _content_text(content: Any) -> str:
 
 
 async def relevant_facts_block(deps: GraphDependencies, query: str) -> str:
-    """Build the 'known facts about the user' block for ``query``, or "" when there's nothing.
+    """Build the 'known facts about the user' block, or "" when there's nothing.
 
-    Embeds ``query`` (when an embedder is configured) and ranks the user's stored facts by
-    similarity via :func:`repo.search_facts` (which falls back to substring matching on its own).
+    Hybrid selection: always include the facts the user (or agent) marked *important*, then fill any
+    remaining room with the facts most semantically relevant to ``query``. Important facts come from
+    :func:`repo.list_facts`; relevance from :func:`repo.search_facts` (which embeds the query when an
+    embedder is configured and falls back to substring matching on its own). Deduped by ``fact_id``.
     Best-effort: any failure logs and returns "" so a turn is never blocked.
     """
-    if not query:
-        return ""
     try:
         embedder = deps.embedder
-        embedding = await embedder.embed(query) if embedder is not None else None
-        facts = await repo.search_facts(
-            deps.db, deps.user_id, query, limit=_MAX_FACTS, embedding=embedding
+        important = await repo.list_facts(
+            deps.db, deps.user_id, limit=_MAX_IMPORTANT, important_only=True
         )
+        relevant: list[dict] = []
+        if query:
+            embedding = await embedder.embed(query) if embedder is not None else None
+            relevant = await repo.search_facts(
+                deps.db, deps.user_id, query, limit=_MAX_FACTS, embedding=embedding
+            )
     except Exception:  # noqa: BLE001 — fact recall is best-effort; never abort the run.
         logger.warning("relevant-facts lookup failed; continuing without it", exc_info=True)
         return ""
-    lines = [f"- {f['text']}" for f in facts if f.get("text")]
+    # Important facts first, then semantically-relevant ones not already included.
+    lines: list[str] = []
+    seen: set[str] = set()
+    for f in important + relevant:
+        text = f.get("text")
+        fact_id = f.get("fact_id")
+        if not text or (fact_id and fact_id in seen):
+            continue
+        if fact_id:
+            seen.add(fact_id)
+        lines.append(f"- {text}")
     if not lines:
         return ""
     return "Known facts about the user (from memory — context, not their current message):\n" + "\n".join(lines)

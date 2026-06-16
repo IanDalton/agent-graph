@@ -332,6 +332,41 @@ async def get_graph(user_id: str = "default", limit: int = 100) -> dict[str, Any
         return {"nodes": [], "edges": []}
 
 
+# ----------------------------------------------------------------------------- facts
+
+
+class FactImportance(BaseModel):
+    """A toggle from the Facts pane: whether a fact is included in the agent's context."""
+
+    user_id: str = "default"
+    important: bool
+
+
+@app.get("/api/facts")
+async def list_facts(user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
+    """List the user's stored facts (newest first) for the Facts tab.
+
+    Pure read, tolerant like the graph/documents lists: a missing database/type (no facts yet) or
+    any error yields an empty list rather than a 500, so the pane never breaks.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_facts(db, user_id, limit=limit)
+    except Exception:  # noqa: BLE001 — the facts pane must never break the page.
+        logger.warning("list_facts failed", exc_info=True)
+        return []
+
+
+@app.patch("/api/facts/{fact_id}")
+async def update_fact_importance(fact_id: str, body: FactImportance) -> dict[str, Any]:
+    """Toggle whether a fact is included in the agent's context (404 if not the caller's)."""
+    async with _client_for(body.user_id, ensure=True) as db:
+        updated = await repo.set_fact_importance(db, body.user_id, fact_id, body.important)
+    if not updated:
+        raise HTTPException(status_code=404, detail="fact not found")
+    return {"fact_id": fact_id, "important": body.important}
+
+
 # ----------------------------------------------------------------------------- chat
 
 

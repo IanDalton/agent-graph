@@ -59,7 +59,9 @@ INSTRUCTIONS = (
     "Use store_fact only for durable facts worth remembering across conversations. "
     "AVOID DUPLICATES: if a fact already exists but is now wrong or incomplete, do NOT store a second "
     "one — call update_fact with that fact's fact_id (returned by search_memory) to revise it in "
-    "place, or delete_fact to remove a redundant/obsolete one."
+    "place, or delete_fact to remove a redundant/obsolete one. "
+    "Facts marked important (the default) are always loaded into your context each turn; pass "
+    "important=False for incidental facts, or via update_fact to flag/unflag an existing one."
 )
 
 
@@ -116,8 +118,9 @@ async def search_memory(ctx: RunContext[GraphDependencies], query: str) -> Memor
     Facts are ranked by semantic similarity when embeddings are enabled, else by substring match.
     """
     deps = ctx.deps
-    messages = await repo.search_messages(deps.db, deps.user_id, query)
-    facts = await repo.search_facts(deps.db, deps.user_id, query, embedding=await _embed(ctx, query))
+    embedding = await _embed(ctx, query)
+    messages = await repo.search_messages(deps.db, deps.user_id, query, embedding=embedding)
+    facts = await repo.search_facts(deps.db, deps.user_id, query, embedding=embedding)
     hits = [
         MemoryHit(kind="message", content=m.get("content", ""), created_at=m.get("created_at"))
         for m in messages
@@ -144,16 +147,31 @@ async def store_fact(ctx: RunContext[GraphDependencies], args: StoreFactArgs) ->
     """Remember a durable fact about the user for use in future conversations.
 
     Search first: if a related fact already exists, prefer update_fact over storing a duplicate.
+    Important facts (the default) are always loaded into your context each turn.
     """
-    await repo.store_fact(ctx.deps.db, ctx.deps.user_id, args.text, embedding=await _embed(ctx, args.text))
+    await repo.store_fact(
+        ctx.deps.db,
+        ctx.deps.user_id,
+        args.text,
+        embedding=await _embed(ctx, args.text),
+        important=args.important,
+    )
     return f"Stored fact for user {ctx.deps.user_id}."
 
 
 @memory_capability.tool
-async def update_fact(ctx: RunContext[GraphDependencies], fact_id: str, text: str) -> str:
-    """Revise an existing fact in place (use its fact_id from search_memory) instead of duplicating it."""
+async def update_fact(
+    ctx: RunContext[GraphDependencies],
+    fact_id: str,
+    text: str,
+    important: bool | None = None,
+) -> str:
+    """Revise an existing fact in place (use its fact_id from search_memory) instead of duplicating it.
+
+    Pass ``important`` to also flag/unflag whether the fact is always loaded into your context.
+    """
     updated = await repo.update_fact(
-        ctx.deps.db, ctx.deps.user_id, fact_id, text, embedding=await _embed(ctx, text)
+        ctx.deps.db, ctx.deps.user_id, fact_id, text, embedding=await _embed(ctx, text), important=important
     )
     if not updated:
         raise ModelRetry(
@@ -235,16 +253,26 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
         what="append_run_messages",
     )
     # Human-readable, searchable mirror: role/content text for search_memory / get_conversation_history.
+    # Content is embedded as it's stored so search_messages can rank by similarity (best-effort:
+    # _embed is tolerant and returns None when embeddings are disabled/unavailable).
     for message in result.new_messages():
         for part in message.parts:
             if isinstance(part, UserPromptPart):
+                content = _text(part.content)
                 await _best_effort(
-                    repo.append_message(deps.db, deps.user_id, deps.conversation_id, "user", _text(part.content)),
+                    repo.append_message(
+                        deps.db, deps.user_id, deps.conversation_id, "user", content,
+                        embedding=await _embed(ctx, content),
+                    ),
                     what="append_user_message",
                 )
             elif isinstance(part, TextPart):
+                content = _text(part.content)
                 await _best_effort(
-                    repo.append_message(deps.db, deps.user_id, deps.conversation_id, "assistant", _text(part.content)),
+                    repo.append_message(
+                        deps.db, deps.user_id, deps.conversation_id, "assistant", content,
+                        embedding=await _embed(ctx, content),
+                    ),
                     what="append_assistant_message",
                 )
     # Refresh the cached conversation summary, but only once every N messages (handled inside).

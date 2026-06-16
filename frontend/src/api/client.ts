@@ -3,6 +3,7 @@ import type {
   Conversation,
   DocumentFull,
   DocumentMeta,
+  Fact,
   MemoryGraph,
   Mode,
   StoredMessage,
@@ -69,6 +70,19 @@ export const api = {
     fetch(
       `/api/graph?user_id=${encodeURIComponent(userId)}&limit=${limit}`
     ).then(json<MemoryGraph>),
+
+  listFacts: (userId: string, limit = 200) =>
+    fetch(
+      `/api/facts?user_id=${encodeURIComponent(userId)}&limit=${limit}`
+    ).then(json<Fact[]>),
+
+  // Toggle whether a fact is included in the agent's context. All facts default to important.
+  setFactImportance: (factId: string, userId: string, important: boolean) =>
+    fetch(`/api/facts/${factId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, important }),
+    }).then(json<{ fact_id: string; important: boolean }>),
 
   listDocuments: (conversationId: string, userId: string) =>
     fetch(

@@ -31,6 +31,24 @@ class StoreFactArgs(BaseModel):
     """A durable fact the agent wants to remember about the user."""
 
     text: str = Field(..., description="The fact to remember, phrased so it is useful in future conversations.")
+    important: bool = Field(
+        True,
+        description=(
+            "Whether this fact should always be loaded into your context each turn. Defaults to "
+            "True (the user can later opt a fact out from the UI). Set False only for incidental "
+            "facts that need not be front-of-mind every turn."
+        ),
+    )
+
+
+class FactDetail(BaseModel):
+    """A stored fact as exposed to the web UI's Facts tab."""
+
+    fact_id: str
+    text: str
+    important: bool = True
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class MemoryHit(BaseModel):

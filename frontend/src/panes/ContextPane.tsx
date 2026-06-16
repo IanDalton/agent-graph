@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Bot, Brain, Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -11,6 +11,7 @@ import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
 import { DocumentsCard } from "@/panes/DocumentsPane";
+import { FactsCard } from "@/panes/FactsPane";
 import { SwarmFlowCard } from "@/swarm/SwarmFlowCard";
 import { Markdown } from "@/components/Markdown";
 
@@ -270,6 +271,10 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
               <LayoutPanelLeft className="size-3.5" />
               Context
             </TabsTrigger>
+            <TabsTrigger value="facts">
+              <Brain className="size-3.5" />
+              Facts
+            </TabsTrigger>
             <TabsTrigger value="documents">
               <FileText className="size-3.5" />
               Documents
@@ -286,6 +291,11 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
             {isSwarm && <SwarmFlowCard />}
             <SummaryCard refreshKey={refreshKey} />
             <MemoryGraphCard refreshKey={refreshKey} />
+          </div>
+        </TabsContent>
+        <TabsContent value="facts" className="min-h-0 flex-1 overflow-y-auto">
+          <div className="p-3">
+            <FactsCard refreshKey={refreshKey} />
           </div>
         </TabsContent>
         <TabsContent value="documents" className="min-h-0 flex-1 overflow-y-auto">

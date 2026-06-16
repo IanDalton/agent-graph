@@ -159,6 +159,16 @@ export interface MemoryGraph {
   edges: GraphEdge[];
 }
 
+/** A durable fact stored about the user (GET /api/facts). `important` controls whether it is
+ *  always loaded into the agent's per-turn context; the user toggles it from the Facts tab. */
+export interface Fact {
+  fact_id: string;
+  text: string;
+  important: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 /** Document metadata as returned by the list endpoint (no body — fetch it separately). */
 export interface DocumentMeta {
   document_id: string;

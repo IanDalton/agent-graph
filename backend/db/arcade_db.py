@@ -272,6 +272,9 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Message (user_id) NOTUNIQUE",
             "CREATE PROPERTY Fact.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Fact (user_id) NOTUNIQUE",
+            # Whether a fact is included in the agent's per-turn context. Default-true semantics:
+            # reads treat a missing/NULL value as important, so existing facts need no backfill.
+            "CREATE PROPERTY Fact.important IF NOT EXISTS BOOLEAN",
         ]
         # Semantic search: when an embedding dimension is configured, give Fact a vector property and
         # an HNSW (LSM_VECTOR) index so search_facts can rank by similarity. ARRAY_OF_FLOATS (not
@@ -280,10 +283,16 @@ class ArcadeClient:
         # fresh per-user DB is empty; the graph builds lazily on the first vectorNeighbors query.
         dim = embedding_dimension()
         if dim:
+            metadata = (
+                f"METADATA {{\"dimensions\": {dim}, \"similarity\": \"COSINE\", \"buildGraphNow\": false}}"
+            )
             statements += [
                 "CREATE PROPERTY Fact.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
-                f"CREATE INDEX IF NOT EXISTS ON Fact (embedding) LSM_VECTOR "
-                f"METADATA {{\"dimensions\": {dim}, \"similarity\": \"COSINE\", \"buildGraphNow\": false}}",
+                f"CREATE INDEX IF NOT EXISTS ON Fact (embedding) LSM_VECTOR {metadata}",
+                # Messages get the same vector treatment so search_messages can rank conversation
+                # history by similarity (with a LIKE fallback), mirroring the Fact contract.
+                "CREATE PROPERTY Message.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
+                f"CREATE INDEX IF NOT EXISTS ON Message (embedding) LSM_VECTOR {metadata}",
             ]
         for stmt in statements:
             await self.command(stmt)

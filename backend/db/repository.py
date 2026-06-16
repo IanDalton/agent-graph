@@ -90,21 +90,31 @@ async def append_message(
     conversation_id: str,
     role: str,
     content: str,
+    embedding: list[float] | None = None,
 ) -> None:
-    """Persist a single message and link it to its conversation."""
+    """Persist a single message and link it to its conversation.
+
+    When ``embedding`` is given (semantic search is enabled), it is stored on the Message's vector
+    property so :func:`search_messages` can rank by similarity. Omitted ⇒ the message is still
+    searchable via substring matching.
+    """
     message_id = _new_id()
-    await db.command(
-        "CREATE VERTEX Message SET message_id = :mid, conversation_id = :cid, "
-        "user_id = :uid, role = :role, content = :content, created_at = :ts",
-        {
-            "mid": message_id,
-            "cid": conversation_id,
-            "uid": user_id,
-            "role": role,
-            "content": content,
-            "ts": _now(),
-        },
+    set_clause = (
+        "message_id = :mid, conversation_id = :cid, "
+        "user_id = :uid, role = :role, content = :content, created_at = :ts"
     )
+    params: dict[str, Any] = {
+        "mid": message_id,
+        "cid": conversation_id,
+        "uid": user_id,
+        "role": role,
+        "content": content,
+        "ts": _now(),
+    }
+    if embedding is not None:
+        set_clause += ", embedding = :emb"
+        params["emb"] = embedding
+    await db.command(f"CREATE VERTEX Message SET {set_clause}", params)
     await db.command(
         "CREATE EDGE HAS_MESSAGE "
         "FROM (SELECT FROM Conversation WHERE conversation_id = :cid) "
@@ -256,18 +266,44 @@ async def get_conversation_system_prompt(db: ArcadeClient, conversation_id: str)
     return str((rows[0].get("system_prompt") if rows else "") or "")
 
 
-async def search_messages(
-    db: ArcadeClient,
-    user_id: str,
-    text: str,
-    limit: int = 10,
+async def _search_messages_like(
+    db: ArcadeClient, user_id: str, text: str, limit: int
 ) -> list[dict[str, Any]]:
-    """Substring search across this user's past messages."""
+    """Substring (LIKE) message search — the default, and the fallback when no embedding is given."""
     return await db.query(
         "SELECT content, created_at FROM Message "
         "WHERE user_id = :uid AND content LIKE :pat ORDER BY created_at DESC LIMIT :limit",
         {"uid": user_id, "pat": f"%{text}%", "limit": limit},
     )
+
+
+async def search_messages(
+    db: ArcadeClient,
+    user_id: str,
+    text: str,
+    limit: int = 10,
+    embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Search this user's past messages.
+
+    When ``embedding`` is provided (semantic search enabled), rank by vector similarity via
+    ArcadeDB's ``vectorNeighbors`` HNSW index; otherwise — or if the vector query errors / returns
+    nothing (e.g. no embedded messages yet) — fall back to substring (LIKE) matching. The vector
+    path can never abort the run: any error degrades to LIKE (same contract as :func:`search_facts`).
+    """
+    if embedding is None:
+        return await _search_messages_like(db, user_id, text, limit)
+    try:
+        hits = await db.query(
+            "SELECT content, created_at FROM ("
+            "SELECT expand(vectorNeighbors('Message[embedding]', :qvec, :k))"
+            ") WHERE user_id = :uid LIMIT :limit",
+            {"qvec": embedding, "k": limit, "uid": user_id, "limit": limit},
+        )
+    except Exception:  # noqa: BLE001 — semantic search is best-effort; degrade to substring search.
+        logger.warning("vector message search failed; falling back to LIKE", exc_info=True)
+        return await _search_messages_like(db, user_id, text, limit)
+    return hits or await _search_messages_like(db, user_id, text, limit)
 
 
 async def append_run_messages(db: ArcadeClient, conversation_id: str, raw: str) -> None:
@@ -311,21 +347,32 @@ async def get_run_history(
 
 
 async def store_fact(
-    db: ArcadeClient, user_id: str, text: str, embedding: list[float] | None = None
+    db: ArcadeClient,
+    user_id: str,
+    text: str,
+    embedding: list[float] | None = None,
+    important: bool = True,
 ) -> None:
     """Store a durable fact about the user and link it to the User vertex.
 
     When ``embedding`` is given (semantic search is enabled), it is stored on the Fact's vector
     property so :func:`search_facts` can rank by similarity. Omitted ⇒ the fact is still searchable
-    via substring matching.
+    via substring matching. ``important`` (default ``True`` — all facts are included by default)
+    controls whether the fact is always loaded into the agent's per-turn context.
     """
     fact_id = _new_id()
     await db.command(
         "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
         {"uid": user_id},
     )
-    set_clause = "fact_id = :fid, user_id = :uid, text = :text, created_at = :ts"
-    params: dict[str, Any] = {"fid": fact_id, "uid": user_id, "text": text, "ts": _now()}
+    set_clause = "fact_id = :fid, user_id = :uid, text = :text, important = :imp, created_at = :ts"
+    params: dict[str, Any] = {
+        "fid": fact_id,
+        "uid": user_id,
+        "text": text,
+        "imp": important,
+        "ts": _now(),
+    }
     if embedding is not None:
         set_clause += ", embedding = :emb"
         params["emb"] = embedding
@@ -346,6 +393,28 @@ async def _search_facts_like(
         "SELECT fact_id, text, created_at FROM Fact "
         "WHERE user_id = :uid AND text LIKE :pat ORDER BY created_at DESC LIMIT :limit",
         {"uid": user_id, "pat": f"%{text}%", "limit": limit},
+    )
+
+
+async def list_facts(
+    db: ArcadeClient,
+    user_id: str,
+    limit: int = 200,
+    important_only: bool = False,
+) -> list[dict[str, Any]]:
+    """List this user's stored facts (newest first) for the UI and the prompt's important set.
+
+    Returns ``fact_id, text, created_at, updated_at, important`` for each fact. Default-true
+    semantics: a fact with no ``important`` value (legacy rows) is treated as important — so
+    ``important_only`` filters out only those explicitly set to ``false``.
+    """
+    where = "user_id = :uid"
+    if important_only:
+        where += " AND important <> false"
+    return await db.query(
+        f"SELECT fact_id, text, important, created_at, updated_at FROM Fact "
+        f"WHERE {where} ORDER BY created_at DESC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
     )
 
 
@@ -384,21 +453,41 @@ async def update_fact(
     fact_id: str,
     text: str,
     embedding: list[float] | None = None,
+    important: bool | None = None,
 ) -> int:
     """Replace the text of an existing fact (so the agent can revise instead of duplicating).
 
     Returns the number of facts updated (0 if no such fact for this user). Scoped by user_id and
     matched on the indexed fact_id. When ``embedding`` is given, the stored vector is refreshed too
-    so semantic search stays consistent with the revised text.
+    so semantic search stays consistent with the revised text. When ``important`` is not ``None``,
+    the fact's inclusion flag is updated as well.
     """
     set_clause = "text = :text, updated_at = :ts"
     params: dict[str, Any] = {"text": text, "ts": _now(), "fid": fact_id, "uid": user_id}
     if embedding is not None:
         set_clause += ", embedding = :emb"
         params["emb"] = embedding
+    if important is not None:
+        set_clause += ", important = :imp"
+        params["imp"] = important
     result = await db.command(
         f"UPDATE Fact SET {set_clause} WHERE fact_id = :fid AND user_id = :uid",
         params,
+    )
+    return _affected(result)
+
+
+async def set_fact_importance(
+    db: ArcadeClient, user_id: str, fact_id: str, important: bool
+) -> int:
+    """Toggle whether a fact is included in the agent's context. Returns count updated (0 if none).
+
+    User-scoped and matched on the indexed fact_id, mirroring :func:`update_fact`. This is the write
+    behind the UI's per-fact toggle (and the agent can reach the same flag via ``update_fact``).
+    """
+    result = await db.command(
+        "UPDATE Fact SET important = :imp, updated_at = :ts WHERE fact_id = :fid AND user_id = :uid",
+        {"imp": important, "ts": _now(), "fid": fact_id, "uid": user_id},
     )
     return _affected(result)
 
