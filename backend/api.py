@@ -22,10 +22,16 @@ from typing import Any, AsyncIterator, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend import main, summarization
 from backend.db import repository as repo
+from backend.skills.subagent import (
+    SWARM_MAX_DEPTH,
+    SWARM_MAX_DEPTH_RANGE,
+    SWARM_MAX_PARALLEL,
+    SWARM_MAX_PARALLEL_RANGE,
+)
 from backend.db.arcade_db import (
     DEFAULT_URL,
     ArcadeClient,
@@ -123,6 +129,14 @@ async def get_config() -> dict[str, Any]:
         # The fixed base system prompt; a conversation's custom prompt is appended to it. Shown
         # read-only in the UI so the user knows what their custom instructions add to.
         "base_system_prompt": main.BASE_SYSTEM_PROMPT,
+        # Swarm bounds: the env defaults + the allowed override ranges. The Configuration card
+        # renders these (swarm mode only) and a conversation may override within range.
+        "swarm": {
+            "max_parallel": SWARM_MAX_PARALLEL,
+            "max_depth": SWARM_MAX_DEPTH,
+            "max_parallel_range": list(SWARM_MAX_PARALLEL_RANGE),
+            "max_depth_range": list(SWARM_MAX_DEPTH_RANGE),
+        },
         "arcade_url": os.getenv("ARCADE_URL", DEFAULT_URL),
         "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8085"),
         "log_level": os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -150,6 +164,13 @@ class UpdateConversation(BaseModel):
     mode: Literal["regular", "research", "swarm"] | None = None
     # The conversation's custom system prompt, appended to the base prompt at run time.
     system_prompt: str | None = None
+    # Per-conversation swarm bounds (swarm mode), validated to the ranges in /api/config.
+    swarm_max_parallel: int | None = Field(
+        None, ge=SWARM_MAX_PARALLEL_RANGE[0], le=SWARM_MAX_PARALLEL_RANGE[1]
+    )
+    swarm_max_depth: int | None = Field(
+        None, ge=SWARM_MAX_DEPTH_RANGE[0], le=SWARM_MAX_DEPTH_RANGE[1]
+    )
 
 
 @app.get("/api/conversations")
@@ -183,10 +204,10 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
 async def update_conversation(
     conversation_id: str, body: UpdateConversation
 ) -> dict[str, Any]:
-    """Update a conversation's agent mode and/or custom system prompt mid-thread.
+    """Update a conversation's agent mode, custom system prompt, and/or swarm bounds mid-thread.
 
-    Both changes persist and take effect on the next turn. Only the fields explicitly sent are
-    applied, so the client can change one without disturbing the other.
+    All changes persist and take effect on the next turn. Only the fields explicitly sent are
+    applied, so the client can change one without disturbing the others.
     """
     fields = body.model_fields_set
     updated: dict[str, Any] = {"conversation_id": conversation_id}
@@ -197,6 +218,17 @@ async def update_conversation(
         if "system_prompt" in fields:
             await repo.set_conversation_system_prompt(db, conversation_id, body.system_prompt or "")
             updated["system_prompt"] = body.system_prompt or ""
+        if "swarm_max_parallel" in fields or "swarm_max_depth" in fields:
+            await repo.set_conversation_swarm_settings(
+                db,
+                conversation_id,
+                max_parallel=body.swarm_max_parallel,
+                max_depth=body.swarm_max_depth,
+            )
+            if "swarm_max_parallel" in fields:
+                updated["swarm_max_parallel"] = body.swarm_max_parallel
+            if "swarm_max_depth" in fields:
+                updated["swarm_max_depth"] = body.swarm_max_depth
     return updated
 
 

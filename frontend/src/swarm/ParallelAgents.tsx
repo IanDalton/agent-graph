@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Check, Loader2 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -15,7 +16,7 @@ export interface AgentLane {
 
 // Up to this many concurrent agents render side-by-side as columns; beyond it, a tabbed switcher
 // (so a wide fan-out doesn't overwhelm the narrow chat column).
-const COLUMNS_MAX = 1;
+const COLUMNS_MAX = 2;
 
 function toolCount(steps: Step[]): number {
   return steps.reduce((n, s) => (s.kind === "tool" ? n + 1 : n), 0);
@@ -91,13 +92,33 @@ export function ParallelAgents({
 
   // Many agents → a tabbed switcher: chips with status + tool count, one trace shown at a time.
   return (
-    <Tabs defaultValue={lanes[0].agent.instanceId} className="space-y-1.5">
+    <TabbedLanes lanes={lanes} isRunning={isRunning} />
+  );
+}
+
+function TabbedLanes({
+  lanes,
+  isRunning,
+}: {
+  lanes: AgentLane[];
+  isRunning: (id: string) => boolean;
+}) {
+  // Controlled so each chip knows whether it's the active one and can highlight itself.
+  const [active, setActive] = useState(lanes[0].agent.instanceId);
+  return (
+    <Tabs
+      defaultValue={lanes[0].agent.instanceId}
+      value={active}
+      onValueChange={setActive}
+      className="space-y-1.5"
+    >
       <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1 bg-transparent p-0">
         {lanes.map((lane) => (
           <LaneChip
             key={lane.agent.instanceId}
             lane={lane}
             running={isRunning(lane.agent.instanceId)}
+            active={active === lane.agent.instanceId}
           />
         ))}
       </TabsList>
@@ -121,14 +142,28 @@ export function ParallelAgents({
   );
 }
 
-/** A tab trigger for one agent: colour dot, name, running/done indicator, and tool-call count. */
-function LaneChip({ lane, running }: { lane: AgentLane; running: boolean }) {
+/** A tab trigger for one agent: colour dot, name, running/done indicator, and tool-call count.
+ *  The active chip is highlighted (brighter background + ring); the others read as dimmed. */
+function LaneChip({
+  lane,
+  running,
+  active,
+}: {
+  lane: AgentLane;
+  running: boolean;
+  active: boolean;
+}) {
   const color = colorForAgent(lane.agent.agentId);
   const tools = toolCount(lane.steps);
   return (
     <TabsTrigger
       value={lane.agent.instanceId}
-      className="flex-none gap-1.5 border border-white/5 font-mono"
+      className={cn(
+        "flex-none gap-1.5 border font-mono transition-colors",
+        active
+          ? "border-white/20 bg-white/10 text-foreground shadow-sm"
+          : "border-transparent opacity-60 hover:bg-white/5 hover:opacity-100"
+      )}
     >
       <span className={cn("inline-block size-2 shrink-0 rounded-full", color.dot)} />
       <span className={cn("max-w-[10rem] truncate", color.text)}>

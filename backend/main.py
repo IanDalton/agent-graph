@@ -273,6 +273,12 @@ async def stream_run(
         except Exception:  # noqa: BLE001 — a missing custom prompt must never block a turn.
             logger.warning("system-prompt lookup failed; using base prompt", exc_info=True)
             system_prompt = ""
+        # Per-conversation swarm bounds (swarm mode); None ⇒ subagent env defaults apply.
+        try:
+            swarm = await repo.get_conversation_swarm_settings(db, conversation_id)
+        except Exception:  # noqa: BLE001 — a missing override must never block a turn.
+            logger.warning("swarm-settings lookup failed; using defaults", exc_info=True)
+            swarm = {}
         agent = build_agent(model, effort, mode=mode, system_prompt=system_prompt)
         # Live trace channel: the parent run AND every sub-agent (run_subagent) push frames onto
         # this one queue, so swarm sub-agents' thinking/tool calls interleave with the
@@ -286,6 +292,8 @@ async def stream_run(
             embedder=embedder,
             model=model,
             event_sink=sink,
+            swarm_max_parallel=swarm.get("max_parallel"),
+            swarm_max_depth=swarm.get("max_depth"),
         )
 
         # Load the prior turns of this thread so the agent retains context. The

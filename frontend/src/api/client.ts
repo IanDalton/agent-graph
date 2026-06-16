@@ -34,7 +34,12 @@ export const api = {
   updateConversation: (
     conversationId: string,
     userId: string,
-    patch: { mode?: Mode; system_prompt?: string }
+    patch: {
+      mode?: Mode;
+      system_prompt?: string;
+      swarm_max_parallel?: number;
+      swarm_max_depth?: number;
+    }
   ) =>
     fetch(`/api/conversations/${conversationId}`, {
       method: "PATCH",

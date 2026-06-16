@@ -208,13 +208,15 @@ async def list_conversations(
     fetch.
     """
     rows = await db.query(
-        "SELECT conversation_id, title, mode, system_prompt, started_at FROM Conversation "
+        "SELECT conversation_id, title, mode, system_prompt, "
+        "swarm_max_parallel, swarm_max_depth, started_at FROM Conversation "
         "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
     for row in rows:
         row["mode"] = row.get("mode") or "regular"
         row["system_prompt"] = row.get("system_prompt") or ""
+        # Swarm overrides are left as-is (None when unset); the UI shows the config default then.
     return rows
 
 
@@ -264,6 +266,49 @@ async def get_conversation_system_prompt(db: ArcadeClient, conversation_id: str)
         {"cid": conversation_id},
     )
     return str((rows[0].get("system_prompt") if rows else "") or "")
+
+
+async def set_conversation_swarm_settings(
+    db: ArcadeClient,
+    conversation_id: str,
+    max_parallel: int | None = None,
+    max_depth: int | None = None,
+) -> None:
+    """Store per-conversation swarm bounds (max concurrent agents / max orchestration depth).
+
+    User-set from the web UI's Configuration card (swarm mode). Only the fields passed (non-None)
+    are updated, so one can change without disturbing the other; ``None`` means "leave it / use the
+    env default". Needs no DDL — ArcadeDB sets the field on write.
+    """
+    set_clauses: list[str] = []
+    params: dict[str, Any] = {"cid": conversation_id}
+    if max_parallel is not None:
+        set_clauses.append("swarm_max_parallel = :mp")
+        params["mp"] = max_parallel
+    if max_depth is not None:
+        set_clauses.append("swarm_max_depth = :md")
+        params["md"] = max_depth
+    if not set_clauses:
+        return
+    await db.command(
+        "UPDATE Conversation SET " + ", ".join(set_clauses) + " WHERE conversation_id = :cid",
+        params,
+    )
+
+
+async def get_conversation_swarm_settings(
+    db: ArcadeClient, conversation_id: str
+) -> dict[str, int | None]:
+    """Return the conversation's swarm overrides, each ``None`` when unset (caller uses env default)."""
+    rows = await db.query(
+        "SELECT swarm_max_parallel, swarm_max_depth FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    row = rows[0] if rows else {}
+    return {
+        "max_parallel": row.get("swarm_max_parallel"),
+        "max_depth": row.get("swarm_max_depth"),
+    }
 
 
 async def _search_messages_like(

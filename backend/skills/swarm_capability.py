@@ -26,9 +26,7 @@ document tools.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 from uuid import uuid4
 
 from pydantic_ai import ModelRetry, RunContext
@@ -53,14 +51,9 @@ from backend.skills.research_capability import (
     DEEP_RESEARCH_INSTRUCTIONS,
     DEEP_RESEARCH_REQUEST_LIMIT,
 )
-from backend.skills.subagent import dispatch_message, run_subagent
+from backend.skills.subagent import dispatch_message, dispatch_messages, run_subagent
 
 logger = logging.getLogger("agent_graph.swarm")
-
-# How many specialists may run at the same moment inside one send_messages batch. Each one is a
-# full agent loop (model calls + tools), so this caps model-provider and DB pressure, not
-# correctness: excess messages simply queue on the semaphore.
-DEFAULT_MAX_PARALLEL = int(os.getenv("SWARM_MAX_PARALLEL", "4"))
 
 _TOOL_GROUP_LINES = "\n".join(f"  - {name}: {desc}" for name, desc in sorted(TOOL_GROUPS.items()))
 
@@ -71,7 +64,7 @@ INSTRUCTIONS = (
     "delegate to specialists and synthesize their reports. The user only talks to you.\n"
     "THE ROSTER: a standard team already exists — ALWAYS call `list_agents` first to see it "
     "(typically web-researcher, report-writer, website-builder, pdf-author, presentation-designer, "
-    "each granted the tools its job needs). Reuse a fitting specialist; `update_agent` to sharpen "
+    "and a `team-lead` sub-orchestrator). Reuse a fitting specialist; `update_agent` to sharpen "
     "one; only `create_agent` for a genuine gap (kebab-case name, one-line role, a focused "
     "job-description prompt, the tool groups the job needs, and `recipients` if it should delegate "
     "onward). The tool groups specialists can be granted:\n"
@@ -87,6 +80,12 @@ INSTRUCTIONS = (
     "serious multi-source investigation, use the built-in `deep_research`. Specialists do NOT see "
     "this conversation: every message must be self-contained — put the goal, constraints, audience "
     "and any findings to build on in `message`/`context`.\n"
+    "SUB-ORCHESTRATORS: for a big, multi-part sub-goal, don't micro-manage every worker yourself — "
+    "hand the whole sub-goal to a sub-orchestrator that has its own team. The seeded `team-lead` "
+    "(its `recipients` are the worker specialists) will itself fan out to them in PARALLEL and "
+    "synthesize the results; you can also `create_agent` a new sub-orchestrator by giving it the "
+    "right `recipients`. Delegating one rich brief to `team-lead` is often better than issuing many "
+    "low-level messages yourself.\n"
     "DELIVERABLES & SYNTHESIS: the specialists produce the artifacts (documents, PDFs, sites), "
     "which are listed on each report. You cannot create documents yourself, so REFERENCE those "
     "documents in your answer — never paste or recreate their content. Weave the reports into one "
@@ -99,9 +98,18 @@ swarm_capability = Capability(id="SwarmOrchestrator", instructions=INSTRUCTIONS)
 
 
 # The standard specialist roster seeded on a user's first swarm turn (see ``swarm_seed_hooks``).
-# Each is a leaf worker (no ``recipients``) that the orchestrator messages directly; together they
-# cover the common deliverables (research, markdown reports, interactive sites, PDFs, slide decks)
-# so the agency is useful out of the box without the user hand-defining agents.
+# The workers are leaves (no ``recipients``) the orchestrator messages directly; together they cover
+# the common deliverables (research, markdown reports, interactive sites, PDFs, slide decks). The
+# ``team-lead`` is a SUB-ORCHESTRATOR whose ``recipients`` are those workers: hand it a complex
+# multi-part sub-goal and it fans out to the workers in parallel and synthesizes their reports — so
+# hierarchical delegation works out of the box without the user hand-wiring a chart.
+_WORKER_NAMES = [
+    "web-researcher",
+    "report-writer",
+    "website-builder",
+    "pdf-author",
+    "presentation-designer",
+]
 DEFAULT_SWARM_AGENTS: list[dict] = [
     {
         "name": "web-researcher",
@@ -160,6 +168,24 @@ DEFAULT_SWARM_AGENTS: list[dict] = [
         ),
         "tools": ["sandbox"],
     },
+    {
+        "name": "team-lead",
+        "role": "Sub-orchestrator: decomposes a complex goal and runs the workers in parallel",
+        "instructions": (
+            "You are a SUB-ORCHESTRATOR leading a team of worker specialists. You were handed ONE "
+            "complex, multi-part goal. Break it into the independent pieces each worker is best at, "
+            "then dispatch them with a SINGLE `send_messages` call so they run IN PARALLEL (use one "
+            "`send_message` only for a lone or dependent step). Your teammates: web-researcher "
+            "(web search + reading sources), report-writer (markdown reports), website-builder "
+            "(interactive HTML), pdf-author (PDF via fpdf2), presentation-designer (slide-deck PDF). "
+            "Each teammate is blind to your context, so give every message a complete, "
+            "self-contained brief. When their reports come back, synthesize them into one coherent "
+            "answer (or a combined document) and reply with that summary, naming the documents they "
+            "produced rather than pasting their contents."
+        ),
+        "tools": ["documents"],
+        "recipients": _WORKER_NAMES,
+    },
 ]
 
 swarm_seed_hooks = Hooks()
@@ -186,6 +212,7 @@ async def _seed_default_agents(ctx: RunContext[GraphDependencies]) -> None:
                 role=spec["role"],
                 instructions=spec["instructions"],
                 tools=spec["tools"],
+                recipients=spec.get("recipients"),
             )
     except Exception:  # noqa: BLE001 — seeding is best-effort; never block the turn.
         logger.warning("default-agent seeding failed; continuing", exc_info=True)
@@ -318,15 +345,7 @@ async def send_messages(
     on each other's results. Messages may target the same agent or different ones. Each report is
     independent: one failing message never affects the others.
     """
-    deps = ctx.deps
-    semaphore = asyncio.Semaphore(DEFAULT_MAX_PARALLEL)
-
-    async def _guarded(msg: SendMessageArgs) -> AgentRunReport:
-        async with semaphore:
-            return await dispatch_message(deps, msg.recipient, msg.message, msg.context)
-
-    reports = await asyncio.gather(*(_guarded(m) for m in args.messages))
-    return SwarmRunResult(reports=list(reports))
+    return SwarmRunResult(reports=await dispatch_messages(ctx.deps, args.messages))
 
 
 @swarm_capability.tool

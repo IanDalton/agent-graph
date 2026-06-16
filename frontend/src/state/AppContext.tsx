@@ -59,6 +59,10 @@ interface AppState {
   setConversationMode: (id: string, mode: Mode) => Promise<void>;
   /** Set a conversation's custom system prompt; persists and takes effect next turn. */
   setConversationSystemPrompt: (id: string, prompt: string) => Promise<void>;
+  setConversationSwarmSettings: (
+    id: string,
+    patch: { swarm_max_parallel?: number; swarm_max_depth?: number }
+  ) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
 }
 
@@ -168,6 +172,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshConversations]);
 
+  const setConversationSwarmSettings = useCallback(
+    async (id: string, patch: { swarm_max_parallel?: number; swarm_max_depth?: number }) => {
+      // Optimistically merge the bounds onto the local row; they take effect on the next turn.
+      setConversations((prev) =>
+        prev.map((c) => (c.conversation_id === id ? { ...c, ...patch } : c))
+      );
+      try {
+        await api.updateConversation(id, USER_ID, patch);
+      } catch (err) {
+        console.error("failed to update conversation swarm settings", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [refreshConversations]
+  );
+
   // Initial load: fetch conversations and select the most recent (or create one).
   useEffect(() => {
     (async () => {
@@ -209,6 +229,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         newConversation,
         setConversationMode,
         setConversationSystemPrompt,
+        setConversationSwarmSettings,
         refreshConversations,
       }}
     >

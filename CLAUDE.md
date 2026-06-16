@@ -185,18 +185,21 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `UsageLimits(request_limit=)` runaway backstop (`SUBAGENT_REQUEST_LIMIT`, default 25). A
   `_document_collector` Hooks records every document the delegate persists (create_document results
   + run_python artifacts) onto `SubagentOutcome.documents`, which is how delegated artifacts reach
-  the UI (see `main`'s document frames). **Agency multi-hop:** when the dispatched specialist has
-  its own chart edges (`recipients`) and its depth is under `SWARM_MAX_DEPTH` (default 3), it is
-  granted its own `send_message` tool via `build_communication_capability()`, and its deps are
-  stamped with `agency_recipients`/`agency_depth` so its own dispatches are chart-enforced and
-  depth-bounded. `dispatch_message(deps, recipient, message, context)` is the shared send_message
-  mechanism (used by the orchestrator's tools AND every specialist's granted send_message): it
-  enforces the caller's chart (`deps.agency_recipients` — `None` = entry point, may message anyone),
-  resolves the recipient spec, and runs it one hop deeper. **Tolerant**: `run_subagent` /
-  `dispatch_message` never raise — failures (incl. exhausted limits, bad/out-of-chart recipients)
-  come back as `SubagentOutcome.error` / an `error` report, keeping any documents persisted before
-  the failure. `model` is a test seam; production resolves `deps.model` (the UI-selected label) so
-  delegates run on the conversation's model.
+  the UI (see `main`'s document frames). **Agency multi-hop / sub-orchestrators:** when the
+  dispatched specialist has its own chart edges (`recipients`) and its depth is under
+  `SWARM_MAX_DEPTH` (default 4 — two orchestration layers), it is granted its own **`send_message`
+  AND `send_messages`** (parallel) tools via `build_communication_capability()` — i.e. it becomes a
+  sub-orchestrator that can itself fan out to workers in parallel. Its deps are stamped with
+  `agency_recipients`/`agency_depth` so its own dispatches are chart-enforced and depth-bounded.
+  `dispatch_message(deps, recipient, message, context)` is the shared single-send mechanism (used by
+  the orchestrator's tools AND every specialist's granted send_message); `dispatch_messages(deps,
+  messages)` is the shared **parallel batch** (semaphore `SWARM_MAX_PARALLEL` default 4 + gather over
+  `dispatch_message`), reused by the orchestrator's and every sub-orchestrator's `send_messages`.
+  Enforcement: `deps.agency_recipients` — `None` = entry point, may message anyone. **Tolerant**:
+  `run_subagent` / `dispatch_message` never raise — failures (incl. exhausted limits, bad/out-of-chart
+  recipients) come back as `SubagentOutcome.error` / an `error` report, keeping any documents persisted
+  before the failure. `model` is a test seam; production resolves `deps.model` (the UI-selected label)
+  so delegates run on the conversation's model.
 - **`backend/schemas/swarm_schemas.py`** — swarm tool I/O: `TOOL_GROUPS` (the grantable bundles),
   `CreateAgentArgs` (kebab-case name validator, tools-subset validator, default grant
   `["web", "documents"]`, `recipients` = the agent's outgoing chart edges, validated kebab-case),
@@ -213,17 +216,19 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   *must* delegate. Roster tools `list_agents`/`create_agent`/`update_agent`/`delete_agent`
   (persisted `AgentSpec`s — durable across turns/conversations; duplicates/unknown names raise
   `ModelRetry`); communication tools `send_message` (one recipient) and `send_messages` (a batch of
-  INDEPENDENT messages delivered **concurrently** via `asyncio.gather` under a `SWARM_MAX_PARALLEL`
-  semaphore, default 4; reports return in message order and one failure never affects the rest) —
-  both delegate to `subagent.dispatch_message`; plus a built-in `deep_research` tool (web+documents
-  delegate on `DEEP_RESEARCH_INSTRUCTIONS`, request limit `DEEP_RESEARCH_REQUEST_LIMIT`, default
-  40). The entry point may message any roster agent; a dispatched specialist may only message its
-  own `recipients`, and those messages flow multi-hop along the chart (bounded by
-  `SWARM_MAX_DEPTH`). **Seeded roster:** `swarm_seed_hooks` (a `before_run` hook in `build_swarm`)
-  creates `DEFAULT_SWARM_AGENTS` — `web-researcher`, `report-writer`, `website-builder` (live HTML
-  doc), `pdf-author` (fpdf2 PDF), `presentation-designer` (slide-deck PDF) — on a user's **first**
-  swarm turn (seed-when-empty: skipped if the user already has any agent, so later edits/deletes
-  aren't fought); best-effort, never blocks the turn. Deliverables are the documents the specialists
+  INDEPENDENT messages delivered **concurrently**; reports return in message order and one failure
+  never affects the rest) — both delegate to `subagent.dispatch_message`/`dispatch_messages`; plus a
+  built-in `deep_research` tool (web+documents delegate on `DEEP_RESEARCH_INSTRUCTIONS`, request limit
+  `DEEP_RESEARCH_REQUEST_LIMIT`, default 40). The entry point may message any roster agent; a
+  dispatched specialist may only message its own `recipients`, and those messages flow multi-hop
+  along the chart (bounded by `SWARM_MAX_DEPTH`). **Seeded roster:** `swarm_seed_hooks` (a
+  `before_run` hook in `build_swarm`) creates `DEFAULT_SWARM_AGENTS` — the workers `web-researcher`,
+  `report-writer`, `website-builder` (live HTML doc), `pdf-author` (fpdf2 PDF),
+  `presentation-designer` (slide-deck PDF), plus a **`team-lead` sub-orchestrator** whose
+  `recipients` are those workers (hand it a complex sub-goal and it fans out to them in parallel and
+  synthesizes) — on a user's **first** swarm turn (seed-when-empty: skipped if the user already has
+  any agent, so later edits/deletes aren't fought); best-effort, never blocks the turn. Deliverables
+  are the documents the specialists
   produce; the orchestrator references (never recreates) them. Communication is tolerant end-to-end:
   an unknown/out-of-chart recipient or broken delegate becomes an `error` report, never an
   exception. Specialists don't see the conversation — instructions make every message
@@ -419,12 +424,13 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
   "agent writes / user edits" surface should reuse `repo.update_document` so both paths stay
   consistent.
 - Delegated runs (`send_message`/`send_messages`/`deep_research`) share the tolerance contract too:
-  `run_subagent`/`dispatch_message` must never raise — failures (incl. out-of-chart recipients)
-  become `error` on the outcome/report. Specialists get tool capabilities ONLY, never
-  `persistence_hooks` (the parent run already persists the turn; hooks on a delegate would
-  double-write messages), and always a `UsageLimits` request cap. The agency communication chart
-  lives on `AgentSpec.recipients`; multi-hop delegation is bounded by `SWARM_MAX_DEPTH` and enforced
-  by `dispatch_message` against `deps.agency_recipients` — keep that enforcement when editing.
+  `run_subagent`/`dispatch_message`/`dispatch_messages` must never raise — failures (incl.
+  out-of-chart recipients) become `error` on the outcome/report. Specialists get tool capabilities
+  ONLY, never `persistence_hooks` (the parent run already persists the turn; hooks on a delegate
+  would double-write messages), and always a `UsageLimits` request cap. The agency communication
+  chart lives on `AgentSpec.recipients`; multi-hop delegation (incl. sub-orchestrators that fan out
+  via their own granted `send_messages`) is bounded by `SWARM_MAX_DEPTH` and enforced by
+  `dispatch_message` against `deps.agency_recipients` — keep that enforcement when editing.
   A conversation's `mode` is stamped at creation but user-changeable later via
   `PATCH /api/conversations/{id}` → `repo.set_conversation_mode`; the same endpoint also sets a
   conversation's custom `system_prompt` (→ `repo.set_conversation_system_prompt`, appended to the

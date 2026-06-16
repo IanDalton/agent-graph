@@ -9,6 +9,9 @@ export interface Conversation {
   mode: Mode;
   /** Custom system prompt appended to the base prompt for this conversation ("" when unset). */
   system_prompt?: string;
+  /** Per-conversation swarm bounds (swarm mode); null/undefined ⇒ use the config default. */
+  swarm_max_parallel?: number | null;
+  swarm_max_depth?: number | null;
 }
 
 export interface StoredMessage {
@@ -128,6 +131,13 @@ export interface AppConfig {
   modes?: string[];
   /** The fixed base system prompt; a conversation's custom prompt is appended to it. */
   base_system_prompt?: string;
+  /** Swarm bounds: env defaults + allowed override ranges for the per-conversation settings. */
+  swarm?: {
+    max_parallel: number;
+    max_depth: number;
+    max_parallel_range: [number, number];
+    max_depth_range: [number, number];
+  };
   arcade_url: string;
   searxng_url: string;
   log_level: string;

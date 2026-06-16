@@ -33,8 +33,10 @@ from backend.skills import swarm_capability as swarm_mod
 from backend.skills.subagent import (
     SWARM_MAX_DEPTH,
     SubagentOutcome,
+    _can_delegate,
     capabilities_for,
     dispatch_message,
+    dispatch_messages,
     run_subagent,
 )
 from backend.skills.swarm_capability import (
@@ -170,8 +172,17 @@ def test_swarm_seeds_default_roster_when_empty() -> None:
     agent = build_agent(model="test", mode="swarm")
     with agent.override(model=TestModel(call_tools=[])):
         asyncio.run(agent.run("hi", deps=_deps(db)))
-    created = [p["name"] for s, p in db.commands if s.startswith("CREATE VERTEX AgentSpec")]
-    assert set(created) == {a["name"] for a in DEFAULT_SWARM_AGENTS}
+    creates = [p for s, p in db.commands if s.startswith("CREATE VERTEX AgentSpec")]
+    created = {p["name"] for p in creates}
+    assert created == {a["name"] for a in DEFAULT_SWARM_AGENTS}
+    # The seeded team-lead is a sub-orchestrator: its recipients are the worker specialists.
+    assert "team-lead" in created
+    team_lead = next(p for p in creates if p["name"] == "team-lead")
+    workers = created - {"team-lead"}
+    assert set(team_lead["recipients"]) == workers
+    # Workers are leaves (no chart edges).
+    web_researcher = next(p for p in creates if p["name"] == "web-researcher")
+    assert web_researcher["recipients"] == []
 
 
 def test_swarm_does_not_seed_when_roster_present() -> None:
@@ -316,6 +327,37 @@ def test_send_message_maps_subagent_outcome(monkeypatch: pytest.MonkeyPatch) -> 
     assert "size the market" in seen["prompt"] and "ACME, B2B" in seen["prompt"]
     assert "market-researcher" in seen["instructions"]
     assert seen["kw"]["recipients"] == []  # the spec's chart edges flow to run_subagent
+
+
+def test_dispatch_messages_runs_concurrently_and_is_tolerant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The shared fan-out used by BOTH the orchestrator and sub-orchestrators: concurrent, ordered,
+    # and one failure never aborts the batch.
+    active = 0
+    max_active = 0
+
+    async def stub(deps: Any, *, prompt: str, **kw: Any) -> SubagentOutcome:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        if "bad" in prompt:
+            return SubagentOutcome(error="boom")
+        return SubagentOutcome(output=f"done: {prompt}")
+
+    monkeypatch.setattr(subagent_mod, "run_subagent", stub)
+    messages = [
+        SendMessageArgs(recipient="market-researcher", message="t0"),
+        SendMessageArgs(recipient="market-researcher", message="bad"),
+        SendMessageArgs(recipient="market-researcher", message="t2"),
+    ]
+    reports = asyncio.run(dispatch_messages(_deps(FakeDb(rows=[SPEC_ROW])), messages))
+    assert [r.task for r in reports] == ["t0", "bad", "t2"]  # order preserved
+    assert reports[0].output == "done: t0" and reports[2].output == "done: t2"
+    assert reports[1].error == "boom"  # isolated failure
+    assert max_active > 1  # genuinely overlapped
 
 
 def test_send_message_enforces_communication_chart() -> None:
@@ -542,20 +584,92 @@ def _subagent_tool_names(deps: GraphDependencies, recipients: list[str]) -> set[
     return {t.name for t in model.last_model_request_parameters.function_tools}
 
 
-def test_run_subagent_grants_send_message_within_depth() -> None:
-    # A delegate dispatched from the entry point (depth 0) with chart edges may delegate further.
-    assert "send_message" in _subagent_tool_names(_deps(FakeDb()), recipients=["teammate"])
+def test_run_subagent_grants_both_comms_within_depth() -> None:
+    # A delegate dispatched from the entry point (depth 0) with chart edges becomes a
+    # sub-orchestrator: it gets BOTH send_message and the parallel send_messages.
+    names = _subagent_tool_names(_deps(FakeDb()), recipients=["teammate"])
+    assert {"send_message", "send_messages"} <= names
 
 
-def test_run_subagent_withholds_send_message_at_depth_ceiling() -> None:
+def test_run_subagent_withholds_comms_at_depth_ceiling() -> None:
     # Past the depth ceiling the delegate is a leaf even though it has chart edges.
     deep = replace(_deps(FakeDb()), agency_depth=SWARM_MAX_DEPTH)
-    assert "send_message" not in _subagent_tool_names(deep, recipients=["teammate"])
+    names = _subagent_tool_names(deep, recipients=["teammate"])
+    assert not ({"send_message", "send_messages"} & names)
 
 
-def test_run_subagent_leaf_has_no_send_message() -> None:
-    # No chart edges → no send_message tool, regardless of depth.
-    assert "send_message" not in _subagent_tool_names(_deps(FakeDb()), recipients=[])
+def test_run_subagent_leaf_has_no_comms() -> None:
+    # No chart edges → no delegation tools, regardless of depth.
+    names = _subagent_tool_names(_deps(FakeDb()), recipients=[])
+    assert not ({"send_message", "send_messages"} & names)
+
+
+# --------------------------------------------------------------------------- #
+# Per-conversation swarm bounds (max parallel / max depth)
+# --------------------------------------------------------------------------- #
+def test_can_delegate_honors_explicit_max_depth() -> None:
+    # max_depth=1 ⇒ even a depth-0 dispatch is a leaf; max_depth=2 ⇒ it may delegate.
+    assert _can_delegate(0, ["x"], max_depth=1) is False
+    assert _can_delegate(0, ["x"], max_depth=2) is True
+
+
+def test_run_subagent_respects_conversation_max_depth() -> None:
+    # A conversation override of swarm_max_depth=1 makes a depth-0 delegate a leaf (no comms),
+    # even though it has chart edges and the env default would have granted them.
+    deps = replace(_deps(FakeDb()), swarm_max_depth=1)
+    assert not ({"send_message", "send_messages"} & _subagent_tool_names(deps, recipients=["t"]))
+
+
+def test_dispatch_messages_respects_conversation_max_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    max_active = 0
+
+    async def stub(deps: Any, *, prompt: str, **kw: Any) -> SubagentOutcome:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return SubagentOutcome(output="ok")
+
+    monkeypatch.setattr(subagent_mod, "run_subagent", stub)
+    deps = replace(_deps(FakeDb(rows=[SPEC_ROW])), swarm_max_parallel=1)
+    messages = [SendMessageArgs(recipient="market-researcher", message=f"t{i}") for i in range(3)]
+    asyncio.run(dispatch_messages(deps, messages))
+    assert max_active == 1  # the conversation's cap of 1 serialized the batch
+
+
+def test_set_conversation_swarm_settings_updates_only_provided() -> None:
+    db = FakeDb()
+    asyncio.run(repo.set_conversation_swarm_settings(db, "c", max_depth=2))
+    sql, params = next((s, p) for s, p in db.commands if s.startswith("UPDATE Conversation"))
+    assert params["md"] == 2 and params["cid"] == "c"
+    assert "mp" not in params  # max_parallel was not sent → not in the SET clause
+
+
+def test_get_conversation_swarm_settings_reads_values_and_nulls() -> None:
+    got = asyncio.run(
+        repo.get_conversation_swarm_settings(
+            FakeDb(rows=[{"swarm_max_parallel": 3, "swarm_max_depth": None}]), "c"
+        )
+    )
+    assert got == {"max_parallel": 3, "max_depth": None}
+    assert asyncio.run(repo.get_conversation_swarm_settings(FakeDb(rows=[]), "c")) == {
+        "max_parallel": None,
+        "max_depth": None,
+    }
+
+
+def test_update_conversation_validates_swarm_ranges() -> None:
+    from backend.api import UpdateConversation
+
+    assert UpdateConversation(swarm_max_parallel=4, swarm_max_depth=3).swarm_max_depth == 3
+    with pytest.raises(ValidationError):
+        UpdateConversation(swarm_max_parallel=99)  # above the allowed range
+    with pytest.raises(ValidationError):
+        UpdateConversation(swarm_max_depth=0)  # below the allowed range
 
 
 # --------------------------------------------------------------------------- #

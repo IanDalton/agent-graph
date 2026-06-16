@@ -15,6 +15,7 @@ for expected failures — a model error, tool blow-up, or exhausted usage limit 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field, replace
@@ -41,7 +42,12 @@ from backend.db.dependencies import GraphDependencies
 from backend.model_selection import resolve_model
 from backend.reasoning_split import ReasoningSplitter
 from backend.schemas.document_schemas import DocumentInfo
-from backend.schemas.swarm_schemas import AgentRunReport, SendMessageArgs
+from backend.schemas.swarm_schemas import (
+    AgentRunReport,
+    SendMessageArgs,
+    SendMessagesArgs,
+    SwarmRunResult,
+)
 from backend.serialization import _jsonable
 
 logger = logging.getLogger("agent_graph.subagent")
@@ -50,10 +56,21 @@ logger = logging.getLogger("agent_graph.subagent")
 DEFAULT_REQUEST_LIMIT = int(os.getenv("SUBAGENT_REQUEST_LIMIT", "25"))
 
 # How many hops deep the agency communication chart may recurse. The entry-point orchestrator is
-# at depth 0; each send_message delegation is one hop. A specialist is granted its own
-# send_message tool only while its depth stays under this ceiling, so multi-hop flows
-# (orchestrator -> A -> B -> ...) can't recurse without bound. Caps depth, not breadth.
-SWARM_MAX_DEPTH = int(os.getenv("SWARM_MAX_DEPTH", "3"))
+# at depth 0; each send_message(s) delegation is one hop. A specialist is granted its own
+# send_message(s) tools only while its depth stays under this ceiling, so multi-hop flows
+# (orchestrator -> sub-orchestrator -> worker) can't recurse without bound. Caps depth, not breadth.
+# Default 4 allows two orchestration layers (orchestrator -> sub-orch -> sub-sub-orch -> worker).
+SWARM_MAX_DEPTH = int(os.getenv("SWARM_MAX_DEPTH", "4"))
+
+# How many delegated agents may run at the same moment inside ONE send_messages batch. Each is a
+# full agent loop, so this caps provider/DB pressure per fan-out (not total: nested batches each get
+# their own semaphore — depth + request limits bound the overall tree). Excess messages queue here.
+SWARM_MAX_PARALLEL = int(os.getenv("SWARM_MAX_PARALLEL", "4"))
+
+# Allowed UI/per-conversation override ranges (inclusive) for the two knobs above. The env values
+# are the defaults; a conversation may override within these bounds from the Configuration card.
+SWARM_MAX_PARALLEL_RANGE = (1, 8)
+SWARM_MAX_DEPTH_RANGE = (1, 6)
 
 
 def _tool_group_builders() -> dict[str, Callable[[], list[Capability]]]:
@@ -93,13 +110,26 @@ def capabilities_for(tool_groups: list[str]) -> list[Capability]:
     return capabilities
 
 
-def _can_delegate(depth: int, recipients: list[str] | None) -> bool:
+def _can_delegate(
+    depth: int, recipients: list[str] | None, max_depth: int = SWARM_MAX_DEPTH
+) -> bool:
     """Whether an agent at ``depth`` with these chart edges may be granted its own send_message.
 
     The child of this dispatch runs at ``depth + 1``; it may delegate further only while that
-    stays under :data:`SWARM_MAX_DEPTH` and it actually has teammates to message.
+    stays under ``max_depth`` (the conversation's setting, defaulting to :data:`SWARM_MAX_DEPTH`)
+    and it actually has teammates to message.
     """
-    return bool(recipients) and (depth + 1) < SWARM_MAX_DEPTH
+    return bool(recipients) and (depth + 1) < max_depth
+
+
+def _effective_max_depth(deps: GraphDependencies) -> int:
+    """The conversation's max orchestration depth, or the env default when unset."""
+    return deps.swarm_max_depth or SWARM_MAX_DEPTH
+
+
+def _effective_max_parallel(deps: GraphDependencies) -> int:
+    """The conversation's max concurrent agents per batch, or the env default when unset."""
+    return deps.swarm_max_parallel or SWARM_MAX_PARALLEL
 
 
 def _subagent_system_prompt(row: dict, can_delegate: bool) -> str:
@@ -121,9 +151,11 @@ def _subagent_system_prompt(row: dict, can_delegate: bool) -> str:
     )
     if can_delegate and recipients:
         prompt += (
-            "\nYou may delegate parts of this work to your teammates via `send_message`: "
-            f"{', '.join(recipients)}. Give each a self-contained assignment (they cannot see your "
-            "context) and fold their reports into your own."
+            "\nYou are also a SUB-ORCHESTRATOR: you may delegate parts of this work to your "
+            f"teammates {', '.join(recipients)}. Batch INDEPENDENT sub-tasks into ONE `send_messages` "
+            "call so they run in PARALLEL (use a single `send_message` only for a one-off or "
+            "dependent step). Give each a self-contained assignment (they cannot see your context) "
+            "and fold their reports into your own."
         )
     return prompt
 
@@ -173,7 +205,7 @@ async def dispatch_message(
             ),
         )
     recipients = list(row.get("recipients") or [])
-    can_delegate = _can_delegate(deps.agency_depth, recipients)
+    can_delegate = _can_delegate(deps.agency_depth, recipients, _effective_max_depth(deps))
     prompt = message
     if context:
         prompt += f"\n\nCONTEXT FROM THE SENDER:\n{context}"
@@ -197,20 +229,43 @@ async def dispatch_message(
     )
 
 
+async def dispatch_messages(
+    deps: GraphDependencies, messages: list[SendMessageArgs]
+) -> list[AgentRunReport]:
+    """Deliver a batch of INDEPENDENT messages concurrently; reports return in message order.
+
+    The shared parallel fan-out behind both the orchestrator's ``send_messages`` tool and a
+    sub-orchestrator's. Concurrency within one batch is capped by :data:`SWARM_MAX_PARALLEL`; each
+    delivery is an independent, tolerant :func:`dispatch_message`, so one failure never aborts the
+    rest. Nested batches each get their own semaphore — depth (:data:`SWARM_MAX_DEPTH`) and per-agent
+    request limits bound the overall tree.
+    """
+    semaphore = asyncio.Semaphore(_effective_max_parallel(deps))
+
+    async def _guarded(msg: SendMessageArgs) -> AgentRunReport:
+        async with semaphore:
+            return await dispatch_message(deps, msg.recipient, msg.message, msg.context)
+
+    return list(await asyncio.gather(*(_guarded(m) for m in messages)))
+
+
 _SEND_MESSAGE_INSTRUCTIONS = (
-    "You are part of an agency and may consult teammates with `send_message`: give a teammate a "
-    "self-contained assignment (they cannot see your context — include everything they need) and "
-    "use their report. You can only message the teammates named in your instructions; an "
-    "out-of-chart or failed message comes back as a report with an `error` you should handle."
+    "You are part of an agency and may delegate to teammates. Batch INDEPENDENT sub-tasks into ONE "
+    "`send_messages` call so they run in PARALLEL; use a single `send_message` only for a one-off "
+    "task or a step that depends on a previous result. Each teammate is given a self-contained "
+    "assignment (they cannot see your context — include everything they need) and replies with a "
+    "report. You can only message the teammates named in your instructions; an out-of-chart or "
+    "failed message comes back as a report with an `error` you should handle."
 )
 
 
 def build_communication_capability() -> Capability:
-    """A capability granting a dispatched specialist its own ``send_message`` tool (multi-hop).
+    """A capability granting a dispatched specialist its own ``send_message``/``send_messages``.
 
     Added by :func:`run_subagent` to a delegate that has chart edges and is within the depth
-    ceiling, so flows can recurse along the agency chart. The orchestrator gets its richer
-    send_message/send_messages tools from the swarm capability instead.
+    ceiling, so flows can recurse along the agency chart — this is what makes a specialist a
+    *sub-orchestrator* that can itself fan out to workers in parallel. The top orchestrator gets the
+    same tools from the swarm capability instead.
     """
     capability = Capability(id="AgencyComms", instructions=_SEND_MESSAGE_INSTRUCTIONS)
 
@@ -220,6 +275,13 @@ def build_communication_capability() -> Capability:
     ) -> AgentRunReport:
         """Send one self-contained assignment to a teammate agent and get its report back."""
         return await dispatch_message(ctx.deps, args.recipient, args.message, args.context)
+
+    @capability.tool
+    async def send_messages(
+        ctx: RunContext[GraphDependencies], args: SendMessagesArgs
+    ) -> SwarmRunResult:
+        """Fan several INDEPENDENT assignments out to teammates concurrently (one report each)."""
+        return SwarmRunResult(reports=await dispatch_messages(ctx.deps, args.messages))
 
     return capability
 
@@ -298,7 +360,11 @@ async def run_subagent(
         agency_recipients=recipients,
         agency_depth=deps.agency_depth + 1,
     )
-    comms = [build_communication_capability()] if _can_delegate(deps.agency_depth, recipients) else []
+    comms = (
+        [build_communication_capability()]
+        if _can_delegate(deps.agency_depth, recipients, _effective_max_depth(deps))
+        else []
+    )
     agent: Agent[GraphDependencies, str] = Agent(
         model if model is not None else resolve_model(deps.model),
         deps_type=GraphDependencies,

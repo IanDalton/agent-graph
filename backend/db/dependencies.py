@@ -64,3 +64,9 @@ class GraphDependencies:
     # grants a dispatched specialist its own send_message tool while depth stays under
     # SWARM_MAX_DEPTH, bounding recursion alongside the per-run request limit.
     agency_depth: int = 0
+    # Per-conversation overrides for the two swarm bounds (set from the UI's Configuration card;
+    # see repo.get_conversation_swarm_settings). ``None`` means "use the env default"
+    # (subagent.SWARM_MAX_PARALLEL / SWARM_MAX_DEPTH). Copied through dataclasses.replace() so a
+    # conversation's values apply at every hop of the agency.
+    swarm_max_parallel: int | None = None
+    swarm_max_depth: int | None = None

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Brain, Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Bot, Brain, Cpu, Database, FileText, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -128,8 +128,53 @@ function SystemPromptRow() {
   );
 }
 
+function rangeOptions([lo, hi]: [number, number]): string[] {
+  const out: string[] = [];
+  for (let i = lo; i <= hi; i++) out.push(String(i));
+  return out;
+}
+
+/** Per-conversation swarm bounds (swarm mode only). Each dropdown saves immediately (one PATCH per
+ *  change) and takes effect on the next turn; an unset value shows the server's config default. */
+function SwarmSettingsRows() {
+  const { config, conversations, activeId, setConversationSwarmSettings } = useApp();
+  const swarm = config?.swarm;
+  if (!swarm || !activeId) return null;
+  const conv = conversations.find((c) => c.conversation_id === activeId);
+  const parallel = conv?.swarm_max_parallel ?? swarm.max_parallel;
+  const depth = conv?.swarm_max_depth ?? swarm.max_depth;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Network className="size-3.5 shrink-0" />
+        <span>Swarm limits</span>
+      </div>
+      <SelectRow
+        icon={Network}
+        label="Parallel"
+        value={String(parallel)}
+        fallback={String(swarm.max_parallel)}
+        options={rangeOptions(swarm.max_parallel_range)}
+        onChange={(v) => setConversationSwarmSettings(activeId, { swarm_max_parallel: Number(v) })}
+        title="Max sub-agents that run at once per fan-out batch (send_messages)"
+      />
+      <SelectRow
+        icon={Layers}
+        label="Depth"
+        value={String(depth)}
+        fallback={String(swarm.max_depth)}
+        options={rangeOptions(swarm.max_depth_range)}
+        onChange={(v) => setConversationSwarmSettings(activeId, { swarm_max_depth: Number(v) })}
+        title="Max orchestration layers delegation may nest (orchestrator → sub-orchestrator → …)"
+      />
+    </div>
+  );
+}
+
 function ConfigCard() {
-  const { config, model, setModel, effort, setEffort } = useApp();
+  const { config, model, setModel, effort, setEffort, conversations, activeId } = useApp();
+  const isSwarm =
+    conversations.find((c) => c.conversation_id === activeId)?.mode === "swarm";
 
   return (
     <Card>
@@ -165,6 +210,11 @@ function ConfigCard() {
             <div className="border-t border-border/50 pt-2">
               <SystemPromptRow />
             </div>
+            {isSwarm && (
+              <div className="border-t border-border/50 pt-2">
+                <SwarmSettingsRows />
+              </div>
+            )}
           </>
         ) : (
           <div className="space-y-2">
