@@ -7,6 +7,12 @@ import path from "node:path";
 // (http://backend:8000) instead of the host default.
 const apiProxyTarget = process.env.API_PROXY_TARGET ?? "http://localhost:8000";
 
+// In the containerized dev server, host file-change events don't cross the Docker bind
+// mount on Windows/macOS, so chokidar's native watcher misses edits and HMR never fires.
+// The frontend-dev compose service sets VITE_USE_POLLING=true to fall back to polling;
+// host-native dev (`npm run dev`) leaves it off to avoid the extra CPU cost.
+const usePolling = process.env.VITE_USE_POLLING === "true";
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -15,6 +21,7 @@ export default defineConfig({
   server: {
     host: true, // listen on 0.0.0.0 so the port is reachable from outside the container
     port: 5173,
+    watch: usePolling ? { usePolling: true, interval: 200 } : undefined,
     proxy: {
       "/api": {
         target: apiProxyTarget,

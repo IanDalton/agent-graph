@@ -22,6 +22,9 @@ x-backend: &backend
     # Shared sandbox scratch dir: mounted at the SAME path here and on the host so the nested
     # `docker run -v {tmp}:/out` the runner emits round-trips /out artifacts. See TMPDIR.
     TMPDIR: ${SANDBOX_SHARED_DIR:-/sandbox-tmp}
+    # Make uvicorn's --reload watcher poll: inotify events don't cross the Docker bind mount
+    # on Windows/macOS hosts, so native watching misses host edits. Inert in prod (no --reload).
+    WATCHFILES_FORCE_POLLING: "true"
   ports:
     - "8000:8000"
   depends_on:
@@ -103,6 +106,9 @@ services:
     environment:
       # Proxy target the Vite server uses (see frontend/vite.config.ts).
       API_PROXY_TARGET: http://backend-dev:8000
+      # Poll for file changes: the host bind mount doesn't deliver inotify events to the
+      # container on Windows/macOS, so Vite's native watcher misses edits and HMR never fires.
+      VITE_USE_POLLING: "true"
     ports:
       - "5173:5173"
     volumes:

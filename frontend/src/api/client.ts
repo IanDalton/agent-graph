@@ -28,6 +28,13 @@ export const api = {
       body: JSON.stringify({ user_id: userId, title, mode }),
     }).then(json<Conversation>),
 
+  updateConversationMode: (conversationId: string, userId: string, mode: Mode) =>
+    fetch(`/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, mode }),
+    }).then(json<{ conversation_id: string; mode: Mode }>),
+
   getMessages: (conversationId: string, userId: string) =>
     fetch(
       `/api/conversations/${conversationId}/messages?user_id=${encodeURIComponent(

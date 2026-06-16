@@ -5,7 +5,74 @@ import { Button } from "@/components/ui/button";
 import { Popover } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { ModeIcon } from "@/components/ModeIcon";
 import { useApp } from "@/state/AppContext";
+import type { Mode } from "@/types";
+
+/** The agent modes a conversation can be switched to (mirrors Canvas's new-chat picker). */
+const MODE_OPTIONS: { mode: Mode; label: string }[] = [
+  { mode: "regular", label: "Regular chat" },
+  { mode: "research", label: "Deep research" },
+  { mode: "swarm", label: "Agent swarm" },
+];
+
+/** A mode-switch chip: shows the active conversation's mode and switches it on select.
+ *  Each option carries its own icon, so it can't reuse the single-icon ControlChip. */
+function ModeChip({ value, onSelect }: { value: Mode; onSelect: (mode: Mode) => void }) {
+  const current = MODE_OPTIONS.find((o) => o.mode === value) ?? MODE_OPTIONS[0];
+  return (
+    <Popover
+      align="start"
+      trigger={({ open, toggle }) => (
+        <button
+          type="button"
+          onClick={toggle}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          title="Mode"
+          className={cn(
+            "inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground",
+            open && "bg-white/5 text-foreground"
+          )}
+        >
+          <ModeIcon mode={current.mode} className="size-3.5 shrink-0" />
+          <span className="truncate font-medium">{current.label}</span>
+        </button>
+      )}
+    >
+      {({ close }) => (
+        <>
+          <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+            Mode
+          </div>
+          {MODE_OPTIONS.map((opt) => {
+            const selected = opt.mode === value;
+            return (
+              <button
+                key={opt.mode}
+                type="button"
+                role="menuitemradio"
+                aria-checked={selected}
+                onClick={() => {
+                  onSelect(opt.mode);
+                  close();
+                }}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-white/5",
+                  selected ? "text-foreground" : "text-muted-foreground"
+                )}
+              >
+                <ModeIcon mode={opt.mode} className="size-3.5 shrink-0" />
+                <span className="flex-1 truncate">{opt.label}</span>
+                {selected && <Check className="size-3.5 shrink-0 text-primary" />}
+              </button>
+            );
+          })}
+        </>
+      )}
+    </Popover>
+  );
+}
 
 /** Strip the provider/path noise from a model label so the indicator stays short:
  *  "ollama/google/gemma-4-26b-a4b-qat" → "gemma-4-26b-a4b-qat", "openai:gpt-5.2" → "gpt-5.2". */
@@ -100,7 +167,9 @@ export function Composer({
   sending: boolean;
   onStop: () => void;
 }) {
-  const { config, model, setModel, effort, setEffort } = useApp();
+  const { config, model, setModel, effort, setEffort, conversations, activeId, setConversationMode } =
+    useApp();
+  const activeMode = conversations.find((c) => c.conversation_id === activeId)?.mode ?? "regular";
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -155,6 +224,18 @@ export function Composer({
           rows={1}
         />
         <div className="flex items-center gap-0.5">
+          {/* Only when a conversation is active — the new-chat picker handles mode pre-creation. */}
+          {activeId && (
+            <>
+              <ModeChip
+                value={activeMode}
+                onSelect={(mode) => setConversationMode(activeId, mode)}
+              />
+              <span aria-hidden className="select-none text-muted-foreground/30">
+                •
+              </span>
+            </>
+          )}
           {modelOptions.length > 0 && (
             <ControlChip
               icon={Brain}

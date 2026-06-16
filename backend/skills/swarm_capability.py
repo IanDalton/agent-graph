@@ -30,6 +30,7 @@ from pydantic_ai.capabilities import Capability
 
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
+from backend.schemas.document_schemas import DocumentInfo
 from backend.schemas.swarm_schemas import (
     TOOL_GROUPS,
     AgentRunReport,
@@ -276,10 +277,34 @@ async def deep_research(
         prompt=prompt,
         request_limit=DEEP_RESEARCH_REQUEST_LIMIT,
     )
+    documents = outcome.documents
+    # Guarantee a saved report even when the delegate forgot to call create_document: persist its
+    # digest as a markdown document. Best-effort — a DB hiccup just leaves documents empty.
+    if not documents and outcome.output.strip():
+        title = f"Research: {args.question}"[:80]
+        try:
+            document_id = await repo.create_document(
+                ctx.deps.db,
+                ctx.deps.user_id,
+                ctx.deps.conversation_id,
+                title=title,
+                content=outcome.output,
+            )
+            documents = [
+                DocumentInfo(
+                    document_id=document_id,
+                    conversation_id=ctx.deps.conversation_id,
+                    title=title,
+                    mime_type="text/markdown",
+                    encoding="text",
+                )
+            ]
+        except Exception:  # noqa: BLE001 — fallback persistence is best-effort; never raise.
+            logger.warning("deep_research report fallback failed; continuing", exc_info=True)
     return DeepResearchResult(
         question=args.question,
         report=outcome.output,
-        documents=outcome.documents,
+        documents=documents,
         error=outcome.error,
     )
 

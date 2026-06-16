@@ -51,6 +51,8 @@ interface AppState {
   openNewChatPicker: () => void;
   /** Create and select a conversation; `mode` picks its agent profile (default regular chat). */
   newConversation: (mode?: Mode) => Promise<void>;
+  /** Switch a conversation's agent mode mid-thread; persists and takes effect next turn. */
+  setConversationMode: (id: string, mode: Mode) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
 }
 
@@ -128,6 +130,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setPendingNewChat(false);
   }, []);
 
+  const setConversationMode = useCallback(async (id: string, mode: Mode) => {
+    // Optimistically flip the local row so the sidebar icon and the Canvas renderer switch
+    // immediately; the next turn re-reads the persisted mode from the server.
+    setConversations((prev) =>
+      prev.map((c) => (c.conversation_id === id ? { ...c, mode } : c))
+    );
+    try {
+      await api.updateConversationMode(id, USER_ID, mode);
+    } catch (err) {
+      console.error("failed to update conversation mode", err);
+      // Re-sync from the server so a failed switch doesn't leave a stale local mode.
+      refreshConversations().catch(() => {});
+    }
+  }, [refreshConversations]);
+
   // Initial load: fetch conversations and select the most recent (or create one).
   useEffect(() => {
     (async () => {
@@ -165,6 +182,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         selectConversation,
         openNewChatPicker,
         newConversation,
+        setConversationMode,
         refreshConversations,
       }}
     >

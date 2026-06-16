@@ -135,8 +135,15 @@ async def get_config() -> dict[str, Any]:
 class NewConversation(BaseModel):
     user_id: str = "default"
     title: str | None = None
-    # The conversation's agent profile, fixed at creation (see backend.main.MODES).
+    # The conversation's agent profile at creation (see backend.main.MODES). Changeable later
+    # via PATCH /api/conversations/{id}.
     mode: Literal["regular", "research", "swarm"] = "regular"
+
+
+class UpdateConversation(BaseModel):
+    user_id: str = "default"
+    # The agent profile to switch this conversation to (see backend.main.MODES).
+    mode: Literal["regular", "research", "swarm"]
 
 
 @app.get("/api/conversations")
@@ -164,6 +171,16 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
         "title": body.title,
         "mode": body.mode,
     }
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: str, body: UpdateConversation
+) -> dict[str, Any]:
+    """Switch a conversation's agent mode mid-thread; the change persists for later turns."""
+    async with _client_for(body.user_id, ensure=True) as db:
+        await repo.set_conversation_mode(db, conversation_id, body.mode)
+    return {"conversation_id": conversation_id, "mode": body.mode}
 
 
 @app.get("/api/conversations/{conversation_id}/messages")

@@ -49,9 +49,11 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `encoding` is `"text"` (literal content) or `"base64"` (binary artifacts — PDFs/images the
   sandbox produced).
   **Modes:** `create_conversation(..., mode=)` stamps the conversation's agent profile at creation
-  (`'regular'`/`'research'`/`'swarm'`; immutable — the idempotent hook call can't overwrite it),
-  `get_conversation_mode` reads it back (default `'regular'` for unknown/pre-mode conversations),
-  and `list_conversations` reports it with the same fallback.
+  (`'regular'`/`'research'`/`'swarm'`; the idempotent hook call can't overwrite it because an
+  existing conversation returns early), `set_conversation_mode` switches it later (the user can
+  change a conversation's mode mid-thread — `stream_run` re-reads the stored mode each turn, so the
+  change persists), `get_conversation_mode` reads it back (default `'regular'` for unknown/pre-mode
+  conversations), and `list_conversations` reports it with the same fallback.
   **Swarm roster:** `create_agent_spec`/`get_agent_spec` (by id OR name)/`list_agent_specs`/
   `update_agent_spec`/`delete_agent_spec` persist sub-agent definitions (name, role, system prompt,
   tool grants) as `AgentSpec` vertices, user-scoped, linked `User -HAS_AGENT-> AgentSpec`.
@@ -265,8 +267,10 @@ React + Vite + TypeScript SPA using **shadcn/ui** components (Tailwind + Radix).
 left `Sidebar` (conversation list with a per-row mode icon — 💬 Regular, 🔬 Deep Research,
 🕸 Swarm — and a **split New Chat button**: the main button creates a regular chat, the chevron
 opens a downward mode menu — local to the Sidebar, since the shared `ui/popover.tsx` anchors
-upward for the composer. The chosen mode rides `POST /api/conversations` and is fixed for the
-conversation's life),
+upward for the composer. The chosen mode rides `POST /api/conversations`; it can be changed later
+mid-conversation via the **mode chip** in the composer (`Composer`'s `ModeChip` →
+`AppContext.setConversationMode` → `PATCH /api/conversations/{id}`), which optimistically updates
+the local row so the sidebar icon and the `Canvas` renderer switch at once),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
@@ -369,5 +373,9 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
   `run_subagent` must never raise — failures become `error` on the outcome/report. Sub-agents get
   tool capabilities ONLY, never `persistence_hooks` (the parent run already persists the turn;
   hooks on a delegate would double-write messages), and always a `UsageLimits` request cap.
-  A conversation's `mode` is fixed at creation — agent-profile changes belong in
-  `main.build_agent`, not per-turn switches.
+  A conversation's `mode` is stamped at creation but user-changeable later via
+  `PATCH /api/conversations/{id}` → `repo.set_conversation_mode`; agent-profile *composition* still
+  lives in `main.build_agent` (which `stream_run` rebuilds each turn from the stored mode).
+  The `research` overlay also guarantees its report: `build_research` adds an `after_run` safeguard
+  that persists the answer as a `Document` if the model skipped `create_document`, and the swarm's
+  `deep_research` tool persists its digest as a fallback when the delegate created none.

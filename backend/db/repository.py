@@ -205,6 +205,18 @@ async def list_conversations(
     return rows
 
 
+async def set_conversation_mode(db: ArcadeClient, conversation_id: str, mode: str) -> None:
+    """Update a conversation's agent mode ('regular'/'research'/'swarm') in place.
+
+    Lets the user switch agent profile mid-conversation; the change persists, so every subsequent
+    turn (which re-reads the stored mode) uses the new profile. Validate ``mode`` at the API edge.
+    """
+    await db.command(
+        "UPDATE Conversation SET mode = :mode WHERE conversation_id = :cid",
+        {"mode": mode, "cid": conversation_id},
+    )
+
+
 async def get_conversation_mode(db: ArcadeClient, conversation_id: str) -> str:
     """Return the conversation's agent mode ('regular'/'research'/'swarm').
 

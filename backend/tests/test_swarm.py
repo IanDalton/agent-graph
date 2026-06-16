@@ -292,6 +292,89 @@ def test_deep_research_uses_builtin_researcher(monkeypatch: pytest.MonkeyPatch) 
     assert "GLP-1 market size" in seen["prompt"] and "EU, 2026" in seen["prompt"]
 
 
+def test_deep_research_persists_report_when_delegate_made_no_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stub(deps: Any, *, prompt: str, **kw: Any) -> SubagentOutcome:
+        return SubagentOutcome(output="A thorough, cited report.")  # no documents
+
+    monkeypatch.setattr(swarm_mod, "run_subagent", stub)
+    db = FakeDb()
+    result = asyncio.run(
+        deep_research(_ctx(db), DeepResearchArgs(question="GLP-1 market size"))
+    )
+    assert len(result.documents) == 1
+    assert result.documents[0].title.startswith("Research: GLP-1")
+    saved = next(p for s, p in db.commands if s.startswith("CREATE VERTEX Document"))
+    assert saved["content"] == "A thorough, cited report."
+
+
+def test_deep_research_keeps_delegate_documents_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.schemas.document_schemas import DocumentInfo
+
+    async def stub(deps: Any, *, prompt: str, **kw: Any) -> SubagentOutcome:
+        return SubagentOutcome(
+            output="digest", documents=[DocumentInfo(document_id="d1", title="Report")]
+        )
+
+    monkeypatch.setattr(swarm_mod, "run_subagent", stub)
+    db = FakeDb()
+    result = asyncio.run(deep_research(_ctx(db), DeepResearchArgs(question="q")))
+    assert [d.document_id for d in result.documents] == ["d1"]
+    assert not any(s.startswith("CREATE VERTEX Document") for s, _ in db.commands)
+
+
+# --------------------------------------------------------------------------- #
+# Research mode (the instructions overlay + report safeguard)
+# --------------------------------------------------------------------------- #
+def test_research_mode_safeguard_saves_report_when_model_skips_create_document() -> None:
+    from backend.skills.document_capability import build_documents
+    from backend.skills.research_capability import build_research
+
+    report = "Executive summary.\n" + "Detailed findings about the topic. " * 20
+    db = FakeDb()
+    agent = Agent(
+        TestModel(call_tools=[], custom_output_text=report),
+        deps_type=GraphDependencies,
+        capabilities=[*build_documents(), *build_research()],
+    )
+    asyncio.run(agent.run("research X", deps=_deps(db)))
+    saved = [p for s, p in db.commands if s.startswith("CREATE VERTEX Document")]
+    assert len(saved) == 1 and saved[0]["content"] == report.strip()
+
+
+def test_research_mode_safeguard_skips_short_replies() -> None:
+    from backend.skills.document_capability import build_documents
+    from backend.skills.research_capability import build_research
+
+    db = FakeDb()
+    agent = Agent(
+        TestModel(call_tools=[], custom_output_text="Which region?"),
+        deps_type=GraphDependencies,
+        capabilities=[*build_documents(), *build_research()],
+    )
+    asyncio.run(agent.run("research X", deps=_deps(db)))
+    assert not any(s.startswith("CREATE VERTEX Document") for s, _ in db.commands)
+
+
+def test_research_mode_safeguard_skips_when_model_creates_document() -> None:
+    from backend.skills.document_capability import build_documents
+    from backend.skills.research_capability import build_research
+
+    db = FakeDb()
+    agent = Agent(
+        TestModel(call_tools=["create_document"]),
+        deps_type=GraphDependencies,
+        capabilities=[*build_documents(), *build_research()],
+    )
+    asyncio.run(agent.run("research X", deps=_deps(db)))
+    # Only the model's own create_document call persisted; the safeguard added nothing.
+    saved = [p for s, p in db.commands if s.startswith("CREATE VERTEX Document")]
+    assert len(saved) == 1
+
+
 # --------------------------------------------------------------------------- #
 # run_subagent (the delegated runner itself)
 # --------------------------------------------------------------------------- #
@@ -355,6 +438,13 @@ def test_create_conversation_stores_mode() -> None:
     asyncio.run(repo.create_conversation(db, "u", "c", mode="swarm"))
     create = next(p for s, p in db.commands if s.startswith("CREATE VERTEX Conversation"))
     assert create["mode"] == "swarm"
+
+
+def test_set_conversation_mode_updates_in_place() -> None:
+    db = FakeDb()
+    asyncio.run(repo.set_conversation_mode(db, "c", "research"))
+    sql, params = next((s, p) for s, p in db.commands if s.startswith("UPDATE Conversation"))
+    assert params["mode"] == "research" and params["cid"] == "c"
 
 
 def test_get_conversation_mode_defaults_to_regular() -> None:
