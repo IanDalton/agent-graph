@@ -193,15 +193,18 @@ async def list_conversations(
 
     Backs the UI's left-pane conversation list. Scoped by ``user_id`` (defense-in-depth on
     top of the per-user database). ``mode`` is the stored agent profile; conversations created
-    before modes existed have none and report ``"regular"``.
+    before modes existed have none and report ``"regular"``. ``system_prompt`` is the custom
+    per-conversation prompt (``""`` when unset), so the UI's config card has it without a separate
+    fetch.
     """
     rows = await db.query(
-        "SELECT conversation_id, title, mode, started_at FROM Conversation "
+        "SELECT conversation_id, title, mode, system_prompt, started_at FROM Conversation "
         "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
     for row in rows:
         row["mode"] = row.get("mode") or "regular"
+        row["system_prompt"] = row.get("system_prompt") or ""
     return rows
 
 
@@ -228,6 +231,29 @@ async def get_conversation_mode(db: ArcadeClient, conversation_id: str) -> str:
         {"cid": conversation_id},
     )
     return (rows[0].get("mode") if rows else None) or "regular"
+
+
+async def set_conversation_system_prompt(
+    db: ArcadeClient, conversation_id: str, prompt: str
+) -> None:
+    """Store the conversation's custom system prompt (appended to the base prompt at run time).
+
+    User-set from the web UI's Configuration card. An empty string clears it. Like the other
+    Conversation properties this needs no DDL — ArcadeDB sets the field on write.
+    """
+    await db.command(
+        "UPDATE Conversation SET system_prompt = :sp WHERE conversation_id = :cid",
+        {"sp": prompt, "cid": conversation_id},
+    )
+
+
+async def get_conversation_system_prompt(db: ArcadeClient, conversation_id: str) -> str:
+    """Return the conversation's custom system prompt, or ``""`` when unset/unknown."""
+    rows = await db.query(
+        "SELECT system_prompt FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return str((rows[0].get("system_prompt") if rows else "") or "")
 
 
 async def search_messages(

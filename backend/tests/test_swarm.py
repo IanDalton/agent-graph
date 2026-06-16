@@ -456,12 +456,50 @@ def test_get_conversation_mode_defaults_to_regular() -> None:
 def test_list_conversations_reports_stored_mode_with_fallback() -> None:
     db = FakeDb(
         rows=[
-            {"conversation_id": "c1", "mode": "research"},
+            {"conversation_id": "c1", "mode": "research", "system_prompt": "be terse"},
             {"conversation_id": "c2", "mode": None},  # pre-modes conversation
         ]
     )
     rows = asyncio.run(repo.list_conversations(db, "u"))
     assert [r["mode"] for r in rows] == ["research", "regular"]
+    assert [r["system_prompt"] for r in rows] == ["be terse", ""]
+
+
+# --------------------------------------------------------------------------- #
+# Per-conversation system prompt
+# --------------------------------------------------------------------------- #
+def test_set_conversation_system_prompt_updates_in_place() -> None:
+    db = FakeDb()
+    asyncio.run(repo.set_conversation_system_prompt(db, "c", "Answer in French."))
+    sql, params = next((s, p) for s, p in db.commands if s.startswith("UPDATE Conversation"))
+    assert params["sp"] == "Answer in French." and params["cid"] == "c"
+
+
+def test_get_conversation_system_prompt_defaults_to_empty() -> None:
+    assert asyncio.run(repo.get_conversation_system_prompt(FakeDb(rows=[]), "c")) == ""
+    assert (
+        asyncio.run(repo.get_conversation_system_prompt(FakeDb(rows=[{"system_prompt": None}]), "c"))
+        == ""
+    )
+    assert (
+        asyncio.run(repo.get_conversation_system_prompt(FakeDb(rows=[{"system_prompt": "hi"}]), "c"))
+        == "hi"
+    )
+
+
+def test_compose_instructions_appends_custom_prompt() -> None:
+    from backend.main import compose_instructions
+    from backend.skills.system_prompt import BASE_SYSTEM_PROMPT
+
+    # No custom prompt → base unchanged (also for whitespace-only input).
+    assert compose_instructions("") == BASE_SYSTEM_PROMPT
+    assert compose_instructions(None) == BASE_SYSTEM_PROMPT
+    assert compose_instructions("   ") == BASE_SYSTEM_PROMPT
+
+    composed = compose_instructions("Always answer in French.")
+    assert composed.startswith(BASE_SYSTEM_PROMPT)
+    assert "Always answer in French." in composed
+    assert "ADDITIONAL INSTRUCTIONS" in composed
 
 
 # --------------------------------------------------------------------------- #

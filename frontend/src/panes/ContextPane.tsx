@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Bot, Cpu, Database, FileText, LayoutPanelLeft, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
@@ -74,6 +75,57 @@ function SelectRow({
   );
 }
 
+/** Per-conversation custom system prompt. Edits live in local state while typing and are saved
+ *  (PATCH) on blur, so it's not a request per keystroke. Appended to the base prompt server-side. */
+function SystemPromptRow() {
+  const { config, conversations, activeId, setConversationSystemPrompt } = useApp();
+  const stored = conversations.find((c) => c.conversation_id === activeId)?.system_prompt ?? "";
+  const [draft, setDraft] = useState(stored);
+
+  // Re-seed the draft when the active conversation (or its stored prompt) changes, so switching
+  // conversations shows that conversation's prompt rather than the previous draft.
+  useEffect(() => {
+    setDraft(stored);
+  }, [activeId, stored]);
+
+  const save = () => {
+    if (activeId && draft !== stored) setConversationSystemPrompt(activeId, draft);
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2 text-xs">
+        <Bot className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="text-muted-foreground">System prompt</span>
+      </div>
+      {activeId ? (
+        <>
+          <Textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={save}
+            placeholder="Extra instructions for this conversation, appended to the base prompt…"
+            className="max-h-48 min-h-[72px] resize-y text-xs"
+            title="Appended to the base system prompt; applies to this conversation from the next turn"
+          />
+          {config?.base_system_prompt && (
+            <details className="text-[10px] text-muted-foreground/70">
+              <summary className="cursor-pointer select-none hover:text-muted-foreground">
+                View base prompt
+              </summary>
+              <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground/70">
+                {config.base_system_prompt}
+              </pre>
+            </details>
+          )}
+        </>
+      ) : (
+        <p className="text-xs text-muted-foreground">Select a conversation to set its prompt.</p>
+      )}
+    </div>
+  );
+}
+
 function ConfigCard() {
   const { config, model, setModel, effort, setEffort } = useApp();
 
@@ -108,6 +160,9 @@ function ConfigCard() {
             <ConfigRow icon={Database} label="ArcadeDB" value={config.arcade_url} />
             <ConfigRow icon={Search} label="Search" value={config.searxng_url} />
             <ConfigRow icon={ScrollText} label="Logs" value={config.log_level} />
+            <div className="border-t border-border/50 pt-2">
+              <SystemPromptRow />
+            </div>
           </>
         ) : (
           <div className="space-y-2">

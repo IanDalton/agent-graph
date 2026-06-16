@@ -7,6 +7,8 @@ export interface Conversation {
   title: string | null;
   started_at?: string;
   mode: Mode;
+  /** Custom system prompt appended to the base prompt for this conversation ("" when unset). */
+  system_prompt?: string;
 }
 
 export interface StoredMessage {
@@ -78,6 +80,8 @@ export interface AppConfig {
   efforts?: string[];
   /** Conversation modes (agent profiles) selectable at conversation creation. */
   modes?: string[];
+  /** The fixed base system prompt; a conversation's custom prompt is appended to it. */
+  base_system_prompt?: string;
   arcade_url: string;
   searxng_url: string;
   log_level: string;

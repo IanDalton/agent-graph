@@ -120,6 +120,9 @@ async def get_config() -> dict[str, Any]:
         "efforts": main.THINKING_EFFORTS,
         # Conversation modes (agent profiles) selectable at conversation creation.
         "modes": main.MODES,
+        # The fixed base system prompt; a conversation's custom prompt is appended to it. Shown
+        # read-only in the UI so the user knows what their custom instructions add to.
+        "base_system_prompt": main.BASE_SYSTEM_PROMPT,
         "arcade_url": os.getenv("ARCADE_URL", DEFAULT_URL),
         "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8085"),
         "log_level": os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -142,8 +145,11 @@ class NewConversation(BaseModel):
 
 class UpdateConversation(BaseModel):
     user_id: str = "default"
-    # The agent profile to switch this conversation to (see backend.main.MODES).
-    mode: Literal["regular", "research", "swarm"]
+    # Partial update: only the fields actually sent are applied (tracked via model_fields_set, so
+    # system_prompt="" can clear the prompt while an omitted field is left untouched).
+    mode: Literal["regular", "research", "swarm"] | None = None
+    # The conversation's custom system prompt, appended to the base prompt at run time.
+    system_prompt: str | None = None
 
 
 @app.get("/api/conversations")
@@ -177,10 +183,21 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
 async def update_conversation(
     conversation_id: str, body: UpdateConversation
 ) -> dict[str, Any]:
-    """Switch a conversation's agent mode mid-thread; the change persists for later turns."""
+    """Update a conversation's agent mode and/or custom system prompt mid-thread.
+
+    Both changes persist and take effect on the next turn. Only the fields explicitly sent are
+    applied, so the client can change one without disturbing the other.
+    """
+    fields = body.model_fields_set
+    updated: dict[str, Any] = {"conversation_id": conversation_id}
     async with _client_for(body.user_id, ensure=True) as db:
-        await repo.set_conversation_mode(db, conversation_id, body.mode)
-    return {"conversation_id": conversation_id, "mode": body.mode}
+        if "mode" in fields and body.mode is not None:
+            await repo.set_conversation_mode(db, conversation_id, body.mode)
+            updated["mode"] = body.mode
+        if "system_prompt" in fields:
+            await repo.set_conversation_system_prompt(db, conversation_id, body.system_prompt or "")
+            updated["system_prompt"] = body.system_prompt or ""
+    return updated
 
 
 @app.get("/api/conversations/{conversation_id}/messages")

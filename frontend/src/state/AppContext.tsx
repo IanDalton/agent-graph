@@ -53,6 +53,8 @@ interface AppState {
   newConversation: (mode?: Mode) => Promise<void>;
   /** Switch a conversation's agent mode mid-thread; persists and takes effect next turn. */
   setConversationMode: (id: string, mode: Mode) => Promise<void>;
+  /** Set a conversation's custom system prompt; persists and takes effect next turn. */
+  setConversationSystemPrompt: (id: string, prompt: string) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
 }
 
@@ -137,10 +139,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
       prev.map((c) => (c.conversation_id === id ? { ...c, mode } : c))
     );
     try {
-      await api.updateConversationMode(id, USER_ID, mode);
+      await api.updateConversation(id, USER_ID, { mode });
     } catch (err) {
       console.error("failed to update conversation mode", err);
       // Re-sync from the server so a failed switch doesn't leave a stale local mode.
+      refreshConversations().catch(() => {});
+    }
+  }, [refreshConversations]);
+
+  const setConversationSystemPrompt = useCallback(async (id: string, prompt: string) => {
+    // Optimistically store the prompt on the local row; it takes effect on the next turn.
+    setConversations((prev) =>
+      prev.map((c) => (c.conversation_id === id ? { ...c, system_prompt: prompt } : c))
+    );
+    try {
+      await api.updateConversation(id, USER_ID, { system_prompt: prompt });
+    } catch (err) {
+      console.error("failed to update conversation system prompt", err);
       refreshConversations().catch(() => {});
     }
   }, [refreshConversations]);
@@ -183,6 +198,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         openNewChatPicker,
         newConversation,
         setConversationMode,
+        setConversationSystemPrompt,
         refreshConversations,
       }}
     >

@@ -213,6 +213,22 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   web/document tools, so every step streams as normal tool chips);
   `DEEP_RESEARCH_INSTRUCTIONS` is the same method framed as a delegate's system prompt, used by
   the swarm's `deep_research` tool.
+- **`backend/skills/system_prompt.py`** — the agent-level system prompt (distinct from the
+  tool-scoped capability `instructions`). `BASE_SYSTEM_PROMPT` is a fixed best-practices identity +
+  behaviour prompt (agency, memory use, honesty/no-fabrication, style) attached to the **main agent
+  only** via `Agent(instructions=...)`. `register_system_prompt(agent)` adds two **dynamic**
+  `@agent.instructions` callables: the current date, and — the key piece — `relevant_facts_block`,
+  which embeds the run's latest user prompt (`_latest_user_prompt(ctx.messages)`) and injects the
+  top-`_MAX_FACTS` most relevant stored facts via the existing `repo.search_facts(..., embedding=)`
+  (semantic ranking with LIKE fallback). So every turn starts grounded in what we know about the
+  user without waiting for the model to call `search_memory`. **Best-effort** like the persistence
+  hooks: any DB/embedder failure logs (`agent_graph.system_prompt`) and degrades to no fact block,
+  never aborting a turn. Sub-agent delegates keep their own task-specific prompts (not wired here).
+  **Custom per-conversation prompt:** a conversation can carry its own extra instructions (set from
+  the web UI's Configuration card, stored on the `Conversation` vertex). `main.compose_instructions`
+  appends them under an `ADDITIONAL INSTRUCTIONS (from the user)` header on top of
+  `BASE_SYSTEM_PROMPT`; `stream_run` reads them each turn via `repo.get_conversation_system_prompt`
+  (tolerant) and passes them to `build_agent(..., system_prompt=)`. Main agent only.
 - **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
   `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
@@ -220,13 +236,16 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   serialized `RunMessages` blobs deserialized with `ModelMessagesTypeAdapter` — faithful, tool calls
   included; a corrupt blob is skipped, not fatal), and streams events using the
   `async with agent.run_stream_events(...) as stream:` form (the bare `async for` form is deprecated).
-  `build_agent()` adds `build_search()` to the capability list, and `run()` opens a `WebClient`
-  alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
+  `build_agent()` adds `build_search()` to the capability list, attaches the best-practices
+  `BASE_SYSTEM_PROMPT` and calls `register_system_prompt(agent)` (see
+  `backend/skills/system_prompt.py` — base prompt + auto-loaded relevant user facts), and `run()`
+  opens a `WebClient` alongside the `ArcadeClient` and injects it via `GraphDependencies(web=...)`.
   **Modes:** `build_agent(model, effort, mode)` keeps the full base capability set for every mode
   and overlays `build_research()` (research) or `build_swarm()` (swarm) on top; `MODES`/
   `DEFAULT_MODE` are the source of truth, unknown values fall back to regular. `stream_run`
-  resolves the conversation's stored mode via `repo.get_conversation_mode` (tolerantly — a lookup
-  failure means regular) *before* building the agent, and passes the UI model label into
+  resolves the conversation's stored mode via `repo.get_conversation_mode` and its custom prompt via
+  `repo.get_conversation_system_prompt` (both tolerantly — a lookup failure means regular / no custom
+  prompt) *before* building the agent, and passes the UI model label into
   `GraphDependencies(model=...)` so swarm/deep-research delegates run on the same model. The
   streaming itself
   lives in `stream_run(prompt, user_id, conversation_id)`, an async generator that maps Pydantic AI
@@ -248,10 +267,13 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
 - **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
   DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
   `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
-  (read-only model/DB/search/log surface incl. the selectable `modes`, **no secrets**),
+  (read-only model/DB/search/log surface incl. the selectable `modes` and the `base_system_prompt`,
+  **no secrets**),
   `GET|POST /api/conversations` (list /
   create — create mints a uuid `conversation_id` and stamps the requested `mode`, validated by a
-  `Literal`), `GET /api/conversations/{id}/messages`,
+  `Literal`), `PATCH /api/conversations/{id}` (partial update of `mode` and/or the custom
+  `system_prompt`; only the fields in `model_fields_set` are applied, so `system_prompt:""` clears
+  it), `GET /api/conversations/{id}/messages`,
   `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
   summary), the document surface — `GET /api/conversations/{id}/documents` (metadata list,
   tolerant), `GET|PUT|DELETE /api/documents/{id}` (PUT applies a **user edit** of title/content via
@@ -274,7 +296,9 @@ the local row so the sidebar icon and the `Canvas` renderer switch at once),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
-(config + summary + memory graph) and a *Documents* tab (`panes/DocumentsPane.tsx`) listing the
+(config + summary + memory graph; the config card's `SystemPromptRow` is a per-conversation custom
+system-prompt textarea, saved on blur via `AppContext.setConversationSystemPrompt`) and a
+*Documents* tab (`panes/DocumentsPane.tsx`) listing the
 active conversation's agent-authored documents. Opening one renders by media type
 (`DocumentBody`): **`text/html` runs as a live interactive app** in a sandboxed iframe
 (`sandbox="allow-scripts allow-forms allow-popups"` — deliberately NO `allow-same-origin`, so
@@ -374,8 +398,10 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
   tool capabilities ONLY, never `persistence_hooks` (the parent run already persists the turn;
   hooks on a delegate would double-write messages), and always a `UsageLimits` request cap.
   A conversation's `mode` is stamped at creation but user-changeable later via
-  `PATCH /api/conversations/{id}` → `repo.set_conversation_mode`; agent-profile *composition* still
-  lives in `main.build_agent` (which `stream_run` rebuilds each turn from the stored mode).
+  `PATCH /api/conversations/{id}` → `repo.set_conversation_mode`; the same endpoint also sets a
+  conversation's custom `system_prompt` (→ `repo.set_conversation_system_prompt`, appended to the
+  base prompt by `main.compose_instructions`). Agent-profile *composition* still
+  lives in `main.build_agent` (which `stream_run` rebuilds each turn from the stored mode + prompt).
   The `research` overlay also guarantees its report: `build_research` adds an `after_run` safeguard
   that persists the answer as a `Document` if the model skipped `create_document`, and the swarm's
   `deep_research` tool persists its digest as a fallback when the delegate created none.

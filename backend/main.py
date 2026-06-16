@@ -41,6 +41,7 @@ from backend.skills.research_capability import build_research
 from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
 from backend.skills.swarm_capability import build_swarm
+from backend.skills.system_prompt import BASE_SYSTEM_PROMPT, register_system_prompt
 from backend.web.client import WebClient
 
 logger = logging.getLogger("agent_graph.main")
@@ -56,8 +57,24 @@ MODES = ["regular", "research", "swarm"]
 DEFAULT_MODE = "regular"
 
 
+def compose_instructions(system_prompt: str | None = None) -> str:
+    """The agent's static system prompt: :data:`BASE_SYSTEM_PROMPT` plus the user's custom prompt.
+
+    A conversation can carry its own extra instructions (set from the web UI). When present they are
+    *appended* under a clear header so the agent keeps its base memory/tool/honesty rules and treats
+    the user's text as additional guidance. An empty/missing prompt returns the base unchanged.
+    """
+    custom = (system_prompt or "").strip()
+    if not custom:
+        return BASE_SYSTEM_PROMPT
+    return f"{BASE_SYSTEM_PROMPT}\n\nADDITIONAL INSTRUCTIONS (from the user):\n{custom}"
+
+
 def build_agent(
-    model: str | None = None, effort: str | None = None, mode: str | None = None
+    model: str | None = None,
+    effort: str | None = None,
+    mode: str | None = None,
+    system_prompt: str | None = None,
 ) -> Agent[GraphDependencies, str]:
     """Construct the agent.
 
@@ -72,6 +89,10 @@ def build_agent(
     ``mode`` is the conversation's agent profile (one of :data:`MODES`). Every mode keeps the full
     base capability set; ``research`` adds the deep-research methodology, ``swarm`` adds the
     sub-agent orchestrator tools. Unknown/missing values fall back to :data:`DEFAULT_MODE`.
+
+    ``system_prompt`` is the conversation's optional custom prompt, appended to
+    :data:`BASE_SYSTEM_PROMPT` (see :func:`compose_instructions`). Main agent only — delegated
+    sub-agents keep their own task-specific prompts.
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     mode = mode if mode in MODES else DEFAULT_MODE
@@ -87,11 +108,15 @@ def build_agent(
         capabilities += build_research()
     elif mode == "swarm":
         capabilities += build_swarm()
-    return Agent(
+    agent = Agent(
         resolve_model(model),
         deps_type=GraphDependencies,
+        instructions=compose_instructions(system_prompt),
         capabilities=capabilities,
     )
+    # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
+    register_system_prompt(agent)
+    return agent
 
 
 def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
@@ -239,14 +264,21 @@ async def stream_run(
     ):
         await db.ensure_database()
         await db.ensure_schema()
-        # The conversation's mode (fixed at creation) picks the agent profile. Tolerant: a
-        # lookup failure or a CLI conversation that doesn't exist yet means the regular agent.
+        # The conversation's mode picks the agent profile, and its custom system prompt (if any)
+        # is appended to the base prompt. Both are re-read each turn, so a UI change takes effect
+        # next turn. Tolerant: a lookup failure (or a CLI conversation that doesn't exist yet)
+        # falls back to the regular agent / no custom prompt rather than blocking the turn.
         try:
             mode = await repo.get_conversation_mode(db, conversation_id)
         except Exception:  # noqa: BLE001 — mode resolution must never block a turn.
             logger.warning("mode lookup failed; using %r", DEFAULT_MODE, exc_info=True)
             mode = DEFAULT_MODE
-        agent = build_agent(model, effort, mode=mode)
+        try:
+            system_prompt = await repo.get_conversation_system_prompt(db, conversation_id)
+        except Exception:  # noqa: BLE001 — a missing custom prompt must never block a turn.
+            logger.warning("system-prompt lookup failed; using base prompt", exc_info=True)
+            system_prompt = ""
+        agent = build_agent(model, effort, mode=mode, system_prompt=system_prompt)
         deps = GraphDependencies(
             db=db,
             user_id=user_id,

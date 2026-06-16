@@ -28,12 +28,20 @@ export const api = {
       body: JSON.stringify({ user_id: userId, title, mode }),
     }).then(json<Conversation>),
 
-  updateConversationMode: (conversationId: string, userId: string, mode: Mode) =>
+  // Partial update: only the keys present in `patch` are applied server-side (mode and/or the
+  // custom system prompt). system_prompt: "" clears the prompt.
+  updateConversation: (
+    conversationId: string,
+    userId: string,
+    patch: { mode?: Mode; system_prompt?: string }
+  ) =>
     fetch(`/api/conversations/${conversationId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, mode }),
-    }).then(json<{ conversation_id: string; mode: Mode }>),
+      body: JSON.stringify({ user_id: userId, ...patch }),
+    }).then(
+      json<{ conversation_id: string; mode?: Mode; system_prompt?: string }>
+    ),
 
   getMessages: (conversationId: string, userId: string) =>
     fetch(
