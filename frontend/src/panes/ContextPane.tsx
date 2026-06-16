@@ -11,6 +11,7 @@ import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
 import { DocumentsCard } from "@/panes/DocumentsPane";
+import { SwarmFlowCard } from "@/swarm/SwarmFlowCard";
 import { Markdown } from "@/components/Markdown";
 
 function ConfigRow({
@@ -251,8 +252,10 @@ function SummaryCard({ refreshKey }: { refreshKey: number }) {
  *  the chat), the pane flips to the Documents tab automatically.
  *  Future modes extend this (Research → sources, Council → consensus doc). */
 export function ContextPane({ refreshKey }: { refreshKey: number }) {
-  const { featuredDoc } = useApp();
+  const { featuredDoc, conversations, activeId } = useApp();
   const [tab, setTab] = useState("context");
+  const isSwarm =
+    conversations.find((c) => c.conversation_id === activeId)?.mode === "swarm";
 
   useEffect(() => {
     if (featuredDoc) setTab("documents");
@@ -280,6 +283,7 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
         <TabsContent value="context" className="min-h-0 flex-1 overflow-y-auto">
           <div className="space-y-3 p-3">
             <ConfigCard />
+            {isSwarm && <SwarmFlowCard />}
             <SummaryCard refreshKey={refreshKey} />
             <MemoryGraphCard refreshKey={refreshKey} />
           </div>

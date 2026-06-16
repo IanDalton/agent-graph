@@ -22,13 +22,23 @@ from typing import Any, Callable
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability, Hooks
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ThinkingPartDelta,
+    ToolCallPart,
+)
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
 from backend.db.dependencies import GraphDependencies
 from backend.model_selection import resolve_model
 from backend.schemas.document_schemas import DocumentInfo
+from backend.serialization import _jsonable
 
 logger = logging.getLogger("agent_graph.subagent")
 
@@ -114,6 +124,9 @@ async def run_subagent(
     prompt: str,
     request_limit: int | None = None,
     model: Model | str | None = None,
+    agent_id: str = "",
+    agent_name: str = "",
+    instance_id: str = "",
 ) -> SubagentOutcome:
     """Run one delegated task to completion and return its outcome. Never raises.
 
@@ -121,6 +134,13 @@ async def run_subagent(
     leaks) and runs on the conversation's model (``deps.model``) unless ``model`` overrides it
     (the test seam). Documents it creates are collected onto the outcome so the caller can
     reference them instead of recreating them.
+
+    When ``deps.event_sink`` is set, the delegate's work is *streamed* and each event is pushed
+    onto the sink as a frame tagged with ``agent_id``/``name``/``instance_id`` (plus
+    ``agent_start``/``agent_end`` lifecycle frames), so ``stream_run`` can render the sub-agent's
+    thinking/tool calls live and coloured. Otherwise the legacy blocking ``agent.run`` path is
+    used (CLI / tests). Either way this never raises — a broken delegate becomes
+    ``SubagentOutcome.error``.
     """
     documents: list[DocumentInfo] = []
     sub_deps = replace(deps, proposed_schemas={}, proposed_edges={})
@@ -130,16 +150,85 @@ async def run_subagent(
         instructions=instructions,
         capabilities=[*capabilities_for(tool_groups), _document_collector(documents)],
     )
+    limits = UsageLimits(request_limit=request_limit or DEFAULT_REQUEST_LIMIT)
+
+    if deps.event_sink is None:
+        # Legacy blocking path: no live trace channel (CLI / non-swarm / tests).
+        try:
+            result = await agent.run(prompt, deps=sub_deps, usage_limits=limits)
+        except Exception as exc:  # noqa: BLE001 — a broken delegate must never abort the orchestrator.
+            logger.warning(
+                "sub-agent run failed: %s: %s", type(exc).__name__, exc, exc_info=True
+            )
+            return SubagentOutcome(
+                documents=documents,  # whatever it persisted before failing is still real
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return SubagentOutcome(output=result.output, documents=documents)
+
+    # Streaming path: relay this delegate's events onto the shared sink, tagged with its identity.
+    sink = deps.event_sink
+
+    def emit(frame: dict[str, Any]) -> None:
+        # Pushing to the sink must never abort the delegate (tolerance contract). An unbounded
+        # asyncio.Queue.put_nowait won't block; we still guard against any unexpected failure.
+        try:
+            sink.put_nowait({**frame, "agent_id": agent_id, "name": agent_name,
+                             "instance_id": instance_id})
+        except Exception:  # noqa: BLE001 — a sink hiccup can't be allowed to break the run.
+            logger.warning("sub-agent event_sink push failed; dropping frame", exc_info=True)
+
+    output = ""
+    emit({"type": "agent_start"})
     try:
-        result = await agent.run(
-            prompt,
-            deps=sub_deps,
-            usage_limits=UsageLimits(request_limit=request_limit or DEFAULT_REQUEST_LIMIT),
-        )
+        async with agent.run_stream_events(
+            prompt, deps=sub_deps, usage_limits=limits
+        ) as stream:
+            async for event in stream:
+                if isinstance(event, FunctionToolCallEvent):
+                    emit({
+                        "type": "tool_call",
+                        "tool_name": event.part.tool_name,
+                        # Namespace by instance so the UI's tool_result->tool_call match never
+                        # collides with the orchestrator or a sibling running the same spec.
+                        "tool_call_id": f"{instance_id}:{event.part.tool_call_id}",
+                        "args": _jsonable(event.part.args),
+                    })
+                    continue
+                if isinstance(event, FunctionToolResultEvent):
+                    part = event.part
+                    emit({
+                        "type": "tool_result",
+                        "tool_name": getattr(part, "tool_name", None),
+                        "tool_call_id": f"{instance_id}:{getattr(part, 'tool_call_id', '')}",
+                        "content": _jsonable(getattr(part, "content", None)),
+                    })
+                    # Documents are NOT emitted here — they ride back on the report and the
+                    # orchestrator's _document_events path turns them into artifact cards
+                    # (emitting them here too would double the cards).
+                    continue
+
+                node = event
+                if isinstance(event, PartStartEvent):
+                    node = event.part
+                elif isinstance(event, PartDeltaEvent):
+                    node = event.delta
+
+                if isinstance(node, ThinkingPartDelta):
+                    if node.content_delta:
+                        emit({"type": "thinking", "delta": node.content_delta})
+                elif isinstance(node, TextPart):
+                    output += node.content
+                    emit({"type": "text", "delta": node.content})
+                elif isinstance(node, TextPartDelta):
+                    output += node.content_delta
+                    emit({"type": "text", "delta": node.content_delta})
     except Exception as exc:  # noqa: BLE001 — a broken delegate must never abort the orchestrator.
         logger.warning("sub-agent run failed: %s: %s", type(exc).__name__, exc, exc_info=True)
         return SubagentOutcome(
             documents=documents,  # whatever it persisted before failing is still real
             error=f"{type(exc).__name__}: {exc}",
         )
-    return SubagentOutcome(output=result.output, documents=documents)
+    finally:
+        emit({"type": "agent_end"})
+    return SubagentOutcome(output=output, documents=documents)

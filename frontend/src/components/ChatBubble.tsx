@@ -81,6 +81,15 @@ function StepItem({ step }: { step: Step }) {
   if (step.kind === "document") {
     return <DocumentCard step={step} />;
   }
+  // agent_text only appears in swarm mode (rendered by SwarmStepItem); render plainly if it
+  // ever reaches the default renderer.
+  if (step.kind === "agent_text") {
+    return step.text.trim() ? (
+      <div className="whitespace-pre-wrap rounded-xl border border-white/10 bg-slate-900/40 px-2.5 py-2 text-xs text-muted-foreground">
+        {step.text}
+      </div>
+    ) : null;
+  }
   return <ToolChip tool={step.tool} />;
 }
 
@@ -135,12 +144,16 @@ export function ChatBubble({
   message,
   onRegenerate,
   renderStep,
+  renderSteps,
 }: {
   message: ChatMessage;
   /** Provided only for the latest assistant turn (re-runs the last prompt). */
   onRegenerate?: () => void;
-  /** Optional custom renderer for steps. If not provided, uses default StepItem. */
+  /** Optional custom renderer for a single step. If not provided, uses default StepItem. */
   renderStep?: (step: Step) => React.ReactNode;
+  /** Optional custom renderer for the WHOLE steps array (overrides renderStep). Lets a mode
+   *  group steps — e.g. swarm wraps each sub-agent's contiguous run in a coloured bubble. */
+  renderSteps?: (steps: Step[]) => React.ReactNode;
 }) {
   const isUser = message.role === "user";
   const steps = message.steps ?? [];
@@ -150,15 +163,18 @@ export function ChatBubble({
   return (
     <div className={cn("group flex w-full", isUser ? "justify-end" : "justify-start")}>
       <div className={cn("max-w-[80%] space-y-2", isUser ? "items-end" : "items-start")}>
-        {!isUser && steps.length > 0 && (
-          <div className="space-y-1.5">
-            {steps.map((s) => (
-              <React.Fragment key={s.id}>
-                {renderStep ? renderStep(s) : <StepItem step={s} />}
-              </React.Fragment>
-            ))}
-          </div>
-        )}
+        {!isUser && steps.length > 0 &&
+          (renderSteps ? (
+            renderSteps(steps)
+          ) : (
+            <div className="space-y-1.5">
+              {steps.map((s) => (
+                <React.Fragment key={s.id}>
+                  {renderStep ? renderStep(s) : <StepItem step={s} />}
+                </React.Fragment>
+              ))}
+            </div>
+          ))}
 
         {(message.content || (!isUser && empty && message.streaming)) && (
           <div

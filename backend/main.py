@@ -14,7 +14,6 @@ import os
 import sys
 from typing import Any, AsyncIterator
 
-from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.messages import (
@@ -34,6 +33,7 @@ from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.embeddings import Embedder
 from backend.model_selection import resolve_model
+from backend.serialization import _jsonable
 from backend.skills.document_capability import build_documents
 from backend.skills.graph_capability import build_memory
 from backend.skills.ontology_capability import build_ontology
@@ -55,6 +55,10 @@ DEFAULT_EFFORT = "minimal"
 # memory agent; "research" overlays the deep-research method; "swarm" adds the orchestrator tools.
 MODES = ["regular", "research", "swarm"]
 DEFAULT_MODE = "regular"
+
+# Drain-loop terminator for stream_run: the background parent task pushes this last so the
+# consumer knows no more frames are coming. Identity-compared, never serialized.
+_STREAM_SENTINEL: Any = object()
 
 
 def compose_instructions(system_prompt: str | None = None) -> str:
@@ -139,25 +143,6 @@ def _to_message_history(rows: list[dict[str, Any]]) -> list[ModelMessage]:
         except Exception:  # noqa: BLE001 — a single bad blob must not blind the agent to the rest.
             logger.warning("skipping unparseable run-message blob", exc_info=True)
     return history
-
-
-def _jsonable(value: Any) -> Any:
-    """Coerce arbitrary tool args/results into something JSON-serializable for an SSE frame.
-
-    Tool results can be any Python value — including Pydantic models or containers OF models
-    (e.g. list_documents returns ``list[DocumentInfo]``; passing that list through untouched
-    made ``json.dumps`` kill the stream). Models dump to plain dicts, containers recurse,
-    JSON scalars pass through, and anything else is rendered as its ``str``.
-    """
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
 
 
 def _created_frame(info: Any) -> dict[str, Any] | None:
@@ -279,6 +264,10 @@ async def stream_run(
             logger.warning("system-prompt lookup failed; using base prompt", exc_info=True)
             system_prompt = ""
         agent = build_agent(model, effort, mode=mode, system_prompt=system_prompt)
+        # Live trace channel: the parent run AND every sub-agent (run_subagent) push frames onto
+        # this one queue, so swarm sub-agents' thinking/tool calls interleave with the
+        # orchestrator's in true arrival order (see the drain loop below).
+        sink: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
         deps = GraphDependencies(
             db=db,
             user_id=user_id,
@@ -286,6 +275,7 @@ async def stream_run(
             web=web,
             embedder=embedder,
             model=model,
+            event_sink=sink,
         )
 
         # Load the prior turns of this thread so the agent retains context. The
@@ -300,51 +290,86 @@ async def stream_run(
         # Args of in-flight tool calls, keyed by tool_call_id — _document_event needs the
         # document_id from update_document's *arguments* (its return is just a string).
         call_args: dict[str, dict[str, Any]] = {}
-        async with agent.run_stream_events(prompt, deps=deps, message_history=history) as stream:
-            async for event in stream:
-                if isinstance(event, FunctionToolCallEvent):
-                    call_args[event.part.tool_call_id] = event.part.args_as_dict() or {}
-                    yield {
-                        "type": "tool_call",
-                        "tool_name": event.part.tool_name,
-                        "tool_call_id": event.part.tool_call_id,
-                        "args": _jsonable(event.part.args),
-                    }
-                    continue
-                if isinstance(event, FunctionToolResultEvent):
-                    part = event.part
-                    tool_name = getattr(part, "tool_name", None)
-                    yield {
-                        "type": "tool_result",
-                        "tool_name": tool_name,
-                        "tool_call_id": getattr(part, "tool_call_id", None),
-                        "content": _jsonable(getattr(part, "content", None)),
-                    }
-                    for doc in _document_events(
-                        tool_name,
-                        getattr(part, "content", None),
-                        call_args.get(getattr(part, "tool_call_id", None) or ""),
-                    ):
-                        yield doc
-                    continue
 
-                node = event
-                if isinstance(event, PartStartEvent):
-                    node = event.part
-                elif isinstance(event, PartDeltaEvent):
-                    node = event.delta
+        def _emit_parent(event: Any) -> None:
+            """Map one orchestrator event to frames and push them onto the sink (untagged).
 
-                if isinstance(node, ThinkingPartDelta):
-                    if node.content_delta:
-                        yield {"type": "thinking", "delta": node.content_delta}
-                elif isinstance(node, TextPart):
-                    final_text += node.content
-                    yield {"type": "text", "delta": node.content}
-                elif isinstance(node, TextPartDelta):
-                    final_text += node.content_delta
-                    yield {"type": "text", "delta": node.content_delta}
+            Untagged frames (no ``agent_id``) are the orchestrator's own work; sub-agents push
+            their own tagged frames onto the same sink from run_subagent.
+            """
+            nonlocal final_text
+            if isinstance(event, FunctionToolCallEvent):
+                call_args[event.part.tool_call_id] = event.part.args_as_dict() or {}
+                sink.put_nowait({
+                    "type": "tool_call",
+                    "tool_name": event.part.tool_name,
+                    "tool_call_id": event.part.tool_call_id,
+                    "args": _jsonable(event.part.args),
+                })
+                return
+            if isinstance(event, FunctionToolResultEvent):
+                part = event.part
+                tool_name = getattr(part, "tool_name", None)
+                sink.put_nowait({
+                    "type": "tool_result",
+                    "tool_name": tool_name,
+                    "tool_call_id": getattr(part, "tool_call_id", None),
+                    "content": _jsonable(getattr(part, "content", None)),
+                })
+                for doc in _document_events(
+                    tool_name,
+                    getattr(part, "content", None),
+                    call_args.get(getattr(part, "tool_call_id", None) or ""),
+                ):
+                    sink.put_nowait(doc)
+                return
 
-        yield {"type": "final", "text": final_text}
+            node = event
+            if isinstance(event, PartStartEvent):
+                node = event.part
+            elif isinstance(event, PartDeltaEvent):
+                node = event.delta
+
+            if isinstance(node, ThinkingPartDelta):
+                if node.content_delta:
+                    sink.put_nowait({"type": "thinking", "delta": node.content_delta})
+            elif isinstance(node, TextPart):
+                final_text += node.content
+                sink.put_nowait({"type": "text", "delta": node.content})
+            elif isinstance(node, TextPartDelta):
+                final_text += node.content_delta
+                sink.put_nowait({"type": "text", "delta": node.content_delta})
+
+        async def _drive() -> None:
+            """Run the parent agent, feeding frames onto the sink; always end with the sentinel."""
+            try:
+                async with agent.run_stream_events(
+                    prompt, deps=deps, message_history=history
+                ) as stream:
+                    async for event in stream:
+                        _emit_parent(event)
+                sink.put_nowait({"type": "final", "text": final_text})
+            finally:
+                sink.put_nowait(_STREAM_SENTINEL)
+
+        task = asyncio.create_task(_drive())
+        try:
+            while True:
+                item = await sink.get()
+                if item is _STREAM_SENTINEL:
+                    break
+                yield item
+        finally:
+            # On a clean finish the task is already done; on early generator close (client
+            # disconnect / abort) cancel it so the background run doesn't leak and hold the
+            # db/web/embedder contexts (and sandbox containers) open. await re-raises any parent
+            # exception so the API layer can emit an {"type": "error"} frame.
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def run(prompt: str, user_id: str = "default", conversation_id: str = "default") -> str:

@@ -4,6 +4,7 @@ import { Brain, ChevronRight, FileText } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Step } from "@/types";
 import { ToolChip } from "@/components/ToolChip";
+import { Markdown } from "@/components/Markdown";
 import { useApp } from "@/state/AppContext";
 import { SwarmTaskBoard } from "./SwarmTaskBoard";
 import { RunAgentCard } from "./RunAgentCard";
@@ -75,6 +76,15 @@ export function SwarmStepItem({ step }: { step: Step }) {
   }
   if (step.kind === "document") {
     return <DocumentCard step={step} />;
+  }
+  if (step.kind === "agent_text") {
+    // A sub-agent's streamed report (its reply to the orchestrator), shown inside its bubble.
+    if (!step.text.trim()) return null;
+    return (
+      <div className="prose prose-invert prose-sm max-w-none rounded-lg border border-white/10 bg-slate-900/40 px-2.5 py-2 text-xs">
+        <Markdown>{step.text}</Markdown>
+      </div>
+    );
   }
 
   // Tool steps: route based on tool name

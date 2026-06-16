@@ -431,6 +431,84 @@ def test_capabilities_for_skips_unknown_groups() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# run_subagent live-trace streaming (event_sink path)
+# --------------------------------------------------------------------------- #
+def _drain(queue: "asyncio.Queue[dict[str, Any]]") -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    while not queue.empty():
+        frames.append(queue.get_nowait())
+    return frames
+
+
+def test_run_subagent_streams_tagged_frames_to_sink() -> None:
+    from dataclasses import replace
+
+    sink: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
+    deps = replace(_deps(FakeDb()), event_sink=sink)
+    outcome = asyncio.run(
+        run_subagent(
+            deps,
+            instructions="You are a test agent.",
+            tool_groups=["documents"],
+            prompt="go",
+            model=TestModel(call_tools=["create_document"], custom_output_text="done"),
+            agent_id="a1",
+            agent_name="market-researcher",
+            instance_id="abc123",
+        )
+    )
+    assert outcome.error is None and outcome.output == "done"
+
+    frames = _drain(sink)
+    types = [f["type"] for f in frames]
+    assert types[0] == "agent_start" and types[-1] == "agent_end"
+    assert {"tool_call", "tool_result", "text"} <= set(types)
+    # Every frame is tagged with this delegate's identity.
+    assert all(
+        f["agent_id"] == "a1"
+        and f["name"] == "market-researcher"
+        and f["instance_id"] == "abc123"
+        for f in frames
+    )
+    # Tool ids are instance-namespaced so the UI never collides them with the parent/siblings.
+    call = next(f for f in frames if f["type"] == "tool_call")
+    result = next(f for f in frames if f["type"] == "tool_result")
+    assert call["tool_call_id"].startswith("abc123:")
+    assert result["tool_call_id"].startswith("abc123:")
+    # Documents ride back on the report (orchestrator _document_events), not the live trace.
+    assert "document" not in types
+
+
+def test_run_subagent_sink_path_swallows_failure_but_closes_bubble() -> None:
+    from dataclasses import replace
+
+    from pydantic_ai.models.function import FunctionModel
+
+    async def boom_stream(messages: Any, info: Any) -> Any:
+        raise RuntimeError("provider down")
+        yield ""  # pragma: no cover — marks this an async generator (a streaming model)
+
+    sink: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
+    deps = replace(_deps(FakeDb()), event_sink=sink)
+    outcome = asyncio.run(
+        run_subagent(
+            deps,
+            instructions="x",
+            tool_groups=[],
+            prompt="go",
+            model=FunctionModel(stream_function=boom_stream),
+            agent_id="a1",
+            agent_name="r",
+            instance_id="i1",
+        )
+    )
+    assert outcome.error and "provider down" in outcome.error
+    types = [f["type"] for f in _drain(sink)]
+    # The bubble always opens and closes, even when the delegate blows up mid-run.
+    assert types[0] == "agent_start" and types[-1] == "agent_end"
+
+
+# --------------------------------------------------------------------------- #
 # Conversation modes (repository)
 # --------------------------------------------------------------------------- #
 def test_create_conversation_stores_mode() -> None:

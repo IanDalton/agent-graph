@@ -25,12 +25,24 @@ export interface ToolEvent {
   done: boolean;
 }
 
+/** Identity of the sub-agent that produced a step/frame in swarm mode. `undefined` on a step
+ *  means the orchestrator (the main agent) produced it. `instanceId` is per-dispatch, so the
+ *  same spec dispatched twice concurrently stays in two separate bubbles. */
+export interface AgentRef {
+  agentId: string;
+  name: string;
+  instanceId: string;
+}
+
 /** One node of the agent's chronological execution chain. Thinking runs and tool
  *  calls are kept in arrival order so the UI can render `thinking → tool → thinking`
- *  exactly as it streamed, rather than collapsing reasoning into a single block. */
+ *  exactly as it streamed, rather than collapsing reasoning into a single block.
+ *  In swarm mode each step carries the `agent` that produced it (undefined = orchestrator);
+ *  a sub-agent's streamed report text becomes an `agent_text` step inside its bubble. */
 export type Step =
-  | { id: string; kind: "thinking"; text: string }
-  | { id: string; kind: "tool"; tool: ToolEvent }
+  | { id: string; kind: "thinking"; text: string; agent?: AgentRef }
+  | { id: string; kind: "agent_text"; text: string; agent?: AgentRef }
+  | { id: string; kind: "tool"; tool: ToolEvent; agent?: AgentRef }
   | {
       id: string;
       kind: "document";
@@ -38,6 +50,7 @@ export type Step =
       title: string;
       mimeType: string;
       action: "created" | "updated";
+      agent?: AgentRef;
     };
 
 /** A rendered chat turn. The assistant turn additionally carries its ordered
@@ -49,17 +62,29 @@ export interface ChatMessage {
   content: string;
   /** Ordered reasoning/tool chain (assistant turns only). */
   steps?: Step[];
+  /** Swarm-mode per-instance run state, keyed by instanceId — drives each agent bubble's
+   *  running spinner (set on agent_start, cleared on agent_end). */
+  agents?: Record<string, { name: string; running: boolean }>;
   streaming?: boolean;
   error?: string;
 }
 
 /** The stable streaming vocabulary emitted by the backend `stream_run` generator
- *  (see backend/main.py). Mirrored here so the UI never couples to Pydantic AI. */
+ *  (see backend/main.py). Mirrored here so the UI never couples to Pydantic AI.
+ *  In swarm mode, sub-agent frames carry `agent_id`/`name`/`instance_id` (orchestrator frames
+ *  omit them), plus `agent_start`/`agent_end` lifecycle frames bracket each delegate's run. */
+export type AgentTag = { agent_id?: string; name?: string; instance_id?: string };
+
 export type StreamEvent =
-  | { type: "thinking"; delta: string }
-  | { type: "text"; delta: string }
-  | { type: "tool_call"; tool_name: string; tool_call_id: string; args: unknown }
-  | { type: "tool_result"; tool_name: string | null; tool_call_id: string | null; content: unknown }
+  | ({ type: "thinking"; delta: string } & AgentTag)
+  | ({ type: "text"; delta: string } & AgentTag)
+  | ({ type: "tool_call"; tool_name: string; tool_call_id: string; args: unknown } & AgentTag)
+  | ({
+      type: "tool_result";
+      tool_name: string | null;
+      tool_call_id: string | null;
+      content: unknown;
+    } & AgentTag)
   | {
       type: "document";
       action: "created" | "updated";
@@ -67,8 +92,29 @@ export type StreamEvent =
       title: string;
       mime_type: string;
     }
+  | { type: "agent_start"; agent_id: string; name: string; instance_id: string }
+  | { type: "agent_end"; agent_id: string; name: string; instance_id: string }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
+
+/** Live swarm activity for the orchestrator→agents flow diagram (ContextPane). Built from the
+ *  stream's agent_start/agent_end/tool_* frames and shared via AppContext, so the right pane can
+ *  render the fan-out while the chat shows the per-agent traces. Ephemeral (reset each turn). */
+export interface SwarmAgentNode {
+  agentId: string;
+  name: string;
+  instanceId: string;
+  status: "running" | "done";
+  /** Number of tool calls this agent has made so far (a rough "how busy" signal). */
+  toolCount: number;
+}
+
+export interface SwarmFlowState {
+  /** True while the orchestrator turn is still streaming. */
+  active: boolean;
+  /** Dispatched sub-agents, keyed by instanceId (so concurrent same-spec dispatches stay separate). */
+  agents: Record<string, SwarmAgentNode>;
+}
 
 export interface AppConfig {
   model: string;

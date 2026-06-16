@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.db.arcade_db import ArcadeClient
 
@@ -46,3 +47,9 @@ class GraphDependencies:
     # Swarm/deep-research sub-agents read it so delegated work runs on the same model the user
     # chose for the conversation; None means the env-configured default.
     model: str | None = None
+    # Live sub-agent trace side-channel. When set (swarm/streamed runs), run_subagent pushes
+    # tagged event frames (thinking/tool_call/tool_result/agent_start/agent_end) onto it so
+    # stream_run can multiplex each delegate's work into the UI in real time. None means no live
+    # tracing (CLI / non-streamed / tests) — sub-agents run via the plain blocking path.
+    # Run-scoped, and copied through dataclasses.replace() so nested dispatches share one sink.
+    event_sink: "asyncio.Queue[dict[str, Any]] | None" = None

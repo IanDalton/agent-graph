@@ -5,10 +5,8 @@ import { useChat } from "@/hooks/useChat";
 import { ChatBubble } from "@/components/ChatBubble";
 import { Composer } from "@/components/Composer";
 import { ModeIcon } from "@/components/ModeIcon";
-import type { Conversation, Step } from "@/types";
-import { SwarmStepItem } from "@/swarm/SwarmStepItem";
-
-const renderSwarmStep = (step: Step) => <SwarmStepItem step={step} />;
+import type { Conversation } from "@/types";
+import { SwarmSteps } from "@/swarm/SwarmSteps";
 
 export function SwarmCanvas({
   conversation,
@@ -69,7 +67,7 @@ export function SwarmCanvas({
               <ChatBubble
                 key={m.id}
                 message={m}
-                renderStep={renderSwarmStep}
+                renderSteps={(steps) => <SwarmSteps steps={steps} agents={m.agents} />}
                 onRegenerate={isLastAssistant && !sending ? regenerate : undefined}
               />
             );

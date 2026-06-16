@@ -8,7 +8,7 @@ import {
 } from "react";
 
 import { api } from "@/api/client";
-import type { AppConfig, Conversation, Mode } from "@/types";
+import type { AppConfig, Conversation, Mode, SwarmFlowState } from "@/types";
 
 // Single source of the current user. Hardcoded for now; swapping in real auth later
 // is a one-line change here, and every call already threads the id through.
@@ -40,6 +40,10 @@ interface AppState {
    *  user clicks a document card in the chat). */
   featuredDoc: FeaturedDoc | null;
   featureDocument: (id: string) => void;
+  /** Live orchestrator→agents activity for the swarm flow diagram (ContextPane). Updated by
+   *  useChat as frames stream; null when no swarm turn is in flight. */
+  swarmFlow: SwarmFlowState | null;
+  setSwarmFlow: (flow: SwarmFlowState | null) => void;
   /** Selected model label, or "" to use the backend default. Sent per chat request. */
   model: string;
   setModel: (model: string) => void;
@@ -67,6 +71,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [pendingNewChat, setPendingNewChat] = useState(false);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [featuredDoc, setFeaturedDoc] = useState<FeaturedDoc | null>(null);
+  const [swarmFlow, setSwarmFlow] = useState<SwarmFlowState | null>(null);
 
   const featureDocument = useCallback((id: string) => {
     setFeaturedDoc({ id, ts: Date.now() });
@@ -115,6 +120,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const openNewChatPicker = useCallback(() => {
     setActiveId(null);
     setFeaturedDoc(null);
+    setSwarmFlow(null);
     setPendingNewChat(true);
   }, []);
 
@@ -123,12 +129,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setConversations((prev) => [convo, ...prev]);
     setActiveId(convo.conversation_id);
     setFeaturedDoc(null);
+    setSwarmFlow(null);
     setPendingNewChat(false);
   }, []);
 
   const selectConversation = useCallback((id: string) => {
     setActiveId(id);
     setFeaturedDoc(null);
+    setSwarmFlow(null);
     setPendingNewChat(false);
   }, []);
 
@@ -190,6 +198,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         config,
         featuredDoc,
         featureDocument,
+        swarmFlow,
+        setSwarmFlow,
         model,
         setModel,
         effort,

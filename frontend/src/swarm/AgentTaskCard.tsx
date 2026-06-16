@@ -3,6 +3,7 @@ import { AlertCircle, CheckCircle2, ChevronRight, FileText, Loader2 } from "luci
 
 import { cn } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
+import { colorForAgent } from "./agentColors";
 import type { AgentRunReport, AgentTask } from "./swarmTypes";
 
 export function AgentTaskCard({
@@ -17,6 +18,7 @@ export function AgentTaskCard({
   const [outputOpen, setOutputOpen] = useState(false);
   const isLoading = report === null;
   const isError = report?.error;
+  const color = colorForAgent(report?.agent_id || task.agent);
 
   return (
     <div className="rounded-lg border border-white/10 bg-slate-900/40 overflow-hidden">
@@ -26,7 +28,8 @@ export function AgentTaskCard({
           <span className="text-[10px] font-mono uppercase tracking-wide text-muted-foreground">
             Task {index + 1}
           </span>
-          <span className="inline-flex gap-1 rounded px-1.5 py-0.5 bg-sky-500/20 text-sky-300 text-xs font-mono">
+          <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-mono", color.text)}>
+            <span className={cn("inline-block size-2 rounded-full", color.dot)} />
             {report?.name || task.agent}
           </span>
         </div>

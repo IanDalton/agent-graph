@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from uuid import uuid4
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.capabilities import Capability
@@ -135,11 +136,16 @@ async def _dispatch(deps: GraphDependencies, task: AgentTask) -> AgentRunReport:
     prompt = task.task
     if task.context:
         prompt += f"\n\nCONTEXT FROM THE ORCHESTRATOR:\n{task.context}"
+    # A per-dispatch instance id distinguishes concurrent dispatches of the SAME spec in a
+    # run_swarm batch (so the live UI groups and namespaces each one separately).
     outcome = await run_subagent(
         deps,
         instructions=_subagent_system_prompt(row),
         tool_groups=list(row.get("tools") or []),
         prompt=prompt,
+        agent_id=row.get("agent_id", task.agent),
+        agent_name=row.get("name") or task.agent,
+        instance_id=uuid4().hex[:8],
     )
     return AgentRunReport(
         agent_id=row.get("agent_id", task.agent),
@@ -276,6 +282,9 @@ async def deep_research(
         tool_groups=["web", "documents"],
         prompt=prompt,
         request_limit=DEEP_RESEARCH_REQUEST_LIMIT,
+        agent_id="deep_research",
+        agent_name="deep-research",
+        instance_id=uuid4().hex[:8],
     )
     documents = outcome.documents
     # Guarantee a saved report even when the delegate forgot to call create_document: persist its
