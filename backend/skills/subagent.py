@@ -39,6 +39,7 @@ from pydantic_ai.usage import UsageLimits
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.model_selection import resolve_model
+from backend.reasoning_split import ReasoningSplitter
 from backend.schemas.document_schemas import DocumentInfo
 from backend.schemas.swarm_schemas import AgentRunReport, SendMessageArgs
 from backend.serialization import _jsonable
@@ -333,6 +334,18 @@ async def run_subagent(
             logger.warning("sub-agent event_sink push failed; dropping frame", exc_info=True)
 
     output = ""
+    # Repair reasoning leaked across channels via literal <think>/</think> tags (e.g. Ollama
+    # qwen3), so a delegate's report text is the answer only, not its trapped chain-of-thought.
+    splitter = ReasoningSplitter()
+
+    def route(channel: str, text: str) -> None:
+        nonlocal output
+        if not text:
+            return
+        if channel == "text":
+            output += text
+        emit({"type": channel, "delta": text})
+
     emit({"type": "agent_start"})
     try:
         async with agent.run_stream_events(
@@ -370,13 +383,17 @@ async def run_subagent(
 
                 if isinstance(node, ThinkingPartDelta):
                     if node.content_delta:
-                        emit({"type": "thinking", "delta": node.content_delta})
+                        for channel, text in splitter.feed_thinking(node.content_delta):
+                            route(channel, text)
                 elif isinstance(node, TextPart):
-                    output += node.content
-                    emit({"type": "text", "delta": node.content})
+                    for channel, text in splitter.feed_text(node.content):
+                        route(channel, text)
                 elif isinstance(node, TextPartDelta):
-                    output += node.content_delta
-                    emit({"type": "text", "delta": node.content_delta})
+                    for channel, text in splitter.feed_text(node.content_delta):
+                        route(channel, text)
+        # Release any partial-tag tail the splitter held back at the very end.
+        for channel, text in splitter.flush():
+            route(channel, text)
     except Exception as exc:  # noqa: BLE001 — a broken delegate must never abort the orchestrator.
         logger.warning("sub-agent run failed: %s: %s", type(exc).__name__, exc, exc_info=True)
         return SubagentOutcome(

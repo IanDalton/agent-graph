@@ -33,6 +33,7 @@ from backend.db.arcade_db import ArcadeClient, database_name_for_user
 from backend.db.dependencies import GraphDependencies
 from backend.embeddings import Embedder
 from backend.model_selection import resolve_model
+from backend.reasoning_split import ReasoningSplitter
 from backend.serialization import _jsonable
 from backend.skills.document_capability import build_documents
 from backend.skills.graph_capability import build_memory
@@ -299,6 +300,19 @@ async def stream_run(
         # Args of in-flight tool calls, keyed by tool_call_id — _document_event needs the
         # document_id from update_document's *arguments* (its return is just a string).
         call_args: dict[str, dict[str, Any]] = {}
+        # Repairs reasoning models that leak their chain-of-thought across channels via literal
+        # <think>/</think> tags (e.g. Ollama qwen3), so the answer never gets trapped in the
+        # thinking column. A no-op for providers that split the channels natively.
+        splitter = ReasoningSplitter()
+
+        def _route(channel: str, text: str) -> None:
+            """Emit a routed chunk, accumulating the user-facing answer into ``final_text``."""
+            nonlocal final_text
+            if not text:
+                return
+            if channel == "text":
+                final_text += text
+            sink.put_nowait({"type": channel, "delta": text})
 
         def _emit_parent(event: Any) -> None:
             """Map one orchestrator event to frames and push them onto the sink (untagged).
@@ -341,13 +355,14 @@ async def stream_run(
 
             if isinstance(node, ThinkingPartDelta):
                 if node.content_delta:
-                    sink.put_nowait({"type": "thinking", "delta": node.content_delta})
+                    for channel, text in splitter.feed_thinking(node.content_delta):
+                        _route(channel, text)
             elif isinstance(node, TextPart):
-                final_text += node.content
-                sink.put_nowait({"type": "text", "delta": node.content})
+                for channel, text in splitter.feed_text(node.content):
+                    _route(channel, text)
             elif isinstance(node, TextPartDelta):
-                final_text += node.content_delta
-                sink.put_nowait({"type": "text", "delta": node.content_delta})
+                for channel, text in splitter.feed_text(node.content_delta):
+                    _route(channel, text)
 
         async def _drive() -> None:
             """Run the parent agent, feeding frames onto the sink; always end with the sentinel."""
@@ -357,6 +372,9 @@ async def stream_run(
                 ) as stream:
                     async for event in stream:
                         _emit_parent(event)
+                # Release any partial-tag tail the splitter held back at the very end.
+                for channel, text in splitter.flush():
+                    _route(channel, text)
                 sink.put_nowait({"type": "final", "text": final_text})
             finally:
                 sink.put_nowait(_STREAM_SENTINEL)
