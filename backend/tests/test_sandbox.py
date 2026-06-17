@@ -223,7 +223,9 @@ def test_run_falls_back_to_base_image_when_unbuilt(monkeypatch: pytest.MonkeyPat
     """A missing agent-sandbox image retries once on python:3.12-slim with a note."""
     attempts: list[str] = []
 
-    async def fake_run_once(self: PythonSandbox, code: str, image: str, timeout: float) -> SandboxResult:
+    async def fake_run_once(
+        self: PythonSandbox, code: str, image: str, timeout: float, skills_dir: str | None = None
+    ) -> SandboxResult:
         attempts.append(image)
         if image == DEFAULT_IMAGE:
             return SandboxResult(

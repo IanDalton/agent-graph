@@ -229,6 +229,9 @@ class ArcadeClient:
             # Swarm sub-agent definitions (name, role, system prompt, tool grants) — the roster the
             # swarm orchestrator builds and dispatches. See repository.create_agent_spec.
             "CREATE VERTEX TYPE AgentSpec IF NOT EXISTS",
+            # Marketplace skills synced from the Anthropic Agent Skills catalog: a skill's
+            # instructions body + its bundled files, enabled per-conversation. See repository.create_skill.
+            "CREATE VERTEX TYPE Skill IF NOT EXISTS",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
@@ -240,6 +243,8 @@ class ArcadeClient:
             "CREATE EDGE TYPE HAS_NODE IF NOT EXISTS",
             # Links the User to their swarm sub-agent definitions.
             "CREATE EDGE TYPE HAS_AGENT IF NOT EXISTS",
+            # Links the User to their synced marketplace skills.
+            "CREATE EDGE TYPE HAS_SKILL IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
             "CREATE PROPERTY User.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON User (user_id) UNIQUE",
@@ -268,6 +273,10 @@ class ArcadeClient:
             # The agency communication chart: the names of teammates this specialist may
             # send_message to. Missing/NULL on pre-agency rows reads back as no edges (a leaf).
             "CREATE PROPERTY AgentSpec.recipients IF NOT EXISTS LIST",
+            "CREATE PROPERTY Skill.skill_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Skill (skill_id) UNIQUE",
+            "CREATE PROPERTY Skill.user_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Skill (user_id) NOTUNIQUE",
             # Non-unique lookup indexes used by the repository queries.
             "CREATE PROPERTY Message.conversation_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (conversation_id) NOTUNIQUE",

@@ -135,9 +135,17 @@ class PythonSandbox:
         self.cpus = cpus or os.getenv("SANDBOX_CPUS", DEFAULT_CPUS)
         self.network = network or os.getenv("SANDBOX_NETWORK", DEFAULT_NETWORK)
 
-    def _docker_args(self, name: str, image: str, out_dir: str) -> list[str]:
-        """The full ``docker run`` argv for one execution (code arrives on stdin)."""
-        return [
+    def _docker_args(
+        self, name: str, image: str, out_dir: str, skills_dir: str | None = None
+    ) -> list[str]:
+        """The full ``docker run`` argv for one execution (code arrives on stdin).
+
+        When ``skills_dir`` is given, the enabled skills' files are bind-mounted READ-ONLY at
+        ``/skills`` (exported as ``$SKILLS_DIR``). The mount is ``:ro`` and adds no capability, so
+        every other hardening flag (no network, dropped caps, read-only root, non-root user,
+        resource caps) is unchanged.
+        """
+        args = [
             "docker", "run", "--rm", "-i",
             "--name", name,
             "--network", self.network,
@@ -150,6 +158,10 @@ class PythonSandbox:
             "--read-only",
             "--tmpfs", "/tmp:rw,size=64m",
             "--volume", f"{out_dir}:/out",
+        ]
+        if skills_dir is not None:
+            args += ["--volume", f"{skills_dir}:/skills:ro", "--env", "SKILLS_DIR=/skills"]
+        args += [
             "--workdir", "/tmp",
             "--user", "65534:65534",  # nobody
             "--env", "HOME=/tmp",
@@ -157,16 +169,23 @@ class PythonSandbox:
             image,
             "python", "-I", "-",  # isolated mode, program from stdin
         ]
+        return args
 
-    async def run(self, code: str, timeout_seconds: float | None = None) -> SandboxResult:
+    async def run(
+        self,
+        code: str,
+        timeout_seconds: float | None = None,
+        skills_dir: str | None = None,
+    ) -> SandboxResult:
         """Execute ``code`` in a fresh container and return its captured output + /out files.
 
         Never raises for expected failures — see the module docstring's failure contract. When
         the project image (``agent-sandbox``) isn't built yet, retries once on the stdlib-only
-        base image so plain Python still works.
+        base image so plain Python still works. ``skills_dir`` (when given) is mounted read-only at
+        ``/skills`` so enabled skills' bundled scripts/assets are available to the code.
         """
         timeout = min(timeout_seconds or self.timeout_seconds, 120.0)
-        result = await self._run_once(code, self.image, timeout)
+        result = await self._run_once(code, self.image, timeout, skills_dir)
         if (
             self.image == DEFAULT_IMAGE
             and result.exit_code not in (0, None)
@@ -177,14 +196,16 @@ class PythonSandbox:
                 "falling back to %r (stdlib only, no PDF libs)",
                 self.image, FALLBACK_IMAGE,
             )
-            result = await self._run_once(code, FALLBACK_IMAGE, timeout)
+            result = await self._run_once(code, FALLBACK_IMAGE, timeout, skills_dir)
             result.notes.append(
                 f"Ran on the fallback image {FALLBACK_IMAGE} (stdlib only): the {DEFAULT_IMAGE} "
                 "image with PDF support is not built. Third-party imports like fpdf will fail."
             )
         return result
 
-    async def _run_once(self, code: str, image: str, timeout: float) -> SandboxResult:
+    async def _run_once(
+        self, code: str, image: str, timeout: float, skills_dir: str | None = None
+    ) -> SandboxResult:
         name = f"agent-sandbox-{uuid.uuid4().hex[:12]}"
         with tempfile.TemporaryDirectory(prefix="agent-sandbox-out-") as out_dir:
             # The container runs as 'nobody'; on Linux hosts the bind-mounted dir must be
@@ -195,7 +216,7 @@ class PythonSandbox:
                 pass
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *self._docker_args(name, image, out_dir),
+                    *self._docker_args(name, image, out_dir, skills_dir),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

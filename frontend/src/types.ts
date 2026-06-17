@@ -12,6 +12,32 @@ export interface Conversation {
   /** Per-conversation swarm bounds (swarm mode); null/undefined ⇒ use the config default. */
   swarm_max_parallel?: number | null;
   swarm_max_depth?: number | null;
+  /** Marketplace skills enabled for this conversation (by skill name). */
+  enabled_skills?: string[];
+}
+
+/** A marketplace skill the user has synced into their database (GET /api/skills, metadata only). */
+export interface SkillInfo {
+  skill_id?: string;
+  name: string;
+  description: string;
+  source?: string;
+  synced_at?: string;
+}
+
+/** Result of a marketplace sync (POST /api/skills/sync). */
+export interface SkillSyncResult {
+  synced: string[];
+  errors: { name: string; error: string }[];
+  source: string;
+}
+
+/** One skill in the live marketplace catalog (GET /api/skills/catalog). `installed` is true when the
+ *  user has already synced it into their library. */
+export interface CatalogSkill {
+  name: string;
+  description: string;
+  installed: boolean;
 }
 
 /** A user-uploaded file attached to a message. During the live turn `data` holds the base64 bytes

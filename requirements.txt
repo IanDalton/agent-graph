@@ -4,3 +4,4 @@ httpx
 python-dotenv
 fastapi
 uvicorn[standard]
+pyyaml

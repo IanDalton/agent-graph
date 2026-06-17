@@ -8,7 +8,14 @@ import {
 } from "react";
 
 import { api } from "@/api/client";
-import type { AppConfig, Conversation, Mode, SwarmFlowState } from "@/types";
+import type {
+  AppConfig,
+  CatalogSkill,
+  Conversation,
+  Mode,
+  SkillInfo,
+  SwarmFlowState,
+} from "@/types";
 
 // Single source of the current user. Hardcoded for now; swapping in real auth later
 // is a one-line change here, and every call already threads the id through.
@@ -63,7 +70,29 @@ interface AppState {
     id: string,
     patch: { swarm_max_parallel?: number; swarm_max_depth?: number }
   ) => Promise<void>;
+  /** Set the marketplace skills enabled for a conversation; persists, takes effect next turn. */
+  setConversationSkills: (id: string, names: string[]) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
+  /** The marketplace skills this user has synced (their library). */
+  skills: SkillInfo[];
+  /** True while a marketplace sync is in flight (drives the Sync button's spinner). */
+  syncingSkills: boolean;
+  /** Re-fetch the synced skills list. */
+  refreshSkills: () => Promise<void>;
+  /** Sync ALL skills from the marketplace into the user's DB, then refresh the list. */
+  syncSkills: () => Promise<void>;
+  /** Whether the Skill Marketplace dialog is open. */
+  skillMarketplaceOpen: boolean;
+  openSkillMarketplace: () => void;
+  closeSkillMarketplace: () => void;
+  /** The live marketplace catalog (name + description + installed) shown in the dialog. */
+  catalog: CatalogSkill[];
+  /** True while the catalog is being fetched from GitHub. */
+  catalogLoading: boolean;
+  /** Re-fetch the live marketplace catalog. */
+  refreshCatalog: () => Promise<void>;
+  /** Install a skill if needed and enable it on the active conversation. */
+  addSkillToChat: (name: string, installed: boolean) => Promise<void>;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -76,6 +105,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [featuredDoc, setFeaturedDoc] = useState<FeaturedDoc | null>(null);
   const [swarmFlow, setSwarmFlow] = useState<SwarmFlowState | null>(null);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [syncingSkills, setSyncingSkills] = useState(false);
+  const [skillMarketplaceOpen, setSkillMarketplaceOpen] = useState(false);
+  const [catalog, setCatalog] = useState<CatalogSkill[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
 
   const featureDocument = useCallback((id: string) => {
     setFeaturedDoc({ id, ts: Date.now() });
@@ -188,6 +222,90 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshConversations]
   );
 
+  const setConversationSkills = useCallback(
+    async (id: string, names: string[]) => {
+      // Optimistically store the selection on the local row; it takes effect on the next turn.
+      setConversations((prev) =>
+        prev.map((c) => (c.conversation_id === id ? { ...c, enabled_skills: names } : c))
+      );
+      try {
+        await api.updateConversation(id, USER_ID, { enabled_skills: names });
+      } catch (err) {
+        console.error("failed to update conversation skills", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [refreshConversations]
+  );
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      setSkills(await api.listSkills(USER_ID));
+    } catch (err) {
+      console.error("failed to load skills", err);
+    }
+  }, []);
+
+  const syncSkills = useCallback(async () => {
+    setSyncingSkills(true);
+    try {
+      await api.syncSkills(USER_ID);
+      setSkills(await api.listSkills(USER_ID));
+    } catch (err) {
+      console.error("failed to sync skills", err);
+    } finally {
+      setSyncingSkills(false);
+    }
+  }, []);
+
+  const refreshCatalog = useCallback(async () => {
+    setCatalogLoading(true);
+    try {
+      setCatalog(await api.getSkillCatalog(USER_ID));
+    } catch (err) {
+      console.error("failed to load skill catalog", err);
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, []);
+
+  const openSkillMarketplace = useCallback(() => {
+    setSkillMarketplaceOpen(true);
+    refreshCatalog().catch(() => {});
+  }, [refreshCatalog]);
+
+  const closeSkillMarketplace = useCallback(() => setSkillMarketplaceOpen(false), []);
+
+  const addSkillToChat = useCallback(
+    async (name: string, installed: boolean) => {
+      if (!activeId) return;
+      // Install into the library first if it isn't there yet (fetches just this one skill).
+      if (!installed) {
+        try {
+          await api.syncSkills(USER_ID, [name]);
+        } catch (err) {
+          console.error("failed to install skill", err);
+          return;
+        }
+      }
+      // Enable it on the active conversation (optimistic + persisted via setConversationSkills).
+      const conv = conversations.find((c) => c.conversation_id === activeId);
+      const enabled = conv?.enabled_skills ?? [];
+      if (!enabled.includes(name)) {
+        await setConversationSkills(activeId, [...enabled, name]);
+      }
+      // Refresh library + catalog so the installed flag reflects the new install.
+      refreshSkills().catch(() => {});
+      refreshCatalog().catch(() => {});
+    },
+    [activeId, conversations, setConversationSkills, refreshSkills, refreshCatalog]
+  );
+
+  // Load the synced-skill library once so the Configuration card has it.
+  useEffect(() => {
+    refreshSkills();
+  }, [refreshSkills]);
+
   // Initial load: fetch conversations and select the most recent (or create one).
   useEffect(() => {
     (async () => {
@@ -230,7 +348,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setConversationMode,
         setConversationSystemPrompt,
         setConversationSwarmSettings,
+        setConversationSkills,
         refreshConversations,
+        skills,
+        syncingSkills,
+        refreshSkills,
+        syncSkills,
+        skillMarketplaceOpen,
+        openSkillMarketplace,
+        closeSkillMarketplace,
+        catalog,
+        catalogLoading,
+        refreshCatalog,
+        addSkillToChat,
       }}
     >
       {children}

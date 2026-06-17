@@ -44,6 +44,7 @@ from backend.skills.ontology_capability import build_ontology
 from backend.skills.research_capability import build_research
 from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
+from backend.skills.skill_capability import build_skills
 from backend.skills.swarm_capability import build_swarm
 from backend.skills.system_prompt import BASE_SYSTEM_PROMPT, register_system_prompt
 from backend.web.client import WebClient, html_to_text
@@ -83,6 +84,7 @@ def build_agent(
     effort: str | None = None,
     mode: str | None = None,
     system_prompt: str | None = None,
+    enabled_skills: list[str] | None = None,
 ) -> Agent[GraphDependencies, str]:
     """Construct the agent.
 
@@ -105,6 +107,10 @@ def build_agent(
     ``system_prompt`` is the conversation's optional custom prompt, appended to
     :data:`BASE_SYSTEM_PROMPT` (see :func:`compose_instructions`). Main agent only — delegated
     sub-agents keep their own task-specific prompts.
+
+    ``enabled_skills`` are the marketplace skills turned on for the conversation. When non-empty
+    (and not in swarm mode) the Skills capability is added so the agent can ``load_skill`` and use
+    their bundled files; the names also ride on the deps for the per-turn description block.
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     mode = mode if mode in MODES else DEFAULT_MODE
@@ -112,18 +118,23 @@ def build_agent(
         resolve_model(model),
         deps_type=GraphDependencies,
         instructions=compose_instructions(system_prompt),
-        capabilities=_capabilities_for_mode(mode, effort),
+        capabilities=_capabilities_for_mode(mode, effort, enabled_skills),
     )
     # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
     register_system_prompt(agent)
     return agent
 
 
-def _capabilities_for_mode(mode: str, effort: str) -> list[Any]:
+def _capabilities_for_mode(
+    mode: str, effort: str, enabled_skills: list[str] | None = None
+) -> list[Any]:
     """The capability bundles for an agent profile (see :func:`build_agent` for the rationale).
 
     Factored out so the context-window meter can introspect the exact tool set a mode exposes
     without rebuilding the agent's other wiring.
+
+    When ``enabled_skills`` is non-empty (and not swarm mode) the Skills capability is appended so
+    the agent gets the ``load_skill`` tool; an empty list keeps it out of context.
     """
     if mode == "swarm":
         # Pure orchestrator: no web/sandbox/ontology/document tools, so it cannot do the work
@@ -141,6 +152,10 @@ def _capabilities_for_mode(mode: str, effort: str) -> list[Any]:
     ]
     if mode == "research":
         capabilities += build_research()
+    # Marketplace skills (progressive disclosure + sandbox-mounted files) when the conversation
+    # has any enabled. Skipped when none are on, so the load_skill tool stays out of context.
+    if enabled_skills:
+        capabilities += build_skills()
     return capabilities
 
 
@@ -447,7 +462,15 @@ async def stream_run(
         except Exception:  # noqa: BLE001 — a missing override must never block a turn.
             logger.warning("swarm-settings lookup failed; using defaults", exc_info=True)
             swarm = {}
-        agent = build_agent(model, effort, mode=mode, system_prompt=system_prompt)
+        # Marketplace skills enabled for this conversation; empty ⇒ the Skills capability is omitted.
+        try:
+            enabled_skills = await repo.get_conversation_enabled_skills(db, conversation_id)
+        except Exception:  # noqa: BLE001 — a missing selection must never block a turn.
+            logger.warning("enabled-skills lookup failed; using none", exc_info=True)
+            enabled_skills = []
+        agent = build_agent(
+            model, effort, mode=mode, system_prompt=system_prompt, enabled_skills=enabled_skills
+        )
         # Live trace channel: the parent run AND every sub-agent (run_subagent) push frames onto
         # this one queue, so swarm sub-agents' thinking/tool calls interleave with the
         # orchestrator's in true arrival order (see the drain loop below).
@@ -462,6 +485,7 @@ async def stream_run(
             event_sink=sink,
             swarm_max_parallel=swarm.get("max_parallel"),
             swarm_max_depth=swarm.get("max_depth"),
+            enabled_skills=enabled_skills,
         )
 
         # Load the prior turns of this thread so the agent retains context. The

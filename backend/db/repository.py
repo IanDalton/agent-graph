@@ -284,7 +284,7 @@ async def list_conversations(
     fetch.
     """
     rows = await db.query(
-        "SELECT conversation_id, title, mode, system_prompt, "
+        "SELECT conversation_id, title, mode, system_prompt, enabled_skills, "
         "swarm_max_parallel, swarm_max_depth, started_at FROM Conversation "
         "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
@@ -292,6 +292,7 @@ async def list_conversations(
     for row in rows:
         row["mode"] = row.get("mode") or "regular"
         row["system_prompt"] = row.get("system_prompt") or ""
+        row["enabled_skills"] = _parse_skill_names(row.get("enabled_skills"))
         # Swarm overrides are left as-is (None when unset); the UI shows the config default then.
     return rows
 
@@ -385,6 +386,47 @@ async def get_conversation_swarm_settings(
         "max_parallel": row.get("swarm_max_parallel"),
         "max_depth": row.get("swarm_max_depth"),
     }
+
+
+async def set_conversation_enabled_skills(
+    db: ArcadeClient, conversation_id: str, names: list[str]
+) -> None:
+    """Store the marketplace skills enabled for this conversation (by skill name).
+
+    User-set from the web UI's Configuration card. Stored as a JSON string (ArcadeDB sets the field
+    on write — no DDL). An empty list clears the selection. The agent reads these each turn to know
+    which skills to offer (descriptions injected) and mount into the sandbox.
+    """
+    await db.command(
+        "UPDATE Conversation SET enabled_skills = :sk WHERE conversation_id = :cid",
+        {"sk": json.dumps(list(names)), "cid": conversation_id},
+    )
+
+
+async def get_conversation_enabled_skills(
+    db: ArcadeClient, conversation_id: str
+) -> list[str]:
+    """Return the conversation's enabled skill names, or ``[]`` when unset/unknown."""
+    rows = await db.query(
+        "SELECT enabled_skills FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return _parse_skill_names(rows[0].get("enabled_skills") if rows else None)
+
+
+def _parse_skill_names(raw: Any) -> list[str]:
+    """Normalize a stored ``enabled_skills`` value (JSON string or native list) to ``list[str]``."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(n) for n in raw]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return [str(n) for n in parsed] if isinstance(parsed, list) else []
+    return []
 
 
 async def _search_messages_like(
@@ -842,6 +884,134 @@ async def delete_agent_spec(db: ArcadeClient, user_id: str, agent_id: str) -> in
     result = await db.command(
         "DELETE VERTEX FROM (SELECT FROM AgentSpec WHERE agent_id = :aid AND user_id = :uid)",
         {"aid": agent_id, "uid": user_id},
+    )
+    return _affected(result)
+
+
+async def create_skill(
+    db: ArcadeClient,
+    user_id: str,
+    name: str,
+    description: str,
+    body: str,
+    files: dict[str, dict[str, str]] | None = None,
+    source: str = "",
+) -> str:
+    """Create a synced marketplace skill, linked to the User. Returns the skill_id.
+
+    A Skill is one Anthropic Agent Skill: its ``description`` (frontmatter, injected per-turn for
+    progressive disclosure), ``body`` (the SKILL.md instructions, loaded on demand via load_skill),
+    and ``files`` — the bundled scripts/assets/references as a map of ``relpath -> {content,
+    encoding}`` (``encoding`` is ``"text"`` or ``"base64"``, the Document convention), mounted into
+    the run_python sandbox. ``source`` records where it came from (e.g. ``anthropics/skills@main``).
+    Name uniqueness per user is maintained by :func:`upsert_skill` (the sync path).
+    """
+    skill_id = _new_id()
+    now = _now()
+    await db.command(
+        "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
+        {"uid": user_id},
+    )
+    await db.command(
+        "CREATE VERTEX Skill SET skill_id = :sid, user_id = :uid, name = :name, "
+        "description = :description, body = :body, files = :files, source = :source, "
+        "synced_at = :ts",
+        {
+            "sid": skill_id,
+            "uid": user_id,
+            "name": name,
+            "description": description,
+            "body": body,
+            "files": json.dumps(files or {}),
+            "source": source,
+            "ts": now,
+        },
+    )
+    await db.command(
+        "CREATE EDGE HAS_SKILL "
+        "FROM (SELECT FROM User WHERE user_id = :uid) "
+        "TO (SELECT FROM Skill WHERE skill_id = :sid)",
+        {"uid": user_id, "sid": skill_id},
+    )
+    return skill_id
+
+
+async def upsert_skill(
+    db: ArcadeClient,
+    user_id: str,
+    name: str,
+    description: str,
+    body: str,
+    files: dict[str, dict[str, str]] | None = None,
+    source: str = "",
+) -> str:
+    """Create or replace a user's skill by ``name`` (the sync path). Returns its skill_id.
+
+    Keeps exactly one row per skill name per user: if the named skill already exists it is updated
+    in place (so re-syncing refreshes content without duplicating); otherwise it is created.
+    """
+    existing = await get_skill(db, user_id, name)
+    if existing:
+        await db.command(
+            "UPDATE Skill SET description = :description, body = :body, files = :files, "
+            "source = :source, synced_at = :ts WHERE skill_id = :sid AND user_id = :uid",
+            {
+                "description": description,
+                "body": body,
+                "files": json.dumps(files or {}),
+                "source": source,
+                "ts": _now(),
+                "sid": existing["skill_id"],
+                "uid": user_id,
+            },
+        )
+        return str(existing["skill_id"])
+    return await create_skill(db, user_id, name, description, body, files, source)
+
+
+async def get_skill(db: ArcadeClient, user_id: str, ref: str) -> dict[str, Any] | None:
+    """Return one skill (full body + files) by its skill_id OR its name, or None. User-scoped.
+
+    The ``files`` field is parsed back from its stored JSON to a ``relpath -> {content, encoding}``
+    dict (``{}`` when absent/corrupt), so callers get a ready-to-use map.
+    """
+    rows = await db.query(
+        "SELECT skill_id, name, description, body, files, source, synced_at "
+        "FROM Skill WHERE user_id = :uid AND (skill_id = :ref OR name = :ref)",
+        {"uid": user_id, "ref": ref},
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    raw_files = row.get("files")
+    if isinstance(raw_files, str):
+        try:
+            row["files"] = json.loads(raw_files) if raw_files else {}
+        except json.JSONDecodeError:
+            row["files"] = {}
+    elif not isinstance(raw_files, dict):
+        row["files"] = {}
+    return row
+
+
+async def list_skills(db: ArcadeClient, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    """Return this user's synced skills (metadata only — no body/files), name-ordered.
+
+    Backs the Configuration card's skill picker. Content is excluded to keep the list light; fetch
+    a skill's body/files with :func:`get_skill`.
+    """
+    return await db.query(
+        "SELECT skill_id, name, description, source, synced_at "
+        "FROM Skill WHERE user_id = :uid ORDER BY name ASC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
+
+
+async def delete_skill(db: ArcadeClient, user_id: str, ref: str) -> int:
+    """Delete a skill (and its HAS_SKILL edge) by skill_id or name, if it belongs to ``user_id``."""
+    result = await db.command(
+        "DELETE VERTEX FROM (SELECT FROM Skill WHERE user_id = :uid AND (skill_id = :ref OR name = :ref))",
+        {"uid": user_id, "ref": ref},
     )
     return _affected(result)
 

@@ -146,6 +146,35 @@ async def user_profile_block(deps: GraphDependencies) -> str:
     return "What we know about this user (durable profile, curated from past conversations):\n" + profile
 
 
+async def enabled_skills_block(deps: GraphDependencies) -> str:
+    """Build the 'skills enabled for this conversation' block, or "" when none are enabled.
+
+    Lists each enabled skill by name + one-line description (the cheap, always-injected half of
+    progressive disclosure; the agent loads a skill's full body on demand via ``load_skill``).
+    Descriptions come from :func:`repo.list_skills` (metadata only), filtered to the enabled names.
+    Best-effort: any DB failure logs and returns "" so a turn is never blocked.
+    """
+    names = deps.enabled_skills or []
+    if not names:
+        return ""
+    try:
+        catalog = {s.get("name"): s for s in await repo.list_skills(deps.db, deps.user_id)}
+    except Exception:  # noqa: BLE001 — skill recall is best-effort; never abort the run.
+        logger.warning("enabled-skills lookup failed; continuing without it", exc_info=True)
+        return ""
+    lines: list[str] = []
+    for name in names:
+        meta = catalog.get(name)
+        description = (meta.get("description") if meta else "") or ""
+        lines.append(f"- {name}: {description}" if description else f"- {name}")
+    if not lines:
+        return ""
+    return (
+        "Skills enabled for this conversation (call load_skill(name) to read a skill's full "
+        "instructions before using it):\n" + "\n".join(lines)
+    )
+
+
 def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     """Attach the dynamic per-run instructions (date + relevant user facts) to ``agent``.
 
@@ -165,3 +194,7 @@ def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     @agent.instructions
     async def _user_facts(ctx: RunContext[GraphDependencies]) -> str:
         return await relevant_facts_block(ctx.deps, _latest_user_prompt(ctx.messages))
+
+    @agent.instructions
+    async def _enabled_skills(ctx: RunContext[GraphDependencies]) -> str:
+        return await enabled_skills_block(ctx.deps)

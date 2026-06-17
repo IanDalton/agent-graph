@@ -55,7 +55,7 @@ logger = logging.getLogger("agent_graph.ontology")
 # their own update_fact/delete_fact tools, and conversation/message/log/replay records are managed by
 # hooks. Dropping any of these would break the memory system.
 _PROTECTED_VERTEX_TYPES = frozenset(
-    {"User", "Conversation", "Message", "Fact", "LogEntry", "RunMessages", "Document", "AgentSpec"}
+    {"User", "Conversation", "Message", "Fact", "LogEntry", "RunMessages", "Document", "AgentSpec", "Skill"}
 )
 # Internal edge types that wire the memory graph together — never droppable here.
 _PROTECTED_EDGE_TYPES = frozenset(
@@ -68,6 +68,7 @@ _PROTECTED_EDGE_TYPES = frozenset(
         "HAS_NODE",
         "HAS_DOCUMENT",
         "HAS_AGENT",
+        "HAS_SKILL",
     }
 )
 

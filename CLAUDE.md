@@ -48,6 +48,10 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `update_document` is shared by agent revisions AND user edits from the web UI. A document's
   `encoding` is `"text"` (literal content) or `"base64"` (binary artifacts — PDFs/images the
   sandbox produced).
+  **Skills capability instructions** carry the `$SKILLS_DIR/<name>/` note; the `run_python` tool
+  materializes the conversation's enabled skills into a host temp dir (under the shared `TMPDIR`, so
+  it's daemon-reachable under DooD; files made world-readable for the `nobody` container) and passes
+  it as `skills_dir`. Tolerant: a materialization failure runs WITHOUT the mount + a `note`.
   **Modes:** `create_conversation(..., mode=)` stamps the conversation's agent profile at creation
   (`'regular'`/`'research'`/`'swarm'`; the idempotent hook call can't overwrite it because an
   existing conversation returns early), `set_conversation_mode` switches it later (the user can
@@ -63,10 +67,18 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   text for `search_messages`/`get_recent_messages`; `RunMessages` blobs are what `main.run()` reloads
   into `message_history` so the agent sees the tool work it actually did (not just its text claims)
   and stops re-doubting/redoing completed work.
+  **Skills (marketplace):** `create_skill`/`upsert_skill` (the sync path keeps one row per skill
+  name per user)/`get_skill` (by id OR name; full `body`+`files`)/`list_skills` (metadata only)/
+  `delete_skill` persist Anthropic Agent Skills synced from GitHub as `Skill` vertices (user-scoped,
+  linked `User -HAS_SKILL-> Skill`): `description` (frontmatter), `body` (the SKILL.md instructions),
+  and `files` (a JSON map `relpath -> {content, encoding}` of the bundled scripts/assets, text or
+  base64 like Documents). A conversation's enabled subset is stored on the `Conversation` vertex via
+  `set_conversation_enabled_skills`/`get_conversation_enabled_skills` (JSON list of names; `[]` when
+  unset; `list_conversations` returns it too).
   Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
   `Conversation -HAS_RUN_MESSAGES-> RunMessages`, `Conversation -HAS_DOCUMENT-> Document`,
   `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
-  `User -HAS_AGENT-> AgentSpec`,
+  `User -HAS_AGENT-> AgentSpec`, `User -HAS_SKILL-> Skill`,
   plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
   `MemorySearchResult`/`MemoryHit`, and the ontology models `VertexProperty`, `ProposeSchemaArgs`,
@@ -117,6 +129,21 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   - a `Hooks` object whose `before_tool_execute` guard rejects `create_vertex_type` /
     `create_edge_type` unless a matching `propose_schema_change` / `propose_edge_type` ran earlier in
     the same run (uses `proposed_schemas` / `proposed_edges` on the deps).
+- **`backend/marketplace.py`** — the **skills sync service** (not a Pydantic AI capability): pulls
+  Anthropic Agent Skills from the public `anthropics/skills` GitHub repo into a user's DB.
+  `MarketplaceClient` (httpx wrapper modeled on `WebClient`; env: `SKILLS_REPO`/`SKILLS_REF`,
+  optional `GITHUB_TOKEN` for the rate limit) has `list_catalog()` — ONE git-trees API call lists
+  the whole repo tree, grouped into `{skill_name: [paths]}` — and `fetch_skill(name, paths)` —
+  fetches `SKILL.md` (via `raw.githubusercontent.com`, which doesn't count against the API limit),
+  parses its YAML frontmatter (`_parse_frontmatter`, pyyaml) into `name`/`description`+`body`, and
+  downloads the bundled files (caps: 50 files / 5MB each / 25MB total; text vs base64 by
+  decodability). `sync(db, user_id, names=None)` lists the catalog (or just `names`), `upsert_skill`s
+  each, and is **tolerant** — per-skill failures (and a total catalog failure) come back in
+  `{"synced", "errors", "source"}`, never raised. `client=` is a test seam. **Live browse:**
+  `fetch_skill_meta(name)` fetches ONLY a skill's frontmatter (name+description, no body/files —
+  cheap), and `catalog()` lists the whole marketplace as `[{name, description}]` (names via one
+  trees call, descriptions fetched concurrently, per-skill failures degrade to `""`) with a 15-min
+  in-process TTL cache (`_catalog_cache`) so reopening the marketplace dialog is instant.
 - **`backend/web/client.py`** — `WebClient`: async `httpx` wrapper for the live internet, modeled on
   `ArcadeClient` (env-driven, context manager, capped-backoff retry on transport/5xx). `search()`
   hits SearXNG's JSON API (`GET {SEARXNG_URL}/search?format=json`, default
@@ -153,7 +180,11 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   limit. On timeout the container is `docker rm -f`'d by name (killing the docker CLI alone would
   leave it running). **File artifacts:** a host temp dir is mounted at `/out` (also `$OUTPUT_DIR`);
   files the program writes there come back as `SandboxFile` blobs on the result (max 8 files,
-  5MB each — drops noted in `notes`). Default image is the project's **`agent-sandbox`**
+  5MB each — drops noted in `notes`). **Skill files:** when `run()` is given a `skills_dir`, it is
+  bind-mounted **read-only** at `/skills` (also `$SKILLS_DIR`) — the enabled skills' bundled
+  scripts/assets, materialized by `sandbox_capability` from the synced `Skill` records. The mount is
+  `:ro` and adds no capability, so every other hardening flag is unchanged; there is no network, so
+  a skill can't `pip install`. Default image is the project's **`agent-sandbox`**
   (`docker/sandbox/Dockerfile`: python:3.12-slim + **fpdf2** for PDFs; `docker compose build
   sandbox`); if it isn't built, the run transparently retries on plain `python:3.12-slim`
   (stdlib only) and says so in `notes`. Env: `SANDBOX_IMAGE`, `SANDBOX_TIMEOUT_SECONDS`,
@@ -175,6 +206,19 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `run_query`/`web_search`: every failure becomes a structured `error` result, never an
   exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
   a `note`, keeping the code's stdout).
+- **`backend/skills/skill_capability.py`** — the `Skills` bundle, exposed via `build_skills()` and
+  added (by `_capabilities_for_mode`) **only when the conversation has skills enabled** (and not in
+  swarm mode). **Progressive disclosure** (the Agent Skills design): the enabled skills'
+  name+description are injected into the system prompt every turn by `enabled_skills_block` (a
+  dynamic `@agent.instructions` callable in `system_prompt.py`, best-effort like
+  `relevant_facts_block`), and the full body is loaded on demand by the one tool, `load_skill(name)`
+  — which returns the SKILL.md body + the list of bundled files (available read-only in the sandbox
+  under `$SKILLS_DIR/<name>/`). A disabled/unknown name raises `ModelRetry` (the
+  `update_document`/`update_fact` convention). Enabled names ride on `deps.enabled_skills` (set per
+  turn by `stream_run` from `repo.get_conversation_enabled_skills`). Schemas in
+  `backend/schemas/skill_schemas.py` (`LoadSkillArgs`, `SkillContent`). Protected types: `Skill` /
+  `HAS_SKILL` are in `ontology_capability`'s `_PROTECTED_VERTEX_TYPES`/`_PROTECTED_EDGE_TYPES`, so
+  the agent can't drop them.
 - **`backend/skills/subagent.py`** — the shared **delegated-run machinery** + the agency
   communication primitive: `run_subagent(deps, instructions=, tool_groups=, prompt=, recipients=,
   request_limit=, model=)` builds a fresh single-purpose Pydantic AI agent per dispatch with a
@@ -248,9 +292,31 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   which embeds the run's latest user prompt (`_latest_user_prompt(ctx.messages)`) and injects the
   top-`_MAX_FACTS` most relevant stored facts via the existing `repo.search_facts(..., embedding=)`
   (semantic ranking with LIKE fallback). So every turn starts grounded in what we know about the
-  user without waiting for the model to call `search_memory`. **Best-effort** like the persistence
-  hooks: any DB/embedder failure logs (`agent_graph.system_prompt`) and degrades to no fact block,
-  never aborting a turn. Sub-agent delegates keep their own task-specific prompts (not wired here).
+  user without waiting for the model to call `search_memory`. A third callable, `_user_profile`
+  (`user_profile_block`), injects the durable **user profile** — the rolling cross-conversation
+  synopsis maintained by `backend/memory_curator.py` (see below) and stored on the `User` vertex —
+  just above the facts block, so the profile frames the more granular facts. **Best-effort** like the
+  persistence hooks: any DB/embedder failure logs (`agent_graph.system_prompt`) and degrades to no
+  fact/profile block, never aborting a turn. Sub-agent delegates keep their own task-specific prompts
+  (not wired here).
+- **`backend/memory_curator.py`** — the **background memory curator** (a write-time leaf module like
+  `backend/summarization.py`). A normal turn relies on the *main* agent remembering to call its fact
+  tools mid-task; this adds a dedicated agent that runs automatically — gated on a message-count
+  watermark (`memory_curated_message_count` on `Conversation`, default every
+  `MEMORY_CURATION_EVERY_N_MESSAGES`=8 messages) — to (1) extract/dedupe durable **facts** from the
+  recent conversation, (2) rewrite the persistent **user profile**
+  (`repo.set_user_profile`/`get_user_profile`, full replace, injected each turn by
+  `system_prompt.user_profile_block`), and (3) optionally grow the knowledge graph. It is granted
+  the existing `memory_capability` + `build_ontology()` tools plus its own `update_user_profile`
+  tool — **no `persistence_hooks`** (a curator run must not be recorded as a turn nor recurse) — on
+  an isolated deps copy (`replace(deps, proposed_schemas={}, proposed_edges={})` so the ontology
+  guard starts clean), and runs **silently** via `agent.run` (not `run_stream_events`, so its tool
+  chips never reach `deps.event_sink`). `maybe_curate_memory(deps)` is called best-effort from
+  `graph_capability._persist_turn` (deferred import — `memory_curator` imports `memory_capability`)
+  right after the summary refresh, so it never affects the turn and its latency lands after the answer
+  has streamed. `MEMORY_CURATION_ENABLED=0` is the kill switch; `MEMORY_CURATOR_REQUEST_LIMIT`
+  (default 12) caps its loop. The profile is read-only in the UI via `GET /api/user/profile`
+  (ContextPane's `UserProfileCard`).
   **Custom per-conversation prompt:** a conversation can carry its own extra instructions (set from
   the web UI's Configuration card, stored on the `Conversation` vertex). `main.compose_instructions`
   appends them under an `ADDITIONAL INSTRUCTIONS (from the user)` header on top of
@@ -301,9 +367,14 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   **no secrets**),
   `GET|POST /api/conversations` (list /
   create — create mints a uuid `conversation_id` and stamps the requested `mode`, validated by a
-  `Literal`), `PATCH /api/conversations/{id}` (partial update of `mode` and/or the custom
-  `system_prompt`; only the fields in `model_fields_set` are applied, so `system_prompt:""` clears
-  it), `GET /api/conversations/{id}/messages`,
+  `Literal`), `PATCH /api/conversations/{id}` (partial update of `mode`, the custom
+  `system_prompt`, swarm bounds, and/or `enabled_skills`; only the fields in `model_fields_set` are
+  applied, so `system_prompt:""` clears it and `enabled_skills:[]` clears the selection),
+  the skills surface — `GET /api/skills` (the user's synced library, metadata),
+  `GET /api/skills/catalog` (the **live** marketplace catalog with an `installed` flag merged per
+  user — backs the marketplace dialog; tolerant → `[]`), `POST /api/skills/sync` (install one
+  (`names=[name]`) or all; tolerant — returns the `{synced,errors,source}` summary, never 500),
+  `DELETE /api/skills/{name}` (uninstall from the library), `GET /api/conversations/{id}/messages`,
   `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
   summary), the document surface — `GET /api/conversations/{id}/documents` (metadata list,
   tolerant), `GET|PUT|DELETE /api/documents/{id}` (PUT applies a **user edit** of title/content via
@@ -327,7 +398,13 @@ middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed 
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
 (config + summary + memory graph; the config card's `SystemPromptRow` is a per-conversation custom
-system-prompt textarea, saved on blur via `AppContext.setConversationSystemPrompt`) and a
+system-prompt textarea, saved on blur via `AppContext.setConversationSystemPrompt`, and `SkillsRow`
+shows the skills *loaded onto this chat* as removable chips plus a "Browse" button that opens the
+**Skill Marketplace** dialog (`panes/SkillMarketplace.tsx`, mounted at the shell, also opened from a
+Sparkles button in the `Composer` toolbar): a full-screen gallery of Claude's live catalog
+(`AppContext.catalog` ← `GET /api/skills/catalog`) where each card's "Add to chat"
+(`AppContext.addSkillToChat` — installs via `POST /api/skills/sync` `names=[name]` if needed, then
+enables via `setConversationSkills`) loads a skill onto the active conversation) and a
 *Documents* tab (`panes/DocumentsPane.tsx`) listing the
 active conversation's agent-authored documents. Opening one renders by media type
 (`DocumentBody`): **`text/html` runs as a live interactive app** in a sandboxed iframe
@@ -385,7 +462,7 @@ Run pieces directly (infra in Docker, app on the host) instead:
 
 ```bash
 docker compose up -d arcadedb searxng  # just the infra (ArcadeDB DB AgentMemory auto-created + SearXNG)
-pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv, fastapi, uvicorn
+pip install -r requirements.txt   # pydantic-ai-slim[openai], httpx, python-dotenv, fastapi, uvicorn, pyyaml
 python -m backend.main "remember I like Recoleta apartments" --user u1 --conversation c1
 python -m pytest backend/tests/   # unit tests run without a DB/network/Docker; integration tests skip when :2480 / the sandbox image is unavailable
 uvicorn backend.api:app --reload --port 8000   # HTTP/SSE API backing the web UI
@@ -396,6 +473,9 @@ curl "http://localhost:8085/search?q=arcadedb&format=json"
 
 Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL` (e.g.
 `openai:gpt-5.2`) to use a hosted provider instead. Secrets load from `.env` via `python-dotenv`.
+The marketplace sync reads `SKILLS_REPO`/`SKILLS_REF` (default `anthropics/skills`/`main`) and an
+optional `GITHUB_TOKEN` (lifts GitHub's 60 req/hr unauthenticated limit; the backend needs outbound
+access to GitHub for the sync).
 
 The **backend image** bundles the Docker CLI and mounts the host `docker.sock` so `run_python`'s
 sandbox containers launch on the host daemon (Docker-out-of-Docker); a same-path
@@ -423,6 +503,12 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
 - Documents are user-editable: agent code must `read_document` before revising, and any new
   "agent writes / user edits" surface should reuse `repo.update_document` so both paths stay
   consistent.
+- Marketplace skills share the tolerance contract: `marketplace.sync` (and `load_skill`, and the
+  sandbox skill-file materialization) must never raise — a sync failure becomes an `errors` entry, a
+  bad skill name a `ModelRetry`, a materialization failure a `note` + running without the mount.
+  When editing the sandbox skill mount, keep it **read-only** (`/skills:ro`) and change no other
+  hardening flag — the synced files come from a trusted source but the mount is still defense-bounded
+  (no network/non-root/read-only root). Keep `Skill`/`HAS_SKILL` in the ontology's protected types.
 - Delegated runs (`send_message`/`send_messages`/`deep_research`) share the tolerance contract too:
   `run_subagent`/`dispatch_message`/`dispatch_messages` must never raise — failures (incl.
   out-of-chart recipients) become `error` on the outcome/report. Specialists get tool capabilities

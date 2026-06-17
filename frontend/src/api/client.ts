@@ -1,5 +1,6 @@
 import type {
   AppConfig,
+  CatalogSkill,
   ContextUsage,
   Conversation,
   DocumentFull,
@@ -7,6 +8,8 @@ import type {
   Fact,
   MemoryGraph,
   Mode,
+  SkillInfo,
+  SkillSyncResult,
   StoredMessage,
 } from "@/types";
 
@@ -30,8 +33,9 @@ export const api = {
       body: JSON.stringify({ user_id: userId, title, mode }),
     }).then(json<Conversation>),
 
-  // Partial update: only the keys present in `patch` are applied server-side (mode and/or the
-  // custom system prompt). system_prompt: "" clears the prompt.
+  // Partial update: only the keys present in `patch` are applied server-side (mode, the custom
+  // system prompt, swarm bounds, and/or enabled skills). system_prompt: "" clears the prompt;
+  // enabled_skills: [] clears the selection.
   updateConversation: (
     conversationId: string,
     userId: string,
@@ -40,6 +44,7 @@ export const api = {
       system_prompt?: string;
       swarm_max_parallel?: number;
       swarm_max_depth?: number;
+      enabled_skills?: string[];
     }
   ) =>
     fetch(`/api/conversations/${conversationId}`, {
@@ -49,6 +54,33 @@ export const api = {
     }).then(
       json<{ conversation_id: string; mode?: Mode; system_prompt?: string }>
     ),
+
+  // The marketplace skills this user has synced (metadata only — backs the skill picker).
+  listSkills: (userId: string) =>
+    fetch(`/api/skills?user_id=${encodeURIComponent(userId)}`).then(
+      json<SkillInfo[]>
+    ),
+
+  // The live Anthropic marketplace catalog (name + description + installed flag) for the dialog.
+  getSkillCatalog: (userId: string) =>
+    fetch(`/api/skills/catalog?user_id=${encodeURIComponent(userId)}`).then(
+      json<CatalogSkill[]>
+    ),
+
+  // Sync skills from the Anthropic marketplace into the user's database. Omit `names` to sync all.
+  syncSkills: (userId: string, names?: string[]) =>
+    fetch("/api/skills/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, names }),
+    }).then(json<SkillSyncResult>),
+
+  // Remove a skill from the user's library (does not touch any conversation's selection).
+  deleteSkill: (userId: string, name: string) =>
+    fetch(
+      `/api/skills/${encodeURIComponent(name)}?user_id=${encodeURIComponent(userId)}`,
+      { method: "DELETE" }
+    ).then(json<{ deleted: string }>),
 
   getMessages: (conversationId: string, userId: string) =>
     fetch(

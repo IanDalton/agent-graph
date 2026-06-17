@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Brain, Cpu, Database, FileText, Gauge, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, UserRound, Zap } from "lucide-react";
+import { Bot, Brain, Cpu, Database, FileText, Gauge, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, Sparkles, UserRound, X, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -172,6 +172,66 @@ function SwarmSettingsRows() {
   );
 }
 
+/** Per-conversation marketplace skills (non-swarm modes). Shows the skills loaded onto this chat as
+ *  removable chips; "Browse" opens the Skill Marketplace dialog to add more. */
+function SkillsRow() {
+  const { conversations, activeId, setConversationSkills, openSkillMarketplace } = useApp();
+  if (!activeId) return null;
+  const conv = conversations.find((c) => c.conversation_id === activeId);
+  const enabled = conv?.enabled_skills ?? [];
+
+  const remove = (name: string) =>
+    setConversationSkills(
+      activeId,
+      enabled.filter((n) => n !== name)
+    );
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Sparkles className="size-3.5 shrink-0" />
+          <span>Skills</span>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 gap-1 px-2 text-[11px] text-muted-foreground"
+          onClick={openSkillMarketplace}
+          title="Browse the skill marketplace"
+        >
+          <Sparkles className="size-3" />
+          Browse
+        </Button>
+      </div>
+      {enabled.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">
+          No skills loaded — Browse the marketplace to add some.
+        </p>
+      ) : (
+        <div className="flex flex-wrap gap-1">
+          {enabled.map((name) => (
+            <span
+              key={name}
+              className="inline-flex items-center gap-1 rounded-full border border-border bg-background/60 px-2 py-0.5 text-[11px]"
+            >
+              {name}
+              <button
+                type="button"
+                onClick={() => remove(name)}
+                title="Remove from this chat"
+                className="text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ConfigCard() {
   const { config, model, setModel, effort, setEffort, conversations, activeId } = useApp();
   const isSwarm =
@@ -211,6 +271,11 @@ function ConfigCard() {
             <div className="border-t border-border/50 pt-2">
               <SystemPromptRow />
             </div>
+            {!isSwarm && (
+              <div className="border-t border-border/50 pt-2">
+                <SkillsRow />
+              </div>
+            )}
             {isSwarm && (
               <div className="border-t border-border/50 pt-2">
                 <SwarmSettingsRows />

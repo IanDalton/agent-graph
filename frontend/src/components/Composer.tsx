@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   Paperclip,
   SendHorizonal,
+  Sparkles,
   Square,
   X,
   Zap,
@@ -227,8 +228,17 @@ export function Composer({
   sending: boolean;
   onStop: () => void;
 }) {
-  const { config, model, setModel, effort, setEffort, conversations, activeId, setConversationMode } =
-    useApp();
+  const {
+    config,
+    model,
+    setModel,
+    effort,
+    setEffort,
+    conversations,
+    activeId,
+    setConversationMode,
+    openSkillMarketplace,
+  } = useApp();
   const activeMode = conversations.find((c) => c.conversation_id === activeId)?.mode ?? "regular";
   const [text, setText] = useState("");
   const [files, setFiles] = useState<Attachment[]>([]);
@@ -377,6 +387,17 @@ export function Composer({
           >
             <Paperclip className="size-4" />
           </button>
+          {activeMode !== "swarm" && (
+            <button
+              type="button"
+              onClick={openSkillMarketplace}
+              aria-label="Browse skills"
+              title="Browse the skill marketplace"
+              className="inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
+            >
+              <Sparkles className="size-4" />
+            </button>
+          )}
           {/* Only when a conversation is active — the new-chat picker handles mode pre-creation. */}
           {activeId && (
             <>

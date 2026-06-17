@@ -75,3 +75,7 @@ class GraphDependencies:
     # the human-readable user Message so a reloaded bubble can re-open them. Run-scoped; empty when
     # the turn carried no uploads.
     uploaded_attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Marketplace skills enabled for this conversation (by name; see repo.get_conversation_enabled_skills).
+    # Read by the Skills capability (descriptions injected per turn, load_skill, sandbox file mount).
+    # Empty when no skills are enabled. Run-scoped; set per turn by stream_run.
+    enabled_skills: list[str] = field(default_factory=list)

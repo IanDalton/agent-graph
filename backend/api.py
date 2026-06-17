@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend import main, summarization
+from backend import main, marketplace, summarization
 from backend.db import repository as repo
 from backend.skills.subagent import (
     SWARM_MAX_DEPTH,
@@ -174,6 +174,8 @@ class UpdateConversation(BaseModel):
     swarm_max_depth: int | None = Field(
         None, ge=SWARM_MAX_DEPTH_RANGE[0], le=SWARM_MAX_DEPTH_RANGE[1]
     )
+    # Marketplace skills enabled for this conversation (by skill name). Empty list clears them.
+    enabled_skills: list[str] | None = None
 
 
 @app.get("/api/conversations")
@@ -232,6 +234,11 @@ async def update_conversation(
                 updated["swarm_max_parallel"] = body.swarm_max_parallel
             if "swarm_max_depth" in fields:
                 updated["swarm_max_depth"] = body.swarm_max_depth
+        if "enabled_skills" in fields:
+            await repo.set_conversation_enabled_skills(
+                db, conversation_id, body.enabled_skills or []
+            )
+            updated["enabled_skills"] = body.enabled_skills or []
     return updated
 
 
@@ -470,6 +477,81 @@ async def update_fact_importance(fact_id: str, body: FactImportance) -> dict[str
     if not updated:
         raise HTTPException(status_code=404, detail="fact not found")
     return {"fact_id": fact_id, "important": body.important}
+
+
+# ---------------------------------------------------------------------------- skills
+
+
+class SyncSkills(BaseModel):
+    """A request to sync marketplace skills into the user's database."""
+
+    user_id: str = "default"
+    # Specific skill names to sync; omit/null to sync the whole catalog.
+    names: list[str] | None = None
+
+
+@app.get("/api/skills")
+async def list_skills(user_id: str = "default") -> list[dict[str, Any]]:
+    """List the marketplace skills this user has synced (metadata only — no body/files).
+
+    Backs the Configuration card's skill picker. Pure read, tolerant like the other list endpoints:
+    a missing database/type (nothing synced yet) yields an empty list rather than a 500.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_skills(db, user_id)
+    except Exception:  # noqa: BLE001 — the skills picker must never break the page.
+        logger.warning("list_skills failed", exc_info=True)
+        return []
+
+
+@app.get("/api/skills/catalog")
+async def skills_catalog(user_id: str = "default") -> list[dict[str, Any]]:
+    """Browse the live Anthropic marketplace catalog (name + description + `installed` flag).
+
+    Backs the Skill Marketplace dialog. The catalog (name/description) comes from GitHub
+    (cached in-process); the `installed` flag is merged fresh from the user's synced library, so it
+    flips to true immediately after an install. Tolerant: any failure (GitHub unreachable, no DB
+    yet) yields an empty list rather than a 500.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            installed = {s.get("name") for s in await repo.list_skills(db, user_id)}
+        items = await marketplace.catalog()
+        return [{**item, "installed": item["name"] in installed} for item in items]
+    except Exception:  # noqa: BLE001 — the marketplace dialog must never break the page.
+        logger.warning("skills catalog failed", exc_info=True)
+        return []
+
+
+@app.delete("/api/skills/{name}")
+async def uninstall_skill(name: str, user_id: str = "default") -> dict[str, Any]:
+    """Remove a skill from the user's library (404 if they don't have it). Does not touch chats.
+
+    A conversation that still lists the skill in its `enabled_skills` simply won't find it on the
+    next turn (load_skill returns "re-sync" guidance) — the same tolerant contract as a stale id.
+    """
+    async with _client_for(user_id, ensure=True) as db:
+        deleted = await repo.delete_skill(db, user_id, name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return {"deleted": name}
+
+
+@app.post("/api/skills/sync")
+async def sync_skills(body: SyncSkills) -> dict[str, Any]:
+    """Sync skills from the Anthropic marketplace into the user's database.
+
+    A write path (it upserts Skill vertices), so the database/schema are ensured first. Tolerant:
+    the sync collects per-skill failures into the returned summary rather than raising. A total
+    failure (e.g. GitHub unreachable) returns the same shape with an error entry, not a 500.
+    """
+    try:
+        async with _client_for(body.user_id, ensure=True) as db:
+            return await marketplace.sync(db, body.user_id, names=body.names)
+    except Exception as exc:  # noqa: BLE001 — never 500; report as a summary error.
+        logger.warning("skills sync failed", exc_info=True)
+        return {"synced": [], "errors": [{"name": "*", "error": str(exc)}], "source": ""}
 
 
 # ----------------------------------------------------------------------------- chat

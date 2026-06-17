@@ -24,6 +24,9 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import os
+import shutil
+import tempfile
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import Capability
@@ -48,6 +51,9 @@ INSTRUCTIONS = (
     "code as a literal.\n"
     "  - LIBRARIES: the standard library plus `fpdf` (the fpdf2 PDF library). No other "
     "third-party packages and no pip.\n"
+    "  - SKILLS: when a skill is enabled and ships files, they are mounted READ-ONLY at "
+    "$SKILLS_DIR/<skill-name>/ (call load_skill first to see what a skill provides and how to use "
+    "it). Read/import them from there; there is no network, so a skill can't install packages.\n"
     "  - OUTPUT: only stdout/stderr come back — print() every result you need. A non-zero "
     "exit_code means the program crashed; read the traceback in stderr, fix the code, retry.\n"
     "  - FILES: anything your program writes to the /out directory is AUTOMATICALLY saved as a "
@@ -145,23 +151,102 @@ async def _persist_files(
     return documents, notes
 
 
+def _make_world_readable(root: str) -> None:
+    """Make ``root`` and everything under it readable by the sandbox's non-root user (Linux).
+
+    The container runs as 'nobody' and the /skills mount is read-only, so files need o+r and dirs
+    o+rx for it to traverse them. A no-op on Windows/Docker Desktop mounts.
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        try:
+            os.chmod(dirpath, 0o755)
+        except OSError:
+            pass
+        for fn in filenames:
+            try:
+                os.chmod(os.path.join(dirpath, fn), 0o644)
+            except OSError:
+                pass
+
+
+async def _materialize_skills(
+    ctx: RunContext[GraphDependencies], names: list[str]
+) -> tuple[str | None, list[str]]:
+    """Write the enabled skills' files into a fresh host temp dir for read-only mounting.
+
+    Each skill lands under ``<dir>/<name>/`` (its SKILL.md body as ``SKILL.md`` plus its bundled
+    files at their relative paths, base64-decoded as needed). Returns ``(dir | None, notes)``; the
+    caller mounts ``dir`` at ``/skills`` and MUST remove it afterwards. Tolerant: any failure
+    returns ``(None, notes)`` so the code still runs — just without the skill files. Uses the
+    default ``TMPDIR`` (the same shared bind ``/out`` uses) so the path is reachable by the daemon.
+    """
+    deps = ctx.deps
+    notes: list[str] = []
+    skills_dir = tempfile.mkdtemp(prefix="agent-skills-")
+    wrote_any = False
+    try:
+        for name in names:
+            skill = await repo.get_skill(deps.db, deps.user_id, name)
+            if not skill:
+                continue
+            base = os.path.join(skills_dir, name)
+            os.makedirs(base, exist_ok=True)
+            with open(os.path.join(base, "SKILL.md"), "w", encoding="utf-8") as fh:
+                fh.write(str(skill.get("body") or ""))
+            for relpath, info in (skill.get("files") or {}).items():
+                dest = os.path.normpath(os.path.join(base, relpath))
+                # Defense-in-depth: never let a crafted relpath escape the skill's dir.
+                if os.path.commonpath([base, dest]) != base:
+                    notes.append(f"Skipped skill file {relpath!r} (path outside skill dir).")
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                content = info.get("content", "") if isinstance(info, dict) else ""
+                if isinstance(info, dict) and info.get("encoding") == "base64":
+                    with open(dest, "wb") as fh:
+                        fh.write(base64.b64decode(content))
+                else:
+                    with open(dest, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+            wrote_any = True
+        if not wrote_any:
+            shutil.rmtree(skills_dir, ignore_errors=True)
+            return None, notes
+        _make_world_readable(skills_dir)
+        return skills_dir, notes
+    except Exception:  # noqa: BLE001 — skill files are best-effort; run without them on failure.
+        logger.warning("failed to materialize skill files for the sandbox", exc_info=True)
+        shutil.rmtree(skills_dir, ignore_errors=True)
+        notes.append("Could not prepare skill files for the sandbox; ran without them.")
+        return None, notes
+
+
 @sandbox_capability.tool
 async def run_python(ctx: RunContext[GraphDependencies], args: RunPythonArgs) -> PythonRunResult:
     """Execute a self-contained Python program in an isolated container and return its output.
 
     Stateless between calls; stdlib + fpdf (fpdf2); no network. print() what you need to see;
-    write file artifacts (e.g. PDFs) to /out — they are saved as documents automatically.
+    write file artifacts (e.g. PDFs) to /out — they are saved as documents automatically. Files
+    shipped by enabled skills are mounted read-only under $SKILLS_DIR/<name>/.
     """
     sandbox = ctx.deps.sandbox or PythonSandbox()
+    timeout = float(args.timeout_seconds) if args.timeout_seconds else None
+    skills_dir: str | None = None
+    skill_notes: list[str] = []
+    if ctx.deps.enabled_skills:
+        skills_dir, skill_notes = await _materialize_skills(ctx, ctx.deps.enabled_skills)
     try:
-        result = await sandbox.run(
-            args.code,
-            timeout_seconds=float(args.timeout_seconds) if args.timeout_seconds else None,
-        )
+        # Pass skills_dir only when set, so a sandbox without that parameter (test fakes) still works.
+        run_kwargs: dict[str, object] = {"timeout_seconds": timeout}
+        if skills_dir:
+            run_kwargs["skills_dir"] = skills_dir
+        result = await sandbox.run(args.code, **run_kwargs)
         documents, persist_notes = await _persist_files(ctx, result.files)
     except Exception as exc:  # noqa: BLE001 — never abort the run on a sandbox failure.
         logger.warning("run_python failed: %s", exc, exc_info=True)
-        return PythonRunResult(error=f"Sandbox execution failed: {exc}")
+        return PythonRunResult(error=f"Sandbox execution failed: {exc}", notes=skill_notes)
+    finally:
+        if skills_dir:
+            shutil.rmtree(skills_dir, ignore_errors=True)
     return PythonRunResult(
         stdout=result.stdout,
         stderr=result.stderr,
@@ -169,7 +254,7 @@ async def run_python(ctx: RunContext[GraphDependencies], args: RunPythonArgs) ->
         timed_out=result.timed_out,
         truncated=result.truncated,
         documents=documents,
-        notes=[*result.notes, *persist_notes],
+        notes=[*result.notes, *persist_notes, *skill_notes],
         error=result.error,
     )
 
