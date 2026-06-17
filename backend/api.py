@@ -431,6 +431,22 @@ class FactImportance(BaseModel):
     important: bool
 
 
+@app.get("/api/user/profile")
+async def get_user_profile(user_id: str = "default") -> dict[str, Any]:
+    """Return the user's durable, curator-maintained profile (a fast DB read).
+
+    The profile is rewritten at write time by the background memory curator (every few turns; see
+    :func:`backend.memory_curator.maybe_curate_memory`), so this endpoint never runs an LLM. Tolerant
+    like the summary/facts reads: any error (or no profile yet) yields an empty profile, never a 500.
+    """
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.get_user_profile(db, user_id)
+    except Exception:  # noqa: BLE001 — the profile card must never break the page.
+        logger.warning("user profile read failed", exc_info=True)
+        return {"profile": "", "profile_updated_at": None}
+
+
 @app.get("/api/facts")
 async def list_facts(user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
     """List the user's stored facts (newest first) for the Facts tab.

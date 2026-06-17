@@ -284,6 +284,15 @@ async def _persist_turn(ctx: RunContext[GraphDependencies], *, result: AgentRunR
         summarization.maybe_refresh_summary(deps.db, deps.conversation_id),
         what="refresh_summary",
     )
+    # Curate long-term memory (extract/dedupe facts, rewrite the user profile, grow the graph), but
+    # only once every N messages (gated inside). Deferred import: memory_curator imports this module's
+    # memory_capability, so importing it at top level would cycle. Best-effort, post-stream.
+    from backend import memory_curator
+
+    await _best_effort(
+        memory_curator.maybe_curate_memory(deps),
+        what="curate_memory",
+    )
     # Fill in a blank conversation title after the first completed turn.
     await _best_effort(
         title_generation.maybe_refresh_title(deps.db, deps.conversation_id),

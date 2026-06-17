@@ -128,6 +128,24 @@ async def relevant_facts_block(deps: GraphDependencies, query: str) -> str:
     return "Known facts about the user (from memory — context, not their current message):\n" + "\n".join(lines)
 
 
+async def user_profile_block(deps: GraphDependencies) -> str:
+    """Build the durable 'user profile' block, or "" when there is none.
+
+    The profile is the rolling cross-conversation synopsis maintained by the background memory
+    curator (:mod:`backend.memory_curator`) and stored on the ``User`` vertex. Injecting it each turn
+    grounds the agent in who the user is without waiting for it to search memory. Best-effort: any
+    DB failure logs and returns "" so a turn is never blocked.
+    """
+    try:
+        profile = (await repo.get_user_profile(deps.db, deps.user_id))["profile"]
+    except Exception:  # noqa: BLE001 — profile recall is best-effort; never abort the run.
+        logger.warning("user-profile lookup failed; continuing without it", exc_info=True)
+        return ""
+    if not profile:
+        return ""
+    return "What we know about this user (durable profile, curated from past conversations):\n" + profile
+
+
 def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     """Attach the dynamic per-run instructions (date + relevant user facts) to ``agent``.
 
@@ -138,6 +156,11 @@ def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     @agent.instructions
     def _date(_ctx: RunContext[GraphDependencies]) -> str:
         return f"Today's date is {_today()}."
+
+    @agent.instructions
+    async def _user_profile(ctx: RunContext[GraphDependencies]) -> str:
+        # The durable profile frames the more granular facts below it.
+        return await user_profile_block(ctx.deps)
 
     @agent.instructions
     async def _user_facts(ctx: RunContext[GraphDependencies]) -> str:

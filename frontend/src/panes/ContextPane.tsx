@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Brain, Cpu, Database, FileText, Gauge, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, Zap } from "lucide-react";
+import { Bot, Brain, Cpu, Database, FileText, Gauge, Layers, LayoutPanelLeft, Network, RefreshCw, Search, ScrollText, UserRound, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -409,6 +409,53 @@ function SummaryCard({ refreshKey }: { refreshKey: number }) {
   );
 }
 
+/** The durable, curator-maintained user profile (cross-conversation context the agent injects each
+ *  turn). Read-only here — it's rewritten automatically by the background memory curator every few
+ *  turns. Per-user, so it refetches on userId and the shared refreshKey bump (after each turn). */
+function UserProfileCard({ refreshKey }: { refreshKey: number }) {
+  const { userId } = useApp();
+  const [profile, setProfile] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api
+      .getUserProfile(userId)
+      .then((r) => !cancelled && setProfile(r.profile))
+      .catch(() => !cancelled && setProfile(""))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, refreshKey]);
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <UserRound className="size-3.5 text-muted-foreground" />
+          User profile
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {loading && !profile ? (
+          <div className="space-y-2">
+            <Skeleton className="h-3 w-full" />
+            <Skeleton className="h-3 w-4/6" />
+          </div>
+        ) : profile ? (
+          <Markdown className="text-xs text-muted-foreground">{profile}</Markdown>
+        ) : (
+          <div className="text-xs text-muted-foreground">
+            No profile yet — it builds up as you chat.
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 /** The right "Knowledge & Artifacts" pane, split into tabs: Context (config + summary +
  *  memory graph) and Documents (agent-authored artifacts, user-editable when text-based).
  *  When a document is featured (agent created one, or the user clicked a document card in
@@ -452,6 +499,7 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
             <ConfigCard />
             <ContextWindowCard refreshKey={refreshKey} />
             {isSwarm && <SwarmFlowCard />}
+            <UserProfileCard refreshKey={refreshKey} />
             <SummaryCard refreshKey={refreshKey} />
             <MemoryGraphCard refreshKey={refreshKey} />
           </div>

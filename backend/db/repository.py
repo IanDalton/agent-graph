@@ -214,6 +214,62 @@ async def set_conversation_summary(
     )
 
 
+async def get_memory_curation_watermark(db: ArcadeClient, conversation_id: str) -> int:
+    """Return the message count at which the background memory curator last ran for this thread.
+
+    The watermark gates curation the same way ``summary_message_count`` gates the summary:
+    callers compare it against the current message count to decide whether a fresh pass is due.
+    Defaults to ``0`` for conversations that have never been curated.
+    """
+    rows = await db.query(
+        "SELECT memory_curated_message_count FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    row = rows[0] if rows else {}
+    return int(row.get("memory_curated_message_count") or 0)
+
+
+async def set_memory_curation_watermark(
+    db: ArcadeClient, conversation_id: str, message_count: int
+) -> None:
+    """Record the message count reached when the memory curator last ran for this conversation."""
+    await db.command(
+        "UPDATE Conversation SET memory_curated_message_count = :n, "
+        "memory_curated_at = :ts WHERE conversation_id = :cid",
+        {"n": message_count, "ts": _now(), "cid": conversation_id},
+    )
+
+
+async def get_user_profile(db: ArcadeClient, user_id: str) -> dict[str, Any]:
+    """Return the persistent, curator-maintained profile of the user (durable cross-conversation context).
+
+    Distinct from the per-conversation summary: this is a single rolling synopsis of who the user
+    is, rewritten by the background memory curator (see ``backend.memory_curator``) and injected into
+    every main-agent turn. Defaults to ``""``/``None`` for a user without a profile yet.
+    """
+    rows = await db.query(
+        "SELECT profile, profile_updated_at FROM User WHERE user_id = :uid",
+        {"uid": user_id},
+    )
+    row = rows[0] if rows else {}
+    return {
+        "profile": row.get("profile") or "",
+        "profile_updated_at": row.get("profile_updated_at") or None,
+    }
+
+
+async def set_user_profile(db: ArcadeClient, user_id: str, profile: str) -> None:
+    """Replace the user's curated profile in full (upserting the User vertex first)."""
+    await db.command(
+        "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
+        {"uid": user_id},
+    )
+    await db.command(
+        "UPDATE User SET profile = :p, profile_updated_at = :ts WHERE user_id = :uid",
+        {"p": profile, "ts": _now(), "uid": user_id},
+    )
+
+
 async def list_conversations(
     db: ArcadeClient,
     user_id: str,

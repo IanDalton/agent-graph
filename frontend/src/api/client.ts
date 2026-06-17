@@ -91,6 +91,13 @@ export const api = {
       `/api/graph?user_id=${encodeURIComponent(userId)}&limit=${limit}`
     ).then(json<MemoryGraph>),
 
+  // The durable, curator-maintained user profile (cross-conversation context). A fast DB read —
+  // rewritten at write time by the background memory curator, so no LLM runs here.
+  getUserProfile: (userId: string) =>
+    fetch(`/api/user/profile?user_id=${encodeURIComponent(userId)}`).then(
+      json<{ profile: string; profile_updated_at: string | null }>
+    ),
+
   listFacts: (userId: string, limit = 200) =>
     fetch(
       `/api/facts?user_id=${encodeURIComponent(userId)}&limit=${limit}`
