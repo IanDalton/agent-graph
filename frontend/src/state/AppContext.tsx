@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import { api } from "@/api/client";
+import { conversationLabel } from "@/panes/Sidebar";
 import type {
   AgentSpec,
   AppConfig,
@@ -30,6 +31,21 @@ const USER_ID = "default";
 // server default".
 const MODEL_KEY = "agent-graph:model";
 const EFFORT_KEY = "agent-graph:effort";
+
+// The URL reflects the open chat (`/c/<conversation_id>`) so a link reopens that exact chat.
+// We drive it with the History API — no router dependency, since "the open chat" is a single
+// piece of state. nginx prod (try_files -> index.html) and Vite dev both serve index.html for
+// these paths.
+const CHAT_PATH = /^\/c\/([^/?#]+)/;
+
+function chatIdFromUrl(): string | null {
+  const m = window.location.pathname.match(CHAT_PATH);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function chatPath(id: string): string {
+  return `/c/${encodeURIComponent(id)}`;
+}
 
 /** A document the UI should bring into focus (side panel → Documents tab → open it).
  *  `ts` makes re-featuring the same document retrigger the effect. */
@@ -590,11 +606,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
     (async () => {
       try {
         const rows = await refreshConversations();
-        if (rows.length > 0) {
-          setActiveId(rows[0].conversation_id);
+        // Deep-link: prefer the chat named in the URL when it's one of ours; otherwise fall back
+        // to the most recent (an unknown/foreign/archived id degrades gracefully, no 404).
+        const urlId = chatIdFromUrl();
+        const target =
+          urlId && rows.some((r) => r.conversation_id === urlId)
+            ? urlId
+            : rows.length > 0
+              ? rows[0].conversation_id
+              : null;
+        if (target) {
+          setActiveId(target);
           // Follow the loaded conversation's project so its group is expanded and a New Chat
           // continues in the same place.
-          setActiveProjectId(rows[0].project_id ?? null);
+          setActiveProjectId(
+            rows.find((r) => r.conversation_id === target)?.project_id ?? null
+          );
         } else {
           setPendingNewChat(true);
         }
@@ -606,6 +633,47 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Mirror the active chat into the URL so it's shareable. First write replaces (no bogus history
+  // entry on load); later writes push so Back/Forward walk chat history. The already-matches guard
+  // makes this a no-op when the URL is already correct — including right after a popstate-driven
+  // select, so navigating Back doesn't re-push.
+  const didInitUrl = useRef(false);
+  useEffect(() => {
+    // Don't touch the URL until the initial load has resolved — otherwise this fires on mount
+    // while activeId is still null and would replace the deep-link (/c/<id>) with "/" before the
+    // async load gets to read it.
+    if (loading) return;
+    const want = activeId ? chatPath(activeId) : "/";
+    if (window.location.pathname === want) {
+      didInitUrl.current = true;
+      return;
+    }
+    if (!didInitUrl.current) {
+      window.history.replaceState({}, "", want);
+      didInitUrl.current = true;
+    } else {
+      window.history.pushState({}, "", want);
+    }
+  }, [activeId, loading]);
+
+  // Browser Back/Forward: follow the URL to the chat it names (when it's one we have loaded).
+  useEffect(() => {
+    const onPop = () => {
+      const id = chatIdFromUrl();
+      if (id && conversations.some((c) => c.conversation_id === id)) {
+        selectConversation(id);
+      }
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [conversations, selectConversation]);
+
+  // Tab title follows the open chat (and updates when its title later fills in after a turn).
+  useEffect(() => {
+    const conv = conversations.find((c) => c.conversation_id === activeId);
+    document.title = conv ? `${conversationLabel(conv)} · agent-graph` : "agent-graph";
+  }, [activeId, conversations]);
 
   // One-time cleanup: prune leftover **empty, untitled** projects (junk from before projects
   // required a name). Safe — they hold no conversations, so nothing is lost — and it runs once,

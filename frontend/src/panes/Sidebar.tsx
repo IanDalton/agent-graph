@@ -25,7 +25,7 @@ import type { Conversation, Project } from "@/types";
 /** dataTransfer key for a conversation being dragged onto a project (or the Ungrouped zone). */
 const DRAG_MIME = "application/x-conversation-id";
 
-function conversationLabel(c: Conversation): string {
+export function conversationLabel(c: Conversation): string {
   if (c.title) return c.title;
   return `Chat ${c.conversation_id.slice(0, 6)}`;
 }

@@ -1167,6 +1167,20 @@ async def create_agent_spec(
     return agent_id
 
 
+def _normalize_agent_spec(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce an AgentSpec row's list fields to real lists.
+
+    ArcadeDB returns ``null`` for a property that was never assigned (e.g. specs seeded before the
+    ``skills`` column existed), so a raw row can carry ``skills=None``. Every consumer — the web
+    roster UI and the swarm runtime that dispatches the spec — expects lists, so a stray null must
+    never leak out: ``None`` becomes ``[]`` here, the single read boundary.
+    """
+    for field in ("tools", "recipients", "skills"):
+        if row.get(field) is None:
+            row[field] = []
+    return row
+
+
 async def get_agent_spec(db: ArcadeClient, user_id: str, ref: str) -> dict[str, Any] | None:
     """Return one sub-agent spec by its agent_id OR its name, or None. User-scoped."""
     rows = await db.query(
@@ -1174,16 +1188,17 @@ async def get_agent_spec(db: ArcadeClient, user_id: str, ref: str) -> dict[str, 
         "FROM AgentSpec WHERE user_id = :uid AND (agent_id = :ref OR name = :ref)",
         {"uid": user_id, "ref": ref},
     )
-    return rows[0] if rows else None
+    return _normalize_agent_spec(rows[0]) if rows else None
 
 
 async def list_agent_specs(db: ArcadeClient, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
     """Return this user's swarm roster (full specs, instructions included), oldest first."""
-    return await db.query(
+    rows = await db.query(
         "SELECT agent_id, name, role, instructions, tools, recipients, skills, created_at, updated_at "
         "FROM AgentSpec WHERE user_id = :uid ORDER BY created_at ASC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
+    return [_normalize_agent_spec(r) for r in rows]
 
 
 async def update_agent_spec(

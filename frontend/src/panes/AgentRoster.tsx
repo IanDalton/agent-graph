@@ -7,8 +7,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { useApp } from "@/state/AppContext";
 import type { AgentSpec } from "@/types";
 
-const sameSet = (a: string[], b: string[]) =>
-  a.length === b.length && [...a].sort().join() === [...b].sort().join();
+// Tolerant of null/undefined inputs: a spec persisted before a list column existed comes back with
+// that field as null (e.g. seeded agents with skills=null), and comparing it must not throw.
+const sameSet = (a: string[] | null | undefined, b: string[] | null | undefined) => {
+  const x = a ?? [];
+  const y = b ?? [];
+  return x.length === y.length && [...x].sort().join() === [...y].sort().join();
+};
 
 function toggle(list: string[], name: string): string[] {
   return list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
@@ -72,9 +77,11 @@ function AgentCard({ agent }: { agent: AgentSpec }) {
   const [open, setOpen] = useState(false);
   const [role, setRole] = useState(agent.role);
   const [instructions, setInstructions] = useState(agent.instructions);
-  const [tools, setTools] = useState<string[]>(agent.tools);
-  const [skl, setSkl] = useState<string[]>(agent.skills);
-  const [recipients, setRecipients] = useState<string[]>(agent.recipients);
+  // Normalize on read: a null list field (legacy/seeded specs) would otherwise break the checkbox
+  // groups' `.includes` and the dirty comparison below.
+  const [tools, setTools] = useState<string[]>(agent.tools ?? []);
+  const [skl, setSkl] = useState<string[]>(agent.skills ?? []);
+  const [recipients, setRecipients] = useState<string[]>(agent.recipients ?? []);
 
   const dirty =
     role !== agent.role ||
@@ -103,7 +110,7 @@ function AgentCard({ agent }: { agent: AgentSpec }) {
             <span className="block truncate text-[10px] text-muted-foreground">{agent.role}</span>
           )}
         </span>
-        {agent.skills.length > 0 && (
+        {(agent.skills?.length ?? 0) > 0 && (
           <span className="inline-flex items-center gap-0.5 text-[10px] text-primary">
             <Sparkles className="size-3" />
             {agent.skills.length}
