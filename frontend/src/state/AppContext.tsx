@@ -13,6 +13,7 @@ import type {
   CatalogSkill,
   Conversation,
   Mode,
+  Project,
   SkillInfo,
   SwarmFlowState,
 } from "@/types";
@@ -60,8 +61,8 @@ interface AppState {
   selectConversation: (id: string) => void;
   /** Show the mode picker in the canvas (clears active conversation). */
   openNewChatPicker: () => void;
-  /** Create and select a conversation; `mode` picks its agent profile (default regular chat). */
-  newConversation: (mode?: Mode) => Promise<void>;
+  /** Create and select a conversation; `mode` picks its agent profile, `projectId` its project. */
+  newConversation: (mode?: Mode, projectId?: string | null) => Promise<void>;
   /** Switch a conversation's agent mode mid-thread; persists and takes effect next turn. */
   setConversationMode: (id: string, mode: Mode) => Promise<void>;
   /** Set a conversation's custom system prompt; persists and takes effect next turn. */
@@ -72,7 +73,29 @@ interface AppState {
   ) => Promise<void>;
   /** Set the marketplace skills enabled for a conversation; persists, takes effect next turn. */
   setConversationSkills: (id: string, names: string[]) => Promise<void>;
+  /** Move a conversation into a project (id) or out of one (null = ungrouped). */
+  setConversationProject: (id: string, projectId: string | null) => Promise<void>;
+  /** Pin/unpin a conversation (pinned float to the top of their group). */
+  setConversationPinned: (id: string, pinned: boolean) => Promise<void>;
+  /** Archive/unarchive a conversation (archived are hidden unless "Show archived" is on). */
+  setConversationArchived: (id: string, archived: boolean) => Promise<void>;
+  /** Permanently delete a conversation (and its messages/documents). */
+  deleteConversation: (id: string) => Promise<void>;
   refreshConversations: () => Promise<Conversation[]>;
+  /** Whether archived conversations are shown in the sidebar. */
+  showArchived: boolean;
+  setShowArchived: (show: boolean) => void;
+  // --- Projects --------------------------------------------------------------------------
+  projects: Project[];
+  refreshProjects: () => Promise<Project[]>;
+  /** Create a project and return it (does not select anything). */
+  newProject: (title?: string) => Promise<Project | null>;
+  /** Set a project's system prompt; persists and takes effect next turn. */
+  setProjectSystemPrompt: (id: string, prompt: string) => Promise<void>;
+  /** Rename a project. */
+  setProjectTitle: (id: string, title: string) => Promise<void>;
+  /** Cascade-delete a project (its conversations + non-global documents). */
+  deleteProject: (id: string) => Promise<void>;
   /** The marketplace skills this user has synced (their library). */
   skills: SkillInfo[];
   /** True while a marketplace sync is in flight (drives the Sync button's spinner). */
@@ -110,6 +133,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [skillMarketplaceOpen, setSkillMarketplaceOpen] = useState(false);
   const [catalog, setCatalog] = useState<CatalogSkill[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
 
   const featureDocument = useCallback((id: string) => {
     setFeaturedDoc({ id, ts: Date.now() });
@@ -150,8 +175,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshConversations = useCallback(async () => {
-    const rows = await api.listConversations(USER_ID);
+    const rows = await api.listConversations(USER_ID, showArchived);
     setConversations(rows);
+    return rows;
+  }, [showArchived]);
+
+  const refreshProjects = useCallback(async () => {
+    const rows = await api.listProjects(USER_ID);
+    setProjects(rows);
     return rows;
   }, []);
 
@@ -162,14 +193,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setPendingNewChat(true);
   }, []);
 
-  const newConversation = useCallback(async (mode: Mode = "regular") => {
-    const convo = await api.createConversation(USER_ID, undefined, mode);
-    setConversations((prev) => [convo, ...prev]);
-    setActiveId(convo.conversation_id);
-    setFeaturedDoc(null);
-    setSwarmFlow(null);
-    setPendingNewChat(false);
-  }, []);
+  const newConversation = useCallback(
+    async (mode: Mode = "regular", projectId: string | null = null) => {
+      const convo = await api.createConversation(USER_ID, undefined, mode, projectId);
+      // The server stamps project_id but may echo it back null in the create response shape;
+      // ensure the local row carries it so the sidebar groups the new chat correctly.
+      setConversations((prev) => [{ ...convo, project_id: projectId }, ...prev]);
+      setActiveId(convo.conversation_id);
+      setFeaturedDoc(null);
+      setSwarmFlow(null);
+      setPendingNewChat(false);
+    },
+    []
+  );
 
   const selectConversation = useCallback((id: string) => {
     setActiveId(id);
@@ -236,6 +272,134 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
     },
     [refreshConversations]
+  );
+
+  const setConversationProject = useCallback(
+    async (id: string, projectId: string | null) => {
+      setConversations((prev) =>
+        prev.map((c) => (c.conversation_id === id ? { ...c, project_id: projectId } : c))
+      );
+      try {
+        await api.updateConversation(id, USER_ID, { project_id: projectId });
+      } catch (err) {
+        console.error("failed to move conversation", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [refreshConversations]
+  );
+
+  const setConversationPinned = useCallback(
+    async (id: string, pinned: boolean) => {
+      setConversations((prev) => {
+        const next = prev.map((c) =>
+          c.conversation_id === id ? { ...c, pinned } : c
+        );
+        // Keep pinned-first ordering locally so the row jumps to the top immediately.
+        return [...next].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
+      });
+      try {
+        await api.updateConversation(id, USER_ID, { pinned });
+      } catch (err) {
+        console.error("failed to pin conversation", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [refreshConversations]
+  );
+
+  const setConversationArchived = useCallback(
+    async (id: string, archived: boolean) => {
+      // Drop it from the list immediately when archiving (unless archived are shown).
+      setConversations((prev) =>
+        archived && !showArchived
+          ? prev.filter((c) => c.conversation_id !== id)
+          : prev.map((c) => (c.conversation_id === id ? { ...c, archived } : c))
+      );
+      if (archived && activeId === id) setActiveId(null);
+      try {
+        await api.updateConversation(id, USER_ID, { archived });
+      } catch (err) {
+        console.error("failed to archive conversation", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [activeId, showArchived, refreshConversations]
+  );
+
+  const deleteConversation = useCallback(
+    async (id: string) => {
+      setConversations((prev) => prev.filter((c) => c.conversation_id !== id));
+      if (activeId === id) setActiveId(null);
+      try {
+        await api.deleteConversation(id, USER_ID);
+      } catch (err) {
+        console.error("failed to delete conversation", err);
+        refreshConversations().catch(() => {});
+      }
+    },
+    [activeId, refreshConversations]
+  );
+
+  const newProject = useCallback(async (title?: string) => {
+    try {
+      const project = await api.createProject(USER_ID, title);
+      setProjects((prev) => [project, ...prev]);
+      return project;
+    } catch (err) {
+      console.error("failed to create project", err);
+      return null;
+    }
+  }, []);
+
+  const setProjectSystemPrompt = useCallback(
+    async (id: string, prompt: string) => {
+      setProjects((prev) =>
+        prev.map((p) => (p.project_id === id ? { ...p, system_prompt: prompt } : p))
+      );
+      try {
+        await api.updateProject(id, USER_ID, { system_prompt: prompt });
+      } catch (err) {
+        console.error("failed to update project prompt", err);
+        refreshProjects().catch(() => {});
+      }
+    },
+    [refreshProjects]
+  );
+
+  const setProjectTitle = useCallback(
+    async (id: string, title: string) => {
+      setProjects((prev) =>
+        prev.map((p) => (p.project_id === id ? { ...p, title } : p))
+      );
+      try {
+        await api.updateProject(id, USER_ID, { title });
+      } catch (err) {
+        console.error("failed to rename project", err);
+        refreshProjects().catch(() => {});
+      }
+    },
+    [refreshProjects]
+  );
+
+  const deleteProject = useCallback(
+    async (id: string) => {
+      // Drop the project and its member conversations locally; the cascade removed them server-side.
+      setProjects((prev) => prev.filter((p) => p.project_id !== id));
+      setConversations((prev) => {
+        const removed = prev.filter((c) => c.project_id === id).map((c) => c.conversation_id);
+        if (activeId && removed.includes(activeId)) setActiveId(null);
+        return prev.filter((c) => c.project_id !== id);
+      });
+      try {
+        await api.deleteProject(id, USER_ID);
+      } catch (err) {
+        console.error("failed to delete project", err);
+        refreshProjects().catch(() => {});
+        refreshConversations().catch(() => {});
+      }
+    },
+    [activeId, refreshProjects, refreshConversations]
   );
 
   const refreshSkills = useCallback(async () => {
@@ -306,6 +470,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     refreshSkills();
   }, [refreshSkills]);
 
+  // Load the projects list once for the sidebar groups (best-effort).
+  useEffect(() => {
+    refreshProjects().catch(() => {});
+  }, [refreshProjects]);
+
   // Initial load: fetch conversations and select the most recent (or create one).
   useEffect(() => {
     (async () => {
@@ -324,6 +493,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Re-fetch when the "Show archived" toggle flips so archived rows appear/disappear.
+  useEffect(() => {
+    if (!loading) refreshConversations().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showArchived]);
 
   return (
     <AppContext.Provider
@@ -349,7 +524,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setConversationSystemPrompt,
         setConversationSwarmSettings,
         setConversationSkills,
+        setConversationProject,
+        setConversationPinned,
+        setConversationArchived,
+        deleteConversation,
         refreshConversations,
+        showArchived,
+        setShowArchived,
+        projects,
+        refreshProjects,
+        newProject,
+        setProjectSystemPrompt,
+        setProjectTitle,
+        deleteProject,
         skills,
         syncingSkills,
         refreshSkills,

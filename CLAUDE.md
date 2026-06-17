@@ -75,10 +75,31 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   base64 like Documents). A conversation's enabled subset is stored on the `Conversation` vertex via
   `set_conversation_enabled_skills`/`get_conversation_enabled_skills` (JSON list of names; `[]` when
   unset; `list_conversations` returns it too).
+  **Projects:** `create_project`/`list_projects`/`get_project`/`update_project`/
+  `get_project_system_prompt` and `delete_project` persist `Project` vertices (user-scoped,
+  `User -HAS_PROJECT-> Project`) — a container grouping conversations under a shared system prompt +
+  uploaded reference documents. A conversation's membership is a scalar `Conversation.project_id`
+  (`None` = ungrouped), read per turn by `get_conversation_project_id` and changed by
+  `set_conversation_project_id`. `delete_project` is a **cascade**: it `delete_conversation`s every
+  member (which itself cascades that conversation's Message/RunMessages/Document/LogEntry children
+  then the Conversation), deletes the project's **non-global** documents, and **spares global**
+  documents by clearing their `project_id` (returns `{conversations, documents}` counts).
+  **Conversation lifecycle:** `delete_conversation` (hard cascade), `set_conversation_archived`
+  (hide from the default list) and `set_conversation_pinned` (float to top); `list_conversations`
+  now orders `pinned DESC, started_at DESC`, filters out archived unless `include_archived=True`,
+  and returns `project_id`/`pinned`/`archived`. **Project/global documents:** `create_document`
+  takes an optional `project_id`/`is_global`/`embedding` and an optional `conversation_id` (anchors
+  the `HAS_DOCUMENT` edge to the Conversation, else the Project, else the User so a global doc is
+  never orphaned); `list_documents` adds `project_id`/`include_global` (OR-composed) scopes;
+  `set_document_global` toggles the flag; `search_documents` ranks a project's + global docs by
+  vector similarity (`vectorNeighbors('Document[embedding]', …)`) with a LIKE fallback, same
+  best-effort contract as `search_facts`. Documents now carry an `embedding` (chat/project text
+  uploads are embedded at write time) and a vector index alongside Fact/Message.
   Graph model: `User -HAS_CONVERSATION-> Conversation -HAS_MESSAGE-> Message`,
   `Conversation -HAS_RUN_MESSAGES-> RunMessages`, `Conversation -HAS_DOCUMENT-> Document`,
   `User -KNOWS-> Fact`, `Conversation -LOGGED-> LogEntry`, `User -HAS_NODE-> <agent-created type>`,
-  `User -HAS_AGENT-> AgentSpec`, `User -HAS_SKILL-> Skill`,
+  `User -HAS_AGENT-> AgentSpec`, `User -HAS_SKILL-> Skill`, `User -HAS_PROJECT-> Project`
+  (with `Project -HAS_DOCUMENT-> Document` for project reference docs),
   plus agent-created `<instance> -<EDGE_TYPE>-> <instance>` relationships.
 - **`backend/schemas/graph_schemas.py`** — Pydantic tool I/O: `RawQuery`, `StoreFactArgs`,
   `MemorySearchResult`/`MemoryHit`, and the ontology models `VertexProperty`, `ProposeSchemaArgs`,
@@ -170,7 +191,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   metadata only), `delete_document`. Its instructions enforce the house style: check
   `list_documents` before creating (no near-duplicates), and **always `read_document` before
   revising** — the user may have edited the body since the agent last wrote it. Bad ids raise
-  `ModelRetry` (mirroring `update_fact`/`delete_fact`).
+  `ModelRetry` (mirroring `update_fact`/`delete_fact`). **Project reference documents:**
+  `list_project_documents` (the conversation's project docs + the user's global docs),
+  `read_project_document`, and `search_project_documents` (semantic + LIKE via `repo.search_documents`,
+  tolerant — any failure returns `[]`) let the agent query the documents uploaded to its project. The
+  per-turn manifest in `system_prompt.project_documents_block` advertises them so the agent knows
+  what's available without a tool call.
 - **`backend/sandbox/runner.py`** — `PythonSandbox`: containerized Python execution via ephemeral
   `docker run --rm` against the host's Docker daemon (no extra Python dependency). Each call is a
   fresh, locked-down container: `--network none`, `--memory`/`--cpus`/`--pids-limit` caps,
@@ -295,7 +321,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   user without waiting for the model to call `search_memory`. A third callable, `_user_profile`
   (`user_profile_block`), injects the durable **user profile** — the rolling cross-conversation
   synopsis maintained by `backend/memory_curator.py` (see below) and stored on the `User` vertex —
-  just above the facts block, so the profile frames the more granular facts. **Best-effort** like the
+  just above the facts block, so the profile frames the more granular facts. `enabled_skills_block`
+  and `project_documents_block` are two more dynamic callables: the latter advertises the
+  conversation's project + global reference documents (titles/ids, capped) each turn so the agent
+  knows what `read_project_document`/`search_project_documents` can pull in. The project **system
+  prompt** itself is layered by `main.compose_instructions(system_prompt, project_prompt)` (base →
+  project → conversation, empty layers omitted), not here. **Best-effort** like the
   persistence hooks: any DB/embedder failure logs (`agent_graph.system_prompt`) and degrades to no
   fact/profile block, never aborting a turn. Sub-agent delegates keep their own task-specific prompts
   (not wired here).
@@ -367,9 +398,15 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   **no secrets**),
   `GET|POST /api/conversations` (list /
   create — create mints a uuid `conversation_id` and stamps the requested `mode`, validated by a
-  `Literal`), `PATCH /api/conversations/{id}` (partial update of `mode`, the custom
-  `system_prompt`, swarm bounds, and/or `enabled_skills`; only the fields in `model_fields_set` are
-  applied, so `system_prompt:""` clears it and `enabled_skills:[]` clears the selection),
+  `Literal`; `POST` also accepts an optional `project_id`), `PATCH /api/conversations/{id}` (partial
+  update of `mode`, the custom `system_prompt`, swarm bounds, `enabled_skills`, `project_id`
+  (`null` = ungrouped), and the `archived`/`pinned` lifecycle flags; only the fields in
+  `model_fields_set` are applied, so `system_prompt:""` clears it and `enabled_skills:[]` clears the
+  selection), `DELETE /api/conversations/{id}` (hard cascade delete), `GET /api/conversations`
+  takes `include_archived`. **Projects:** `GET|POST /api/projects`, `PATCH /api/projects/{id}`
+  (title/system_prompt), `DELETE /api/projects/{id}` (cascade — returns `{deleted, conversations,
+  documents}`), `GET|POST /api/projects/{id}/documents` (list project+global docs / upload one,
+  decoded + embedded like a chat upload), and `POST /api/documents/{id}/global` (the global toggle).
   the skills surface — `GET /api/skills` (the user's synced library, metadata),
   `GET /api/skills/catalog` (the **live** marketplace catalog with an `installed` flag merged per
   user — backs the marketplace dialog; tolerant → `[]`), `POST /api/skills/sync` (install one
@@ -393,7 +430,13 @@ opens a downward mode menu — local to the Sidebar, since the shared `ui/popove
 upward for the composer. The chosen mode rides `POST /api/conversations`; it can be changed later
 mid-conversation via the **mode chip** in the composer (`Composer`'s `ModeChip` →
 `AppContext.setConversationMode` → `PATCH /api/conversations/{id}`), which optimistically updates
-the local row so the sidebar icon and the `Canvas` renderer switch at once),
+the local row so the sidebar icon and the `Canvas` renderer switch at once. **Projects** render as
+collapsible group headers above the conversation list (with an "Ungrouped" section and a "Show
+archived" toggle): a **New Project** button (`FolderPlus` → `AppContext.newProject`), a per-header
+"+" that creates a chat inside that project, a header menu to rename / cascade-delete it (the delete
+is gated by a confirm `Dialog` warning that member chats + non-global docs are removed), and a
+per-conversation kebab `RowMenu` for Pin/Archive/Move-to-project/Delete. Pinned chats float to the
+top within each group),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
@@ -404,7 +447,12 @@ shows the skills *loaded onto this chat* as removable chips plus a "Browse" butt
 Sparkles button in the `Composer` toolbar): a full-screen gallery of Claude's live catalog
 (`AppContext.catalog` ← `GET /api/skills/catalog`) where each card's "Add to chat"
 (`AppContext.addSkillToChat` — installs via `POST /api/skills/sync` `names=[name]` if needed, then
-enables via `setConversationSkills`) loads a skill onto the active conversation) and a
+enables via `setConversationSkills`) loads a skill onto the active conversation). When the active
+conversation belongs to a project, a **`ProjectCard`** (`panes/ProjectCard.tsx`) sits at the top of
+the Context tab: the project's system-prompt textarea (saved on blur via
+`AppContext.setProjectSystemPrompt`) and its reference-document list — upload (a `FileReader`
+base64 helper → `api.uploadProjectDocument`), open (reusing the exported `DocumentView`), a per-doc
+**Global** toggle (`Globe` → `api.setDocumentGlobal`), and delete. There is also a
 *Documents* tab (`panes/DocumentsPane.tsx`) listing the
 active conversation's agent-authored documents. Opening one renders by media type
 (`DocumentBody`): **`text/html` runs as a live interactive app** in a sandboxed iframe

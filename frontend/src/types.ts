@@ -14,6 +14,21 @@ export interface Conversation {
   swarm_max_depth?: number | null;
   /** Marketplace skills enabled for this conversation (by skill name). */
   enabled_skills?: string[];
+  /** Owning project id (null/undefined ⇒ ungrouped — shown in the "Ungrouped" sidebar section). */
+  project_id?: string | null;
+  /** Lifecycle flags: pinned floats it to the top of its group; archived hides it from the list. */
+  pinned?: boolean;
+  archived?: boolean;
+}
+
+/** A project: a container grouping conversations under a shared system prompt + reference
+ *  documents the agent can query across the group (GET /api/projects, metadata only). */
+export interface Project {
+  project_id: string;
+  title: string | null;
+  /** Project-level system prompt, layered between the base prompt and the conversation prompt. */
+  system_prompt?: string;
+  created_at?: string;
 }
 
 /** A marketplace skill the user has synced into their database (GET /api/skills, metadata only). */
@@ -242,6 +257,10 @@ export interface Fact {
 export interface DocumentMeta {
   document_id: string;
   conversation_id?: string;
+  /** Owning project id (set on project reference documents instead of conversation_id). */
+  project_id?: string | null;
+  /** True when the document is global (available in every project, exempt from cascade-delete). */
+  is_global?: boolean;
   title: string;
   mime_type: string;
   /** "text" (content is literal text) or "base64" (binary artifact, e.g. a sandbox-made PDF). */

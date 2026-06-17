@@ -140,7 +140,7 @@ function DocumentRow({
 
 /** Viewer/editor for one opened document. Markdown renders rich; other text shows in a
  *  monospace block. Text documents flip into a textarea on Edit and save via PUT. */
-function DocumentView({
+export function DocumentView({
   documentId,
   onBack,
 }: {

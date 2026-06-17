@@ -39,7 +39,7 @@ from backend.db.arcade_db import (
     ArcadeClient,
     database_name_for_user,
 )
-from backend.embeddings import embeddings_enabled
+from backend.embeddings import Embedder, embeddings_enabled
 from backend.model_selection import available_models, context_window_for, default_model_label
 from backend.token_count import count_tokens
 
@@ -158,6 +158,9 @@ class NewConversation(BaseModel):
     # The conversation's agent profile at creation (see backend.main.MODES). Changeable later
     # via PATCH /api/conversations/{id}.
     mode: Literal["regular", "research", "swarm"] = "regular"
+    # Optional owning project: the chat is created inside this project (inherits its system prompt
+    # + reference documents, shows under its sidebar group). Omit for an ungrouped chat.
+    project_id: str | None = None
 
 
 class UpdateConversation(BaseModel):
@@ -176,15 +179,25 @@ class UpdateConversation(BaseModel):
     )
     # Marketplace skills enabled for this conversation (by skill name). Empty list clears them.
     enabled_skills: list[str] | None = None
+    # Move the conversation into a project (id) or out of one (null = ungrouped).
+    project_id: str | None = None
+    # Lifecycle flags: archive hides it from the default list; pin floats it to the top.
+    archived: bool | None = None
+    pinned: bool | None = None
 
 
 @app.get("/api/conversations")
-async def list_conversations(user_id: str = "default") -> list[dict[str, Any]]:
+async def list_conversations(
+    user_id: str = "default", include_archived: bool = False
+) -> list[dict[str, Any]]:
     # Pure read, no schema ensure. Tolerant: a brand-new user whose database doesn't exist yet
     # simply has no conversations, so a query error maps to an empty list rather than a 500.
+    # Archived conversations are omitted unless include_archived is set (the "Show archived" toggle).
     try:
         async with _client_for(user_id) as db:
-            return await repo.list_conversations(db, user_id)
+            return await repo.list_conversations(
+                db, user_id, include_archived=include_archived
+            )
     except Exception:  # noqa: BLE001
         logger.warning("list_conversations failed", exc_info=True)
         return []
@@ -196,12 +209,14 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
     # The one common write path: ensure the database/schema exist before the first insert.
     async with _client_for(body.user_id, ensure=True) as db:
         await repo.create_conversation(
-            db, body.user_id, conversation_id, title=body.title, mode=body.mode
+            db, body.user_id, conversation_id, title=body.title, mode=body.mode,
+            project_id=body.project_id,
         )
     return {
         "conversation_id": conversation_id,
         "title": body.title,
         "mode": body.mode,
+        "project_id": body.project_id,
     }
 
 
@@ -209,7 +224,7 @@ async def create_conversation(body: NewConversation) -> dict[str, Any]:
 async def update_conversation(
     conversation_id: str, body: UpdateConversation
 ) -> dict[str, Any]:
-    """Update a conversation's agent mode, custom system prompt, and/or swarm bounds mid-thread.
+    """Update a conversation's mode, custom prompt, swarm bounds, project, or lifecycle flags.
 
     All changes persist and take effect on the next turn. Only the fields explicitly sent are
     applied, so the client can change one without disturbing the others.
@@ -239,7 +254,27 @@ async def update_conversation(
                 db, conversation_id, body.enabled_skills or []
             )
             updated["enabled_skills"] = body.enabled_skills or []
+        if "project_id" in fields:
+            await repo.set_conversation_project_id(db, conversation_id, body.project_id)
+            updated["project_id"] = body.project_id
+        if "archived" in fields and body.archived is not None:
+            await repo.set_conversation_archived(db, conversation_id, body.archived)
+            updated["archived"] = body.archived
+        if "pinned" in fields and body.pinned is not None:
+            await repo.set_conversation_pinned(db, conversation_id, body.pinned)
+            updated["pinned"] = body.pinned
     return updated
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def remove_conversation(
+    conversation_id: str, user_id: str = "default"
+) -> dict[str, Any]:
+    """Permanently delete a conversation and all its messages/documents (404 if not the caller's)."""
+    async with _client_for(user_id, ensure=True) as db:
+        # delete_conversation is tolerant of an already-gone conversation; report the id regardless.
+        await repo.delete_conversation(db, user_id, conversation_id)
+    return {"deleted": conversation_id}
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
@@ -408,6 +443,171 @@ async def remove_document(document_id: str, user_id: str = "default") -> dict[st
     if not deleted:
         raise HTTPException(status_code=404, detail="document not found")
     return {"deleted": document_id}
+
+
+class DocumentGlobal(BaseModel):
+    """A toggle from the project documents UI: whether a document is global (survives cascade)."""
+
+    user_id: str = "default"
+    is_global: bool
+
+
+@app.post("/api/documents/{document_id}/global")
+async def set_document_global(document_id: str, body: DocumentGlobal) -> dict[str, Any]:
+    """Mark a document global (available everywhere, exempt from project cascade-delete) or not.
+
+    404 when the document doesn't belong to this user.
+    """
+    async with _client_for(body.user_id, ensure=True) as db:
+        updated = await repo.set_document_global(
+            db, body.user_id, document_id, body.is_global
+        )
+    if not updated:
+        raise HTTPException(status_code=404, detail="document not found")
+    return {"document_id": document_id, "is_global": body.is_global}
+
+
+# -------------------------------------------------------------------------- projects
+
+
+class NewProject(BaseModel):
+    user_id: str = "default"
+    title: str | None = None
+    system_prompt: str = ""
+
+
+class UpdateProject(BaseModel):
+    user_id: str = "default"
+    # Partial update (model_fields_set): only the sent fields change. title="" / system_prompt=""
+    # clear the respective field.
+    title: str | None = None
+    system_prompt: str | None = None
+
+
+@app.get("/api/projects")
+async def list_projects(user_id: str = "default") -> list[dict[str, Any]]:
+    """List the user's projects (metadata) for the sidebar groups. Tolerant: errors → empty list."""
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_projects(db, user_id)
+    except Exception:  # noqa: BLE001 — the sidebar must never break the page.
+        logger.warning("list_projects failed", exc_info=True)
+        return []
+
+
+@app.post("/api/projects")
+async def create_project(body: NewProject) -> dict[str, Any]:
+    project_id = uuid.uuid4().hex
+    async with _client_for(body.user_id, ensure=True) as db:
+        await repo.create_project(
+            db, body.user_id, project_id, title=body.title, system_prompt=body.system_prompt
+        )
+    return {
+        "project_id": project_id,
+        "title": body.title,
+        "system_prompt": body.system_prompt,
+    }
+
+
+@app.patch("/api/projects/{project_id}")
+async def update_project(project_id: str, body: UpdateProject) -> dict[str, Any]:
+    """Update a project's title and/or system prompt (404 if not the caller's)."""
+    fields = body.model_fields_set
+    title = body.title if "title" in fields else None
+    system_prompt = body.system_prompt if "system_prompt" in fields else None
+    async with _client_for(body.user_id, ensure=True) as db:
+        updated = await repo.update_project(
+            db, body.user_id, project_id, title=title, system_prompt=system_prompt
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="project not found")
+        row = await repo.get_project(db, body.user_id, project_id)
+    return row or {"project_id": project_id}
+
+
+@app.delete("/api/projects/{project_id}")
+async def remove_project(project_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Cascade-delete a project: its conversations + non-global documents. Globals are spared.
+
+    Returns counts of what was deleted (for the UI's confirmation toast).
+    """
+    async with _client_for(user_id, ensure=True) as db:
+        counts = await repo.delete_project(db, user_id, project_id)
+    return {"deleted": project_id, **counts}
+
+
+@app.get("/api/projects/{project_id}/documents")
+async def get_project_documents(
+    project_id: str, user_id: str = "default"
+) -> list[dict[str, Any]]:
+    """List a project's reference documents plus the user's global ones (metadata only). Tolerant."""
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_documents(
+                db, user_id, project_id=project_id, include_global=True
+            )
+    except Exception:  # noqa: BLE001 — the project pane must never break the page.
+        logger.warning("list project documents failed", exc_info=True)
+        return []
+
+
+class ProjectUpload(BaseModel):
+    """Upload one reference file into a project's document set (base64 bytes + name + mime)."""
+
+    user_id: str = "default"
+    filename: str = ""
+    mime_type: str
+    data: str  # base64-encoded file bytes (no "data:" URL prefix)
+
+
+@app.post("/api/projects/{project_id}/documents")
+async def upload_project_document(
+    project_id: str, body: ProjectUpload
+) -> dict[str, Any]:
+    """Persist an uploaded file as a project reference document (decoded + embedded like a chat upload).
+
+    Mirrors stream_run's upload-persist: binary mimes stay base64, text is decoded and (when
+    embeddings are configured) embedded so search_project_documents can rank it.
+    """
+    try:
+        size = len(base64.b64decode(body.data, validate=True))
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="attachment is not valid base64")
+    if size > _MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=400, detail="attachment exceeds the size limit")
+
+    mime = body.mime_type or "application/octet-stream"
+    name = body.filename or "upload"
+    if main._is_binary_attachment(mime):
+        body_text, encoding = body.data, "base64"
+    else:
+        body_text = base64.b64decode(body.data).decode("utf-8", errors="replace")
+        encoding = "text"
+    embedding = None
+    if encoding == "text" and embeddings_enabled():
+        try:
+            async with Embedder.from_env() as embedder:
+                embedding = await embedder.embed(body_text)
+        except Exception:  # noqa: BLE001 — embedding is best-effort; degrade to LIKE search.
+            logger.warning("embedding project upload %r failed", name, exc_info=True)
+    async with _client_for(body.user_id, ensure=True) as db:
+        document_id = await repo.create_document(
+            db,
+            body.user_id,
+            title=name,
+            content=body_text,
+            mime_type=mime,
+            encoding=encoding,
+            project_id=project_id,
+            embedding=embedding,
+        )
+    return {
+        "document_id": document_id,
+        "project_id": project_id,
+        "title": name,
+        "mime_type": mime,
+        "encoding": encoding,
+    }
 
 
 # ---------------------------------------------------------------------------- graph

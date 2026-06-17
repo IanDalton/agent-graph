@@ -51,13 +51,15 @@ async def create_conversation(
     conversation_id: str,
     title: str | None = None,
     mode: str = "regular",
+    project_id: str | None = None,
 ) -> None:
     """Ensure the User and Conversation vertices (and their link) exist. Idempotent.
 
     ``mode`` selects the agent profile for this conversation ('regular'/'research'/'swarm' — see
     ``backend.main.MODES``). It is fixed at creation: the persistence hook's idempotent call (which
     always passes the default) cannot overwrite a mode the API set, because an existing
-    conversation returns early.
+    conversation returns early. ``project_id`` (when given) stamps the owning project at creation
+    (the conversation shows under that project's group and inherits its system prompt + documents).
     """
     existing = await db.query(
         "SELECT count(*) AS n FROM Conversation WHERE conversation_id = :cid",
@@ -71,11 +73,16 @@ async def create_conversation(
         "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
         {"uid": user_id},
     )
-    await db.command(
-        "CREATE VERTEX Conversation SET conversation_id = :cid, user_id = :uid, "
-        "title = :title, mode = :mode, started_at = :ts",
-        {"cid": conversation_id, "uid": user_id, "title": title, "mode": mode, "ts": _now()},
+    set_clause = (
+        "conversation_id = :cid, user_id = :uid, title = :title, mode = :mode, started_at = :ts"
     )
+    params: dict[str, Any] = {
+        "cid": conversation_id, "uid": user_id, "title": title, "mode": mode, "ts": _now(),
+    }
+    if project_id is not None:
+        set_clause += ", project_id = :pid"
+        params["pid"] = project_id
+    await db.command("CREATE VERTEX Conversation SET " + set_clause, params)
     await db.command(
         "CREATE EDGE HAS_CONVERSATION "
         "FROM (SELECT FROM User WHERE user_id = :uid) "
@@ -274,26 +281,37 @@ async def list_conversations(
     db: ArcadeClient,
     user_id: str,
     limit: int = 50,
+    include_archived: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return this user's conversations, most recently started first.
+    """Return this user's conversations, pinned first then most recently started.
 
     Backs the UI's left-pane conversation list. Scoped by ``user_id`` (defense-in-depth on
     top of the per-user database). ``mode`` is the stored agent profile; conversations created
     before modes existed have none and report ``"regular"``. ``system_prompt`` is the custom
     per-conversation prompt (``""`` when unset), so the UI's config card has it without a separate
-    fetch.
+    fetch. ``project_id`` is the owning project (``None`` ⇒ ungrouped); ``pinned``/``archived`` are
+    the lifecycle flags (default ``False`` for rows created before they existed). Archived
+    conversations are omitted unless ``include_archived`` is set.
     """
+    where = "user_id = :uid"
+    if not include_archived:
+        # Default-false semantics: a missing/NULL archived flag reads as not-archived, so existing
+        # rows need no backfill. ArcadeDB has no boolean coercion in WHERE, so test both forms.
+        where += " AND (archived IS NULL OR archived = false)"
     rows = await db.query(
         "SELECT conversation_id, title, mode, system_prompt, enabled_skills, "
-        "swarm_max_parallel, swarm_max_depth, started_at FROM Conversation "
-        "WHERE user_id = :uid ORDER BY started_at DESC LIMIT :limit",
+        "swarm_max_parallel, swarm_max_depth, project_id, pinned, archived, started_at "
+        f"FROM Conversation WHERE {where} "
+        "ORDER BY pinned DESC, started_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
     for row in rows:
         row["mode"] = row.get("mode") or "regular"
         row["system_prompt"] = row.get("system_prompt") or ""
         row["enabled_skills"] = _parse_skill_names(row.get("enabled_skills"))
-        # Swarm overrides are left as-is (None when unset); the UI shows the config default then.
+        row["pinned"] = bool(row.get("pinned"))
+        row["archived"] = bool(row.get("archived"))
+        # project_id and swarm overrides are left as-is (None when unset).
     return rows
 
 
@@ -343,6 +361,203 @@ async def get_conversation_system_prompt(db: ArcadeClient, conversation_id: str)
         {"cid": conversation_id},
     )
     return str((rows[0].get("system_prompt") if rows else "") or "")
+
+
+async def get_conversation_project_id(db: ArcadeClient, conversation_id: str) -> str | None:
+    """Return the conversation's owning project id, or ``None`` when ungrouped/unknown.
+
+    Read each turn by ``stream_run`` to layer in the project's system prompt + reference documents.
+    """
+    rows = await db.query(
+        "SELECT project_id FROM Conversation WHERE conversation_id = :cid",
+        {"cid": conversation_id},
+    )
+    return (rows[0].get("project_id") if rows else None) or None
+
+
+async def set_conversation_project_id(
+    db: ArcadeClient, conversation_id: str, project_id: str | None
+) -> None:
+    """Move a conversation into a project, or out of one. ``None`` clears membership (ungrouped)."""
+    await db.command(
+        "UPDATE Conversation SET project_id = :pid WHERE conversation_id = :cid",
+        {"pid": project_id, "cid": conversation_id},
+    )
+
+
+async def set_conversation_archived(
+    db: ArcadeClient, conversation_id: str, archived: bool
+) -> None:
+    """Archive (hide from the default list) or unarchive a conversation. Needs no DDL."""
+    await db.command(
+        "UPDATE Conversation SET archived = :a WHERE conversation_id = :cid",
+        {"a": bool(archived), "cid": conversation_id},
+    )
+
+
+async def set_conversation_pinned(db: ArcadeClient, conversation_id: str, pinned: bool) -> None:
+    """Pin a conversation to the top of the list, or unpin it. Needs no DDL."""
+    await db.command(
+        "UPDATE Conversation SET pinned = :p WHERE conversation_id = :cid",
+        {"p": bool(pinned), "cid": conversation_id},
+    )
+
+
+async def delete_conversation(db: ArcadeClient, user_id: str, conversation_id: str) -> None:
+    """Permanently delete a conversation and all of its children, if it belongs to ``user_id``.
+
+    Cascades: the conversation's Messages, RunMessages, conversation-scoped Documents and LogEntries
+    are deleted first (their HAS_* edges go with them via ``DELETE VERTEX``), then the Conversation
+    vertex itself. Project- and global-scoped documents have no ``conversation_id`` and are left
+    untouched. Best-effort per child set — a failure deleting one set must not strand the rest, so
+    callers wrap this tolerantly.
+    """
+    for child in ("Message", "RunMessages", "Document", "LogEntry"):
+        await db.command(
+            f"DELETE VERTEX FROM (SELECT FROM {child} WHERE conversation_id = :cid)",
+            {"cid": conversation_id},
+        )
+    await db.command(
+        "DELETE VERTEX FROM (SELECT FROM Conversation "
+        "WHERE conversation_id = :cid AND user_id = :uid)",
+        {"cid": conversation_id, "uid": user_id},
+    )
+
+
+# --- Projects: containers grouping conversations + reference documents ---------------------------
+
+
+async def create_project(
+    db: ArcadeClient,
+    user_id: str,
+    project_id: str,
+    title: str | None = None,
+    system_prompt: str = "",
+) -> None:
+    """Ensure the User and Project vertices (and their link) exist. Idempotent like
+    :func:`create_conversation`: an existing project returns early.
+    """
+    existing = await db.query(
+        "SELECT count(*) AS n FROM Project WHERE project_id = :pid",
+        {"pid": project_id},
+    )
+    if existing and existing[0].get("n", 0) > 0:
+        return
+    await db.command(
+        "UPDATE User SET user_id = :uid UPSERT WHERE user_id = :uid",
+        {"uid": user_id},
+    )
+    await db.command(
+        "CREATE VERTEX Project SET project_id = :pid, user_id = :uid, "
+        "title = :title, system_prompt = :sp, created_at = :ts",
+        {"pid": project_id, "uid": user_id, "title": title, "sp": system_prompt, "ts": _now()},
+    )
+    await db.command(
+        "CREATE EDGE HAS_PROJECT "
+        "FROM (SELECT FROM User WHERE user_id = :uid) "
+        "TO (SELECT FROM Project WHERE project_id = :pid)",
+        {"uid": user_id, "pid": project_id},
+    )
+
+
+async def list_projects(
+    db: ArcadeClient, user_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Return this user's projects, most recently created first (metadata for the sidebar groups)."""
+    rows = await db.query(
+        "SELECT project_id, title, system_prompt, created_at FROM Project "
+        "WHERE user_id = :uid ORDER BY created_at DESC LIMIT :limit",
+        {"uid": user_id, "limit": limit},
+    )
+    for row in rows:
+        row["system_prompt"] = row.get("system_prompt") or ""
+    return rows
+
+
+async def get_project(
+    db: ArcadeClient, user_id: str, project_id: str
+) -> dict[str, Any] | None:
+    """Return one project's metadata, or ``None`` if it doesn't exist for this user."""
+    rows = await db.query(
+        "SELECT project_id, title, system_prompt, created_at FROM Project "
+        "WHERE project_id = :pid AND user_id = :uid",
+        {"pid": project_id, "uid": user_id},
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    row["system_prompt"] = row.get("system_prompt") or ""
+    return row
+
+
+async def get_project_system_prompt(db: ArcadeClient, project_id: str) -> str:
+    """Return the project's system prompt, or ``""`` when unset/unknown (mirrors the conversation one)."""
+    rows = await db.query(
+        "SELECT system_prompt FROM Project WHERE project_id = :pid",
+        {"pid": project_id},
+    )
+    return str((rows[0].get("system_prompt") if rows else "") or "")
+
+
+async def update_project(
+    db: ArcadeClient,
+    user_id: str,
+    project_id: str,
+    title: str | None = None,
+    system_prompt: str | None = None,
+) -> int:
+    """Revise a project's title and/or system prompt. Returns rows updated (0 if not this user's)."""
+    set_clauses: list[str] = []
+    params: dict[str, Any] = {"pid": project_id, "uid": user_id}
+    if title is not None:
+        set_clauses.append("title = :title")
+        params["title"] = title
+    if system_prompt is not None:
+        set_clauses.append("system_prompt = :sp")
+        params["sp"] = system_prompt
+    if not set_clauses:
+        return 0
+    result = await db.command(
+        "UPDATE Project SET " + ", ".join(set_clauses)
+        + " WHERE project_id = :pid AND user_id = :uid",
+        params,
+    )
+    return _affected(result)
+
+
+async def delete_project(
+    db: ArcadeClient, user_id: str, project_id: str
+) -> dict[str, int]:
+    """Cascade-delete a project: its member conversations and its non-global documents.
+
+    Global documents (``is_global = true``) are *spared* — they are un-scoped from the project
+    (``project_id`` cleared) and remain queryable everywhere. Returns counts ``{conversations,
+    documents}`` of what was deleted, for the UI's confirmation toast. Scoped to ``user_id``.
+    """
+    members = await db.query(
+        "SELECT conversation_id FROM Conversation WHERE user_id = :uid AND project_id = :pid",
+        {"uid": user_id, "pid": project_id},
+    )
+    for row in members:
+        cid = row.get("conversation_id")
+        if cid:
+            await delete_conversation(db, user_id, cid)
+    docs = await db.command(
+        "DELETE VERTEX FROM (SELECT FROM Document WHERE user_id = :uid AND project_id = :pid "
+        "AND (is_global IS NULL OR is_global = false))",
+        {"uid": user_id, "pid": project_id},
+    )
+    # Spare global docs: drop their project link so they survive as user-global references.
+    await db.command(
+        "UPDATE Document SET project_id = null "
+        "WHERE user_id = :uid AND project_id = :pid AND is_global = true",
+        {"uid": user_id, "pid": project_id},
+    )
+    await db.command(
+        "DELETE VERTEX FROM (SELECT FROM Project WHERE project_id = :pid AND user_id = :uid)",
+        {"pid": project_id, "uid": user_id},
+    )
+    return {"conversations": len(members), "documents": _affected(docs)}
 
 
 async def set_conversation_swarm_settings(
@@ -667,41 +882,70 @@ async def delete_fact(db: ArcadeClient, user_id: str, fact_id: str) -> int:
 async def create_document(
     db: ArcadeClient,
     user_id: str,
-    conversation_id: str,
-    title: str,
-    content: str,
+    conversation_id: str | None = None,
+    title: str = "",
+    content: str = "",
     mime_type: str = "text/markdown",
     encoding: str = "text",
+    project_id: str | None = None,
+    is_global: bool = False,
+    embedding: list[float] | None = None,
 ) -> str:
-    """Create an agent-authored document, linked to its conversation. Returns the document_id.
+    """Create a document and link it to its owner. Returns the document_id.
 
-    Documents are durable artifacts (reports, notes, code listings) the agent produces for the
-    user. They surface in the web UI's Documents pane, where text-based ones can be edited by
-    the user via :func:`update_document`. ``encoding`` is ``"text"`` for literal text content or
-    ``"base64"`` for binary artifacts (PDFs, images) produced by the Python sandbox.
+    Documents are durable artifacts (reports, notes, code listings, uploaded reference files). They
+    surface in the web UI's Documents pane, where text-based ones can be edited by the user via
+    :func:`update_document`. ``encoding`` is ``"text"`` for literal text or ``"base64"`` for binary
+    artifacts (PDFs, images).
+
+    Scope (pick one): pass ``conversation_id`` for a conversation-scoped document (the default,
+    agent-authored or chat upload), or ``project_id`` for a project reference document the agent can
+    query across the whole project. ``is_global`` marks a document available everywhere (and exempt
+    from project cascade-delete). When ``embedding`` is given, it is stored for semantic search via
+    :func:`search_documents`. The ``HAS_DOCUMENT`` edge is anchored to the Conversation when
+    ``conversation_id`` is set, else the Project when ``project_id`` is set, else the User (so a
+    global document is never orphaned).
     """
     document_id = _new_id()
     now = _now()
-    await db.command(
-        "CREATE VERTEX Document SET document_id = :did, conversation_id = :cid, "
-        "user_id = :uid, title = :title, content = :content, mime_type = :mime, "
-        "encoding = :enc, created_at = :ts, updated_at = :ts",
-        {
-            "did": document_id,
-            "cid": conversation_id,
-            "uid": user_id,
-            "title": title,
-            "content": content,
-            "mime": mime_type,
-            "enc": encoding,
-            "ts": now,
-        },
+    set_clause = (
+        "document_id = :did, user_id = :uid, title = :title, content = :content, "
+        "mime_type = :mime, encoding = :enc, is_global = :glob, created_at = :ts, updated_at = :ts"
     )
+    params: dict[str, Any] = {
+        "did": document_id,
+        "uid": user_id,
+        "title": title,
+        "content": content,
+        "mime": mime_type,
+        "enc": encoding,
+        "glob": bool(is_global),
+        "ts": now,
+    }
+    if conversation_id is not None:
+        set_clause += ", conversation_id = :cid"
+        params["cid"] = conversation_id
+    if project_id is not None:
+        set_clause += ", project_id = :pid"
+        params["pid"] = project_id
+    if embedding is not None:
+        set_clause += ", embedding = :emb"
+        params["emb"] = embedding
+    await db.command("CREATE VERTEX Document SET " + set_clause, params)
+    # Anchor the HAS_DOCUMENT edge to the most specific owner that exists.
+    if conversation_id is not None:
+        anchor = "SELECT FROM Conversation WHERE conversation_id = :aid"
+        params_edge = {"aid": conversation_id, "did": document_id}
+    elif project_id is not None:
+        anchor = "SELECT FROM Project WHERE project_id = :aid"
+        params_edge = {"aid": project_id, "did": document_id}
+    else:
+        anchor = "SELECT FROM User WHERE user_id = :aid"
+        params_edge = {"aid": user_id, "did": document_id}
     await db.command(
-        "CREATE EDGE HAS_DOCUMENT "
-        "FROM (SELECT FROM Conversation WHERE conversation_id = :cid) "
+        f"CREATE EDGE HAS_DOCUMENT FROM ({anchor}) "
         "TO (SELECT FROM Document WHERE document_id = :did)",
-        {"cid": conversation_id, "did": document_id},
+        params_edge,
     )
     return document_id
 
@@ -736,12 +980,32 @@ async def update_document(
 async def get_document(db: ArcadeClient, user_id: str, document_id: str) -> dict[str, Any] | None:
     """Return one document (full content included), or None if it doesn't exist for this user."""
     rows = await db.query(
-        "SELECT document_id, conversation_id, title, content, mime_type, encoding, "
-        "created_at, updated_at "
+        "SELECT document_id, conversation_id, project_id, is_global, title, content, mime_type, "
+        "encoding, created_at, updated_at "
         "FROM Document WHERE document_id = :did AND user_id = :uid",
         {"did": document_id, "uid": user_id},
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    row["is_global"] = bool(row.get("is_global"))
+    return row
+
+
+async def set_document_global(
+    db: ArcadeClient, user_id: str, document_id: str, is_global: bool
+) -> int:
+    """Mark a document global (available everywhere, exempt from project cascade-delete) or not.
+
+    User-scoped and matched on the indexed ``document_id``. Returns rows updated (0 if not this
+    user's). Backs the per-document "Global" toggle in the project documents UI.
+    """
+    result = await db.command(
+        "UPDATE Document SET is_global = :g, updated_at = :ts "
+        "WHERE document_id = :did AND user_id = :uid",
+        {"g": bool(is_global), "ts": _now(), "did": document_id, "uid": user_id},
+    )
+    return _affected(result)
 
 
 async def list_documents(
@@ -749,23 +1013,94 @@ async def list_documents(
     user_id: str,
     conversation_id: str | None = None,
     limit: int = 50,
+    project_id: str | None = None,
+    include_global: bool = False,
 ) -> list[dict[str, Any]]:
     """Return this user's documents (metadata only, no content), most recently updated first.
 
-    Pass ``conversation_id`` to restrict to one conversation (the Documents pane does); omit it
-    for all of the user's documents. Content is excluded so the list stays light — fetch one
-    document's body with :func:`get_document`.
+    Scope (the filters compose with OR so the global set can be folded in):
+    - ``conversation_id`` — restrict to one conversation (the Documents pane).
+    - ``project_id`` — restrict to one project's reference documents.
+    - ``include_global`` — also include the user's global documents (``is_global = true``),
+      regardless of project/conversation. With no scope at all, returns all of the user's documents.
+    Content is excluded so the list stays light — fetch one document's body with :func:`get_document`.
     """
-    where = "user_id = :uid"
     params: dict[str, Any] = {"uid": user_id, "limit": limit}
+    clauses: list[str] = []
     if conversation_id is not None:
-        where += " AND conversation_id = :cid"
+        clauses.append("conversation_id = :cid")
         params["cid"] = conversation_id
-    return await db.query(
-        "SELECT document_id, conversation_id, title, mime_type, encoding, created_at, updated_at "
-        f"FROM Document WHERE {where} ORDER BY updated_at DESC LIMIT :limit",
+    if project_id is not None:
+        clauses.append("project_id = :pid")
+        params["pid"] = project_id
+    if include_global:
+        clauses.append("is_global = true")
+    where = "user_id = :uid"
+    if clauses:
+        where += " AND (" + " OR ".join(clauses) + ")"
+    rows = await db.query(
+        "SELECT document_id, conversation_id, project_id, is_global, title, mime_type, encoding, "
+        f"created_at, updated_at FROM Document WHERE {where} ORDER BY updated_at DESC LIMIT :limit",
         params,
     )
+    for row in rows:
+        row["is_global"] = bool(row.get("is_global"))
+    return rows
+
+
+async def _search_documents_like(
+    db: ArcadeClient, user_id: str, text: str, limit: int, scope: str, params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    p = {**params, "uid": user_id, "pat": f"%{text}%", "limit": limit}
+    return await db.query(
+        "SELECT document_id, title, content, project_id, is_global FROM Document "
+        f"WHERE user_id = :uid AND ({scope}) AND content LIKE :pat "
+        "ORDER BY updated_at DESC LIMIT :limit",
+        p,
+    )
+
+
+async def search_documents(
+    db: ArcadeClient,
+    user_id: str,
+    text: str,
+    limit: int = 8,
+    embedding: list[float] | None = None,
+    project_id: str | None = None,
+    include_global: bool = True,
+) -> list[dict[str, Any]]:
+    """Search a project's (and optionally the user's global) reference documents.
+
+    Mirrors :func:`search_facts`: when ``embedding`` is given, rank by vector similarity via the
+    ``vectorNeighbors`` HNSW index, else (or on any vector error / empty result) fall back to
+    substring (LIKE) matching. Best-effort — the vector path can never abort the run. Each hit
+    carries ``document_id``/``title``/``content`` so the agent can cite it directly.
+    """
+    # Build the scope predicate shared by both the vector and LIKE paths.
+    scope_parts: list[str] = []
+    scope_params: dict[str, Any] = {}
+    if project_id is not None:
+        scope_parts.append("project_id = :pid")
+        scope_params["pid"] = project_id
+    if include_global:
+        scope_parts.append("is_global = true")
+    if not scope_parts:
+        return []
+    scope = " OR ".join(scope_parts)
+
+    if embedding is None:
+        return await _search_documents_like(db, user_id, text, limit, scope, scope_params)
+    try:
+        hits = await db.query(
+            "SELECT document_id, title, content, project_id, is_global FROM ("
+            "SELECT expand(vectorNeighbors('Document[embedding]', :qvec, :k))"
+            f") WHERE user_id = :uid AND ({scope}) LIMIT :limit",
+            {"qvec": embedding, "k": limit, "uid": user_id, "limit": limit, **scope_params},
+        )
+    except Exception:  # noqa: BLE001 — semantic search is best-effort; degrade to substring search.
+        logger.warning("vector document search failed; falling back to LIKE", exc_info=True)
+        return await _search_documents_like(db, user_id, text, limit, scope, scope_params)
+    return hits or await _search_documents_like(db, user_id, text, limit, scope, scope_params)
 
 
 async def delete_document(db: ArcadeClient, user_id: str, document_id: str) -> int:

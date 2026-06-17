@@ -232,6 +232,9 @@ class ArcadeClient:
             # Marketplace skills synced from the Anthropic Agent Skills catalog: a skill's
             # instructions body + its bundled files, enabled per-conversation. See repository.create_skill.
             "CREATE VERTEX TYPE Skill IF NOT EXISTS",
+            # Projects group conversations under a shared system prompt + uploaded reference
+            # documents the agent can query across the group. See repository.create_project.
+            "CREATE VERTEX TYPE Project IF NOT EXISTS",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
@@ -245,6 +248,9 @@ class ArcadeClient:
             "CREATE EDGE TYPE HAS_AGENT IF NOT EXISTS",
             # Links the User to their synced marketplace skills.
             "CREATE EDGE TYPE HAS_SKILL IF NOT EXISTS",
+            # Links the User to their projects (HAS_DOCUMENT is reused to link a Project to its
+            # uploaded reference documents — edge types aren't endpoint-typed in ArcadeDB).
+            "CREATE EDGE TYPE HAS_PROJECT IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
             "CREATE PROPERTY User.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON User (user_id) UNIQUE",
@@ -277,6 +283,17 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Skill (skill_id) UNIQUE",
             "CREATE PROPERTY Skill.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Skill (user_id) NOTUNIQUE",
+            # Projects: a per-user container grouping conversations + reference documents.
+            "CREATE PROPERTY Project.project_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Project (project_id) UNIQUE",
+            "CREATE PROPERTY Project.user_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Project (user_id) NOTUNIQUE",
+            # A conversation's owning project (NULL/absent ⇒ ungrouped) and a document's owning
+            # project (set on project-scoped uploads instead of conversation_id). Both NOTUNIQUE.
+            "CREATE PROPERTY Conversation.project_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Conversation (project_id) NOTUNIQUE",
+            "CREATE PROPERTY Document.project_id IF NOT EXISTS STRING",
+            "CREATE INDEX IF NOT EXISTS ON Document (project_id) NOTUNIQUE",
             # Non-unique lookup indexes used by the repository queries.
             "CREATE PROPERTY Message.conversation_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Message (conversation_id) NOTUNIQUE",
@@ -305,6 +322,10 @@ class ArcadeClient:
                 # history by similarity (with a LIKE fallback), mirroring the Fact contract.
                 "CREATE PROPERTY Message.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
                 f"CREATE INDEX IF NOT EXISTS ON Message (embedding) LSM_VECTOR {metadata}",
+                # Documents get the same treatment so search_documents can semantically rank a
+                # project's (and the user's global) reference docs, with a LIKE fallback.
+                "CREATE PROPERTY Document.embedding IF NOT EXISTS ARRAY_OF_FLOATS",
+                f"CREATE INDEX IF NOT EXISTS ON Document (embedding) LSM_VECTOR {metadata}",
             ]
         for stmt in statements:
             await self.command(stmt)

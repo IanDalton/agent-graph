@@ -11,6 +11,7 @@ import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
 import { DocumentsCard } from "@/panes/DocumentsPane";
+import { ProjectCard } from "@/panes/ProjectCard";
 import { FactsCard } from "@/panes/FactsPane";
 import { SwarmFlowCard } from "@/swarm/SwarmFlowCard";
 import { Markdown } from "@/components/Markdown";
@@ -561,6 +562,7 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
             clipped by the grid's overflow-hidden instead of scrolling. */}
         <TabsContent value="context" className="min-h-0 flex-1 overflow-y-auto">
           <div className="space-y-3 p-3">
+            <ProjectCard />
             <ConfigCard />
             <ContextWindowCard refreshKey={refreshKey} />
             {isSwarm && <SwarmFlowCard />}

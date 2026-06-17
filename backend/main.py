@@ -66,17 +66,27 @@ DEFAULT_MODE = "regular"
 _STREAM_SENTINEL: Any = object()
 
 
-def compose_instructions(system_prompt: str | None = None) -> str:
-    """The agent's static system prompt: :data:`BASE_SYSTEM_PROMPT` plus the user's custom prompt.
+def compose_instructions(
+    system_prompt: str | None = None, project_prompt: str | None = None
+) -> str:
+    """The agent's static system prompt, layered base → project → conversation.
 
-    A conversation can carry its own extra instructions (set from the web UI). When present they are
-    *appended* under a clear header so the agent keeps its base memory/tool/honesty rules and treats
-    the user's text as additional guidance. An empty/missing prompt returns the base unchanged.
+    Three layers, each omitted when empty so the output is byte-identical to the base for an
+    ungrouped conversation with no custom prompt:
+    1. :data:`BASE_SYSTEM_PROMPT` — the fixed memory/tool/honesty rules.
+    2. ``project_prompt`` — the owning project's instructions, shared by every conversation in it.
+    3. ``system_prompt`` — this conversation's own extra instructions (most specific, so last).
     """
+    parts = [BASE_SYSTEM_PROMPT]
+    project = (project_prompt or "").strip()
+    if project:
+        parts.append(
+            "PROJECT INSTRUCTIONS (apply to every conversation in this project):\n" + project
+        )
     custom = (system_prompt or "").strip()
-    if not custom:
-        return BASE_SYSTEM_PROMPT
-    return f"{BASE_SYSTEM_PROMPT}\n\nADDITIONAL INSTRUCTIONS (from the user):\n{custom}"
+    if custom:
+        parts.append("ADDITIONAL INSTRUCTIONS (from the user):\n" + custom)
+    return "\n\n".join(parts)
 
 
 def build_agent(
@@ -85,6 +95,7 @@ def build_agent(
     mode: str | None = None,
     system_prompt: str | None = None,
     enabled_skills: list[str] | None = None,
+    project_prompt: str | None = None,
 ) -> Agent[GraphDependencies, str]:
     """Construct the agent.
 
@@ -105,8 +116,9 @@ def build_agent(
     Unknown/missing values fall back to :data:`DEFAULT_MODE`.
 
     ``system_prompt`` is the conversation's optional custom prompt, appended to
-    :data:`BASE_SYSTEM_PROMPT` (see :func:`compose_instructions`). Main agent only — delegated
-    sub-agents keep their own task-specific prompts.
+    :data:`BASE_SYSTEM_PROMPT` (see :func:`compose_instructions`). ``project_prompt`` is the owning
+    project's prompt, layered in between the base and the conversation prompt. Both main agent only
+    — delegated sub-agents keep their own task-specific prompts.
 
     ``enabled_skills`` are the marketplace skills turned on for the conversation. When non-empty
     (and not in swarm mode) the Skills capability is added so the agent can ``load_skill`` and use
@@ -117,7 +129,7 @@ def build_agent(
     agent = Agent(
         resolve_model(model),
         deps_type=GraphDependencies,
-        instructions=compose_instructions(system_prompt),
+        instructions=compose_instructions(system_prompt, project_prompt),
         capabilities=_capabilities_for_mode(mode, effort, enabled_skills),
     )
     # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
@@ -468,8 +480,25 @@ async def stream_run(
         except Exception:  # noqa: BLE001 — a missing selection must never block a turn.
             logger.warning("enabled-skills lookup failed; using none", exc_info=True)
             enabled_skills = []
+        # The conversation's owning project (None ⇒ ungrouped) and that project's system prompt are
+        # layered in: the prompt sits between the base and the conversation prompt, and project_id
+        # rides on the deps so the project-document tools + manifest are scoped to it.
+        project_id: str | None = None
+        project_prompt = ""
+        try:
+            project_id = await repo.get_conversation_project_id(db, conversation_id)
+            if project_id:
+                project_prompt = await repo.get_project_system_prompt(db, project_id)
+        except Exception:  # noqa: BLE001 — a missing project must never block a turn.
+            logger.warning("project lookup failed; treating as ungrouped", exc_info=True)
+            project_id, project_prompt = None, ""
         agent = build_agent(
-            model, effort, mode=mode, system_prompt=system_prompt, enabled_skills=enabled_skills
+            model,
+            effort,
+            mode=mode,
+            system_prompt=system_prompt,
+            enabled_skills=enabled_skills,
+            project_prompt=project_prompt,
         )
         # Live trace channel: the parent run AND every sub-agent (run_subagent) push frames onto
         # this one queue, so swarm sub-agents' thinking/tool calls interleave with the
@@ -486,6 +515,7 @@ async def stream_run(
             swarm_max_parallel=swarm.get("max_parallel"),
             swarm_max_depth=swarm.get("max_depth"),
             enabled_skills=enabled_skills,
+            project_id=project_id,
         )
 
         # Load the prior turns of this thread so the agent retains context. The
@@ -518,9 +548,17 @@ async def stream_run(
                     body, encoding = data, "base64"
                 else:
                     body, encoding = base64.b64decode(data).decode("utf-8", errors="replace"), "text"
+                # Embed text uploads so they're semantically searchable (best-effort; binary
+                # artifacts and a disabled/failed embedder simply store no vector → LIKE fallback).
+                embedding = None
+                if encoding == "text" and embedder is not None:
+                    try:
+                        embedding = await embedder.embed(body)
+                    except Exception:  # noqa: BLE001 — embedding is best-effort.
+                        logger.warning("embedding uploaded file %r failed", name, exc_info=True)
                 document_id = await repo.create_document(
                     db, user_id, conversation_id, title=name, content=body,
-                    mime_type=mime, encoding=encoding,
+                    mime_type=mime, encoding=encoding, embedding=embedding,
                 )
                 uploaded.append(
                     {"document_id": document_id, "filename": name, "mime_type": mime}

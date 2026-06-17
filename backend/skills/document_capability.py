@@ -31,10 +31,27 @@ from backend.schemas.document_schemas import (
     CreateDocumentArgs,
     DocumentContent,
     DocumentInfo,
+    DocumentSearchHit,
     UpdateDocumentArgs,
 )
 
 logger = logging.getLogger("agent_graph.documents")
+
+# Cap on the excerpt returned per search hit — enough to judge relevance without flooding context.
+_SNIPPET_CHARS = 1500
+
+
+def _row_to_info(row: dict) -> DocumentInfo:
+    return DocumentInfo(
+        document_id=row.get("document_id", ""),
+        conversation_id=row.get("conversation_id"),
+        project_id=row.get("project_id"),
+        is_global=bool(row.get("is_global")),
+        title=row.get("title") or "",
+        mime_type=row.get("mime_type") or "text/markdown",
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
 
 INSTRUCTIONS = (
     "You can author DOCUMENTS for the user: durable artifacts like reports, plans, notes, code "
@@ -56,7 +73,12 @@ INSTRUCTIONS = (
     "THE USER CAN EDIT: a document's content may have changed since you wrote it. ALWAYS call "
     "`read_document` to get the current body before revising or summarizing one — never assume "
     "it still says what you last wrote. `update_document` replaces the full content, so send the "
-    "complete new body, not a diff."
+    "complete new body, not a diff.\n"
+    "PROJECT REFERENCE DOCUMENTS: when this conversation belongs to a project, the user may have "
+    "uploaded reference documents (and may have marked some documents 'global', available in every "
+    "project). The system prompt lists them. To use them, `search_project_documents(query)` to find "
+    "the relevant ones by content, then `read_project_document(document_id)` to read one in full. "
+    "Ground answers in these documents rather than guessing, and cite which document you used."
 )
 
 documents_capability = Capability(id="Documents", instructions=INSTRUCTIONS)
@@ -133,18 +155,91 @@ async def list_documents(ctx: RunContext[GraphDependencies]) -> list[DocumentInf
     rows = await repo.list_documents(
         ctx.deps.db, ctx.deps.user_id, conversation_id=ctx.deps.conversation_id
     )
-    return [
-        DocumentInfo(
-            document_id=r.get("document_id", ""),
-            conversation_id=r.get("conversation_id"),
-            title=r.get("title") or "",
-            mime_type=r.get("mime_type") or "text/markdown",
-            created_at=r.get("created_at"),
-            updated_at=r.get("updated_at"),
+    return [_row_to_info(r) for r in rows if r.get("document_id")]
+
+
+@documents_capability.tool
+async def list_project_documents(ctx: RunContext[GraphDependencies]) -> list[DocumentInfo]:
+    """List the reference documents available to this conversation (its project's + global ones).
+
+    Returns metadata only (titles + ids). Empty when the conversation is not in a project and there
+    are no global documents. Read one with read_project_document or search with
+    search_project_documents.
+    """
+    rows = await repo.list_documents(
+        ctx.deps.db,
+        ctx.deps.user_id,
+        project_id=ctx.deps.project_id,
+        include_global=True,
+    )
+    return [_row_to_info(r) for r in rows if r.get("document_id")]
+
+
+@documents_capability.tool
+async def read_project_document(
+    ctx: RunContext[GraphDependencies], document_id: str
+) -> DocumentContent:
+    """Read a project (or global) reference document's full body by its document_id."""
+    row = await repo.get_document(ctx.deps.db, ctx.deps.user_id, document_id)
+    if row is None:
+        raise ModelRetry(
+            f"No document with id {document_id!r} for this user. "
+            "Use list_project_documents or search_project_documents to find the correct id."
         )
-        for r in rows
-        if r.get("document_id")
-    ]
+    return DocumentContent(
+        document_id=row.get("document_id", document_id),
+        project_id=row.get("project_id"),
+        is_global=bool(row.get("is_global")),
+        title=row.get("title") or "",
+        mime_type=row.get("mime_type") or "text/markdown",
+        content=row.get("content") or "",
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+@documents_capability.tool
+async def search_project_documents(
+    ctx: RunContext[GraphDependencies], query: str
+) -> list[DocumentSearchHit]:
+    """Search the conversation's reference documents (its project's + global) by content.
+
+    Ranks by semantic similarity when embeddings are configured, else by substring match. Returns
+    the most relevant documents with a leading excerpt; read one in full with read_project_document.
+    Tolerant: any failure returns an empty list rather than aborting the run.
+    """
+    deps = ctx.deps
+    try:
+        embedding = None
+        if deps.embedder is not None:
+            embedding = await deps.embedder.embed(query)
+        rows = await repo.search_documents(
+            deps.db,
+            deps.user_id,
+            query,
+            embedding=embedding,
+            project_id=deps.project_id,
+            include_global=True,
+        )
+    except Exception:  # noqa: BLE001 — search is best-effort; never abort the run.
+        logger.warning("search_project_documents failed; returning no hits", exc_info=True)
+        return []
+    hits: list[DocumentSearchHit] = []
+    for r in rows:
+        did = r.get("document_id")
+        if not did:
+            continue
+        content = r.get("content") or ""
+        hits.append(
+            DocumentSearchHit(
+                document_id=did,
+                title=r.get("title") or "",
+                project_id=r.get("project_id"),
+                is_global=bool(r.get("is_global")),
+                snippet=content[:_SNIPPET_CHARS],
+            )
+        )
+    return hits
 
 
 @documents_capability.tool

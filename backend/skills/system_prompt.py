@@ -35,6 +35,9 @@ _MAX_FACTS = 8
 # Cap on the always-included "important" facts the user (or agent) curated. Bounds the prompt even
 # when a user marks many facts important.
 _MAX_IMPORTANT = 20
+# Cap on the project/global reference documents advertised (titles only) in the per-turn manifest.
+# Bounds the prompt; the agent reads or searches the full set on demand via the project doc tools.
+_MAX_PROJECT_DOCS = 30
 
 BASE_SYSTEM_PROMPT = (
     "You are a helpful, capable assistant backed by a persistent graph memory of THIS user. "
@@ -175,6 +178,54 @@ async def enabled_skills_block(deps: GraphDependencies) -> str:
     )
 
 
+async def project_documents_block(deps: GraphDependencies) -> str:
+    """Build the 'project + global reference documents' manifest, or "" when there are none.
+
+    Advertises (titles + ids only — the cheap half of progressive disclosure) the documents the
+    agent can pull in: the owning project's uploaded reference docs (when this conversation belongs
+    to a project) plus the user's global documents. The agent reads one with
+    ``read_project_document`` or searches across them with ``search_project_documents``. Best-effort:
+    any DB failure logs and returns "" so a turn is never blocked.
+    """
+    try:
+        rows = await repo.list_documents(
+            deps.db,
+            deps.user_id,
+            project_id=deps.project_id,
+            include_global=True,
+            limit=_MAX_PROJECT_DOCS,
+        )
+    except Exception:  # noqa: BLE001 — project-doc recall is best-effort; never abort the run.
+        logger.warning("project-documents lookup failed; continuing without it", exc_info=True)
+        return ""
+    if not rows:
+        return ""
+    title = ""
+    if deps.project_id:
+        try:
+            project = await repo.get_project(deps.db, deps.user_id, deps.project_id)
+            title = (project or {}).get("title") or ""
+        except Exception:  # noqa: BLE001 — the title is cosmetic; degrade silently.
+            logger.warning("project lookup failed; omitting project title", exc_info=True)
+    lines: list[str] = []
+    for row in rows[:_MAX_PROJECT_DOCS]:
+        did = row.get("document_id")
+        if not did:
+            continue
+        name = row.get("title") or "(untitled)"
+        tag = " [global]" if row.get("is_global") else ""
+        lines.append(f"- {name} ({did}){tag}")
+    if not lines:
+        return ""
+    header = (
+        f'This conversation belongs to the project "{title}". ' if title else ""
+    ) + (
+        "Reference documents available to you (call read_project_document(document_id) to read one, "
+        "or search_project_documents(query) to search across them):"
+    )
+    return header + "\n" + "\n".join(lines)
+
+
 def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     """Attach the dynamic per-run instructions (date + relevant user facts) to ``agent``.
 
@@ -198,3 +249,7 @@ def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     @agent.instructions
     async def _enabled_skills(ctx: RunContext[GraphDependencies]) -> str:
         return await enabled_skills_block(ctx.deps)
+
+    @agent.instructions
+    async def _project_documents(ctx: RunContext[GraphDependencies]) -> str:
+        return await project_documents_block(ctx.deps)

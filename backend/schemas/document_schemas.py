@@ -58,6 +58,8 @@ class DocumentInfo(BaseModel):
 
     document_id: str
     conversation_id: str | None = None
+    project_id: str | None = None
+    is_global: bool = False
     title: str = ""
     mime_type: str = "text/markdown"
     encoding: str = Field(
@@ -67,10 +69,22 @@ class DocumentInfo(BaseModel):
     updated_at: str | None = None
 
 
+class DocumentSearchHit(BaseModel):
+    """One relevant reference document, as returned by search_project_documents."""
+
+    document_id: str
+    title: str = ""
+    project_id: str | None = None
+    is_global: bool = False
+    snippet: str = Field("", description="A leading excerpt of the matching document's text.")
+
+
 class DocumentContent(BaseModel):
     """A full document, as returned by read_document."""
 
     document_id: str
+    project_id: str | None = None
+    is_global: bool = False
     title: str = ""
     mime_type: str = "text/markdown"
     encoding: str = Field(

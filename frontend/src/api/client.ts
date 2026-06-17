@@ -8,6 +8,7 @@ import type {
   Fact,
   MemoryGraph,
   Mode,
+  Project,
   SkillInfo,
   SkillSyncResult,
   StoredMessage,
@@ -21,21 +22,27 @@ const json = async <T>(res: Response): Promise<T> => {
 export const api = {
   getConfig: () => fetch("/api/config").then(json<AppConfig>),
 
-  listConversations: (userId: string) =>
-    fetch(`/api/conversations?user_id=${encodeURIComponent(userId)}`).then(
-      json<Conversation[]>
-    ),
+  listConversations: (userId: string, includeArchived = false) =>
+    fetch(
+      `/api/conversations?user_id=${encodeURIComponent(userId)}&include_archived=${includeArchived}`
+    ).then(json<Conversation[]>),
 
-  createConversation: (userId: string, title?: string, mode: Mode = "regular") =>
+  createConversation: (
+    userId: string,
+    title?: string,
+    mode: Mode = "regular",
+    projectId?: string | null
+  ) =>
     fetch("/api/conversations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, title, mode }),
+      body: JSON.stringify({ user_id: userId, title, mode, project_id: projectId ?? null }),
     }).then(json<Conversation>),
 
   // Partial update: only the keys present in `patch` are applied server-side (mode, the custom
-  // system prompt, swarm bounds, and/or enabled skills). system_prompt: "" clears the prompt;
-  // enabled_skills: [] clears the selection.
+  // system prompt, swarm bounds, enabled skills, project membership, pin/archive flags).
+  // system_prompt: "" clears the prompt; enabled_skills: [] clears the selection;
+  // project_id: null moves the chat to Ungrouped.
   updateConversation: (
     conversationId: string,
     userId: string,
@@ -45,6 +52,9 @@ export const api = {
       swarm_max_parallel?: number;
       swarm_max_depth?: number;
       enabled_skills?: string[];
+      project_id?: string | null;
+      pinned?: boolean;
+      archived?: boolean;
     }
   ) =>
     fetch(`/api/conversations/${conversationId}`, {
@@ -54,6 +64,68 @@ export const api = {
     }).then(
       json<{ conversation_id: string; mode?: Mode; system_prompt?: string }>
     ),
+
+  deleteConversation: (conversationId: string, userId: string) =>
+    fetch(
+      `/api/conversations/${conversationId}?user_id=${encodeURIComponent(userId)}`,
+      { method: "DELETE" }
+    ).then(json<{ deleted: string }>),
+
+  // --- Projects ---------------------------------------------------------------------------
+  listProjects: (userId: string) =>
+    fetch(`/api/projects?user_id=${encodeURIComponent(userId)}`).then(
+      json<Project[]>
+    ),
+
+  createProject: (userId: string, title?: string, systemPrompt = "") =>
+    fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, title, system_prompt: systemPrompt }),
+    }).then(json<Project>),
+
+  updateProject: (
+    projectId: string,
+    userId: string,
+    patch: { title?: string; system_prompt?: string }
+  ) =>
+    fetch(`/api/projects/${projectId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...patch }),
+    }).then(json<Project>),
+
+  // Cascade-delete: removes the project, its conversations, and its non-global documents.
+  deleteProject: (projectId: string, userId: string) =>
+    fetch(`/api/projects/${projectId}?user_id=${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    }).then(json<{ deleted: string; conversations: number; documents: number }>),
+
+  // A project's reference documents (plus the user's global ones), metadata only.
+  listProjectDocuments: (projectId: string, userId: string) =>
+    fetch(
+      `/api/projects/${projectId}/documents?user_id=${encodeURIComponent(userId)}`
+    ).then(json<DocumentMeta[]>),
+
+  // Upload one reference file (base64 bytes) into a project's document set.
+  uploadProjectDocument: (
+    projectId: string,
+    userId: string,
+    file: { filename: string; mime_type: string; data: string }
+  ) =>
+    fetch(`/api/projects/${projectId}/documents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...file }),
+    }).then(json<DocumentMeta>),
+
+  // Mark a document global (survives project cascade-delete, queryable everywhere) or not.
+  setDocumentGlobal: (documentId: string, userId: string, isGlobal: boolean) =>
+    fetch(`/api/documents/${documentId}/global`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, is_global: isGlobal }),
+    }).then(json<{ document_id: string; is_global: boolean }>),
 
   // The marketplace skills this user has synced (metadata only — backs the skill picker).
   listSkills: (userId: string) =>

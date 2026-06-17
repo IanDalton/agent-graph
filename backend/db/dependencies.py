@@ -79,3 +79,8 @@ class GraphDependencies:
     # Read by the Skills capability (descriptions injected per turn, load_skill, sandbox file mount).
     # Empty when no skills are enabled. Run-scoped; set per turn by stream_run.
     enabled_skills: list[str] = field(default_factory=list)
+    # The owning project of this conversation (None = ungrouped). Set per turn by stream_run from
+    # repo.get_conversation_project_id. Read by system_prompt.project_documents_block (to advertise
+    # the project's + the user's global reference documents) and by the project document tools
+    # (list/read/search_project_documents) to scope their queries.
+    project_id: str | None = None
