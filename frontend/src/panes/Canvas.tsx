@@ -24,9 +24,11 @@ const MODE_OPTIONS: { mode: Mode; label: string; desc: string }[] = [
 function PendingCanvas({
   onPick,
   onSend,
+  projectName,
 }: {
   onPick: (mode: Mode) => void;
   onSend: (text: string, attachments: Attachment[]) => void;
+  projectName?: string | null;
 }) {
   return (
     <div className="flex h-full flex-col bg-slate-950">
@@ -36,7 +38,14 @@ function PendingCanvas({
             Start a new conversation
           </h2>
           <p className="mb-8 text-center text-sm text-muted-foreground">
-            Choose a mode, or just type below for a regular chat
+            {projectName ? (
+              <>
+                In project <span className="font-medium text-foreground">{projectName}</span> —
+                choose a mode, or just type below
+              </>
+            ) : (
+              "Choose a mode, or just type below for a regular chat"
+            )}
           </p>
           <div className="flex flex-col gap-3">
             {MODE_OPTIONS.map((opt) => (
@@ -138,14 +147,25 @@ function RegularCanvas({
 }
 
 export function Canvas({ onTurnComplete }: { onTurnComplete: () => void }) {
-  const { conversations, activeId, userId, pendingNewChat, newConversation } = useApp();
+  const {
+    conversations,
+    activeId,
+    userId,
+    pendingNewChat,
+    newConversation,
+    activeProjectId,
+    projects,
+  } = useApp();
   const pendingMessageRef = useRef<PendingMessage | null>(null);
   const conversation = conversations.find((c) => c.conversation_id === activeId);
 
   if (!conversation) {
     if (pendingNewChat) {
+      const projectName =
+        projects.find((p) => p.project_id === activeProjectId)?.title ?? null;
       return (
         <PendingCanvas
+          projectName={activeProjectId ? projectName || "Untitled project" : null}
           onPick={(mode) => void newConversation(mode)}
           onSend={(text, attachments) => {
             pendingMessageRef.current = { text, attachments };

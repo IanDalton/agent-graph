@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { DragEvent, ReactNode } from "react";
 import {
   Archive,
   ArchiveRestore,
@@ -21,13 +22,16 @@ import { useApp } from "@/state/AppContext";
 import { ModeIcon } from "@/components/ModeIcon";
 import type { Conversation, Project } from "@/types";
 
+/** dataTransfer key for a conversation being dragged onto a project (or the Ungrouped zone). */
+const DRAG_MIME = "application/x-conversation-id";
+
 function conversationLabel(c: Conversation): string {
   if (c.title) return c.title;
   return `Chat ${c.conversation_id.slice(0, 6)}`;
 }
 
 /** A tiny downward-anchored dropdown menu (the shared Popover anchors upward for the composer). */
-function RowMenu({ children }: { children: (close: () => void) => React.ReactNode }) {
+function RowMenu({ children }: { children: (close: () => void) => ReactNode }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -116,6 +120,11 @@ function ConversationRow({ c }: { c: Conversation }) {
   return (
     <button
       type="button"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData(DRAG_MIME, c.conversation_id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
       onClick={() => selectConversation(c.conversation_id)}
       className={cn(
         "group flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors",
@@ -195,25 +204,85 @@ function ProjectGroup({
   project: Project;
   conversations: Conversation[];
 }) {
-  const { newConversation, setProjectTitle, deleteProject } = useApp();
-  const [collapsed, setCollapsed] = useState(false);
+  const {
+    newConversation,
+    setProjectTitle,
+    deleteProject,
+    setConversationProject,
+    activeProjectId,
+    selectProject,
+    activeId,
+  } = useApp();
+  const selected = activeProjectId === project.project_id;
+  // "Am I chatting inside this project?" — the active conversation belongs to it, or it's selected.
+  const hasActiveChat = conversations.some((c) => c.conversation_id === activeId);
+  const expandedByActivity = selected || hasActiveChat;
+  // Projects start collapsed unless the user is currently inside them.
+  const [collapsed, setCollapsed] = useState(!expandedByActivity);
   const [renaming, setRenaming] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draftTitle, setDraftTitle] = useState(project.title || "");
+  const [dragOver, setDragOver] = useState(false);
+
+  // Auto-expand when this project becomes the one being worked in (selected or holds the active
+  // chat); leaves manual collapse/expand alone otherwise.
+  useEffect(() => {
+    if (expandedByActivity) setCollapsed(false);
+  }, [expandedByActivity]);
+
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const convId = e.dataTransfer.getData(DRAG_MIME);
+    if (convId) setConversationProject(convId, project.project_id);
+  };
 
   return (
-    <li>
-      <div className="group flex items-center gap-1 rounded-md px-1 py-1 text-xs font-medium text-muted-foreground hover:bg-accent/40">
+    <li
+      onDragOver={(e) => {
+        // Accept conversation drags; show the drop affordance.
+        if (e.dataTransfer.types.includes(DRAG_MIME)) {
+          e.preventDefault();
+          setDragOver(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        // Only clear when the pointer actually leaves the group (not when entering a child).
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
+      }}
+      onDrop={onDrop}
+      className={cn(
+        "rounded-md",
+        dragOver && "bg-primary/10 ring-1 ring-primary/40"
+      )}
+    >
+      <div
+        className={cn(
+          "group flex items-center gap-1 rounded-md px-1 py-1 text-xs font-medium text-muted-foreground hover:bg-accent/40",
+          selected && "bg-accent/60 text-accent-foreground"
+        )}
+      >
         <button
           type="button"
           onClick={() => setCollapsed((v) => !v)}
-          className="flex flex-1 items-center gap-1 truncate text-left"
+          className="shrink-0"
+          title={collapsed ? "Expand" : "Collapse"}
         >
           {collapsed ? (
-            <ChevronRight className="size-3.5 shrink-0" />
+            <ChevronRight className="size-3.5" />
           ) : (
-            <ChevronDown className="size-3.5 shrink-0" />
+            <ChevronDown className="size-3.5" />
           )}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            // Select the project (so "New Chat" lands in it) and reveal its chats.
+            selectProject(project.project_id);
+            setCollapsed(false);
+          }}
+          className="flex flex-1 items-center gap-1 truncate text-left"
+        >
           <span className="truncate uppercase tracking-wide">
             {project.title || "Untitled project"}
           </span>
@@ -345,10 +414,16 @@ export function Sidebar() {
     newProject,
     showArchived,
     setShowArchived,
+    activeProjectId,
+    selectProject,
+    setConversationProject,
   } = useApp();
 
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
+  const [dragOverUngrouped, setDragOverUngrouped] = useState(false);
+
+  const activeProject = projects.find((p) => p.project_id === activeProjectId) ?? null;
 
   // Group conversations by project; pinned-first ordering is already applied by the server.
   const ungrouped = useMemo(
@@ -382,11 +457,24 @@ export function Sidebar() {
       <div className="flex gap-2 px-3 pb-2">
         <Button
           variant="secondary"
-          className="flex-1 justify-start"
+          className="flex-1 justify-start overflow-hidden"
           onClick={openNewChatPicker}
+          title={
+            activeProject
+              ? `New chat in ${activeProject.title || "this project"}`
+              : "New chat"
+          }
         >
-          <Plus />
-          New Chat
+          <Plus className="shrink-0" />
+          <span className="truncate">
+            New Chat
+            {activeProject && (
+              <span className="text-muted-foreground">
+                {" "}
+                · {activeProject.title || "project"}
+              </span>
+            )}
+          </span>
         </Button>
         <Button
           variant="outline"
@@ -408,16 +496,60 @@ export function Sidebar() {
             />
           ))}
 
-          {projects.length > 0 && ungrouped.length > 0 && (
-            <li className="px-2 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-              Ungrouped
+          {projects.length > 0 ? (
+            <li
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes(DRAG_MIME)) {
+                  e.preventDefault();
+                  setDragOverUngrouped(true);
+                }
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node))
+                  setDragOverUngrouped(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOverUngrouped(false);
+                const convId = e.dataTransfer.getData(DRAG_MIME);
+                if (convId) setConversationProject(convId, null);
+              }}
+              className={cn(
+                "rounded-md",
+                dragOverUngrouped && "bg-primary/10 ring-1 ring-primary/40"
+              )}
+            >
+              <button
+                type="button"
+                onClick={() => selectProject(null)}
+                className={cn(
+                  "w-full rounded px-2 pt-2 text-left text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground",
+                  activeProjectId === null && "text-foreground"
+                )}
+                title="Ungrouped — drop a chat here to remove it from its project"
+              >
+                Ungrouped
+              </button>
+              <ul className="space-y-1 pt-1">
+                {ungrouped.map((c) => (
+                  <li key={c.conversation_id}>
+                    <ConversationRow c={c} />
+                  </li>
+                ))}
+                {ungrouped.length === 0 && (
+                  <li className="px-2 py-1.5 text-center text-[11px] text-muted-foreground">
+                    Drop a chat here to ungroup it.
+                  </li>
+                )}
+              </ul>
             </li>
+          ) : (
+            ungrouped.map((c) => (
+              <li key={c.conversation_id}>
+                <ConversationRow c={c} />
+              </li>
+            ))
           )}
-          {ungrouped.map((c) => (
-            <li key={c.conversation_id}>
-              <ConversationRow c={c} />
-            </li>
-          ))}
 
           {conversations.length === 0 && projects.length === 0 && (
             <li className="px-2 py-4 text-center text-xs text-muted-foreground">

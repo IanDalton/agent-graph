@@ -436,7 +436,11 @@ archived" toggle): a **New Project** button (`FolderPlus` → `AppContext.newPro
 "+" that creates a chat inside that project, a header menu to rename / cascade-delete it (the delete
 is gated by a confirm `Dialog` warning that member chats + non-global docs are removed), and a
 per-conversation kebab `RowMenu` for Pin/Archive/Move-to-project/Delete. Pinned chats float to the
-top within each group),
+top within each group. Chats are **draggable** onto a project group (or the **Ungrouped** drop zone)
+to change membership (`DRAG_MIME` dataTransfer → `setConversationProject`). Clicking a project header
+**selects** it (`AppContext.activeProjectId`/`selectProject`) so the top **New Chat** lands in that
+project; selecting a chat follows its project, and the new-chat picker shows which project a chat
+will be created in),
 middle `Canvas` (streaming chat bubbles + collapsible tool-call chips, the seed of the future
 chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rolled `ui/tabs.tsx`,
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab

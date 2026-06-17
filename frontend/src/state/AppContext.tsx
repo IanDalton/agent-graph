@@ -39,6 +39,11 @@ interface AppState {
   userId: string;
   conversations: Conversation[];
   activeId: string | null;
+  /** The project a new chat will be created into (set by selecting a project or a chat in one).
+   *  null ⇒ new chats are ungrouped. */
+  activeProjectId: string | null;
+  /** Select a project (so "New Chat" lands in it); pass null to clear the selection. */
+  selectProject: (id: string | null) => void;
   loading: boolean;
   /** True when the "new chat" mode picker should be shown in the canvas. */
   pendingNewChat: boolean;
@@ -61,7 +66,8 @@ interface AppState {
   selectConversation: (id: string) => void;
   /** Show the mode picker in the canvas (clears active conversation). */
   openNewChatPicker: () => void;
-  /** Create and select a conversation; `mode` picks its agent profile, `projectId` its project. */
+  /** Create and select a conversation; `mode` picks its agent profile. `projectId` its project —
+   *  omit it to use the currently-selected project (`activeProjectId`). */
   newConversation: (mode?: Mode, projectId?: string | null) => Promise<void>;
   /** Switch a conversation's agent mode mid-thread; persists and takes effect next turn. */
   setConversationMode: (id: string, mode: Mode) => Promise<void>;
@@ -135,6 +141,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [showArchived, setShowArchived] = useState(false);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
 
   const featureDocument = useCallback((id: string) => {
     setFeaturedDoc({ id, ts: Date.now() });
@@ -194,24 +201,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const newConversation = useCallback(
-    async (mode: Mode = "regular", projectId: string | null = null) => {
-      const convo = await api.createConversation(USER_ID, undefined, mode, projectId);
+    async (mode: Mode = "regular", projectId?: string | null) => {
+      // Default a new chat into the currently-selected project (so picking a project then
+      // "New Chat" lands there); an explicit argument (incl. null for ungrouped) wins.
+      const target = projectId === undefined ? activeProjectId : projectId;
+      const convo = await api.createConversation(USER_ID, undefined, mode, target);
       // The server stamps project_id but may echo it back null in the create response shape;
       // ensure the local row carries it so the sidebar groups the new chat correctly.
-      setConversations((prev) => [{ ...convo, project_id: projectId }, ...prev]);
+      setConversations((prev) => [{ ...convo, project_id: target }, ...prev]);
       setActiveId(convo.conversation_id);
+      setActiveProjectId(target);
       setFeaturedDoc(null);
       setSwarmFlow(null);
       setPendingNewChat(false);
     },
-    []
+    [activeProjectId]
   );
 
-  const selectConversation = useCallback((id: string) => {
-    setActiveId(id);
-    setFeaturedDoc(null);
-    setSwarmFlow(null);
-    setPendingNewChat(false);
+  const selectConversation = useCallback(
+    (id: string) => {
+      setActiveId(id);
+      // Follow the conversation's project so a subsequent "New Chat" continues in the same place.
+      const conv = conversations.find((c) => c.conversation_id === id);
+      setActiveProjectId(conv?.project_id ?? null);
+      setFeaturedDoc(null);
+      setSwarmFlow(null);
+      setPendingNewChat(false);
+    },
+    [conversations]
+  );
+
+  const selectProject = useCallback((id: string | null) => {
+    setActiveProjectId(id);
   }, []);
 
   const setConversationMode = useCallback(async (id: string, mode: Mode) => {
@@ -279,6 +300,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setConversations((prev) =>
         prev.map((c) => (c.conversation_id === id ? { ...c, project_id: projectId } : c))
       );
+      // If the moved chat is the active one, follow it so "New Chat" lands in its new project.
+      setActiveProjectId((prev) => (id === activeId ? projectId : prev));
       try {
         await api.updateConversation(id, USER_ID, { project_id: projectId });
       } catch (err) {
@@ -286,7 +309,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         refreshConversations().catch(() => {});
       }
     },
-    [refreshConversations]
+    [activeId, refreshConversations]
   );
 
   const setConversationPinned = useCallback(
@@ -384,17 +407,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const deleteProject = useCallback(
     async (id: string) => {
-      // Drop the project and its member conversations locally; the cascade removed them server-side.
+      if (!id) return;
+      // Optimistically drop the project and ONLY its member conversations. Normalize project_id to
+      // null so an ungrouped chat (project_id null/undefined) is never matched and removed.
+      setActiveProjectId((prev) => (prev === id ? null : prev));
       setProjects((prev) => prev.filter((p) => p.project_id !== id));
       setConversations((prev) => {
-        const removed = prev.filter((c) => c.project_id === id).map((c) => c.conversation_id);
+        const removed = prev
+          .filter((c) => (c.project_id ?? null) === id)
+          .map((c) => c.conversation_id);
         if (activeId && removed.includes(activeId)) setActiveId(null);
-        return prev.filter((c) => c.project_id !== id);
+        return prev.filter((c) => (c.project_id ?? null) !== id);
       });
       try {
         await api.deleteProject(id, USER_ID);
       } catch (err) {
         console.error("failed to delete project", err);
+      } finally {
+        // Reconcile with the server's actual cascade result (source of truth) so the local
+        // optimistic guess can never strand or drop the wrong conversations.
         refreshProjects().catch(() => {});
         refreshConversations().catch(() => {});
       }
@@ -482,6 +513,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const rows = await refreshConversations();
         if (rows.length > 0) {
           setActiveId(rows[0].conversation_id);
+          // Follow the loaded conversation's project so its group is expanded and a New Chat
+          // continues in the same place.
+          setActiveProjectId(rows[0].project_id ?? null);
         } else {
           setPendingNewChat(true);
         }
@@ -506,6 +540,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         userId: USER_ID,
         conversations,
         activeId,
+        activeProjectId,
+        selectProject,
         loading,
         pendingNewChat,
         config,
