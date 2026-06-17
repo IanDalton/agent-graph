@@ -463,12 +463,18 @@ async def create_project(
 async def list_projects(
     db: ArcadeClient, user_id: str, limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Return this user's projects, most recently created first (metadata for the sidebar groups)."""
+    """Return this user's projects, most recently created first (metadata for the sidebar groups).
+
+    Defensively skips any vertex with a NULL/empty ``project_id`` (legacy orphans that can't be
+    addressed by the id-based update/delete paths and would otherwise render as undeletable
+    "Untitled project" rows).
+    """
     rows = await db.query(
         "SELECT project_id, title, system_prompt, created_at FROM Project "
-        "WHERE user_id = :uid ORDER BY created_at DESC LIMIT :limit",
+        "WHERE user_id = :uid AND project_id IS NOT NULL ORDER BY created_at DESC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
+    rows = [r for r in rows if r.get("project_id")]
     for row in rows:
         row["system_prompt"] = row.get("system_prompt") or ""
     return rows

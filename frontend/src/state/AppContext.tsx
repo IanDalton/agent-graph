@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -605,6 +606,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // One-time cleanup: prune leftover **empty, untitled** projects (junk from before projects
+  // required a name). Safe — they hold no conversations, so nothing is lost — and it runs once,
+  // only after conversations have loaded (so "empty" is accurate). New untitled projects can no
+  // longer be created, so this never fights the user.
+  const prunedRef = useRef(false);
+  useEffect(() => {
+    if (loading || prunedRef.current || projects.length === 0) return;
+    prunedRef.current = true;
+    const usedProjectIds = new Set(
+      conversations.map((c) => c.project_id ?? null).filter(Boolean)
+    );
+    const junk = projects.filter(
+      (p) => !(p.title && p.title.trim()) && !usedProjectIds.has(p.project_id)
+    );
+    junk.forEach((p) => void deleteProject(p.project_id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, projects]);
 
   // Re-fetch when the "Show archived" toggle flips so archived rows appear/disappear.
   useEffect(() => {

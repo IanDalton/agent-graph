@@ -313,7 +313,10 @@ function ProjectGroup({
                 label="Delete project"
                 danger
                 onClick={() => {
-                  setConfirmDelete(true);
+                  // Empty projects carry no data to lose — delete straight away. Only prompt for
+                  // confirmation when chats/documents would be cascaded.
+                  if (conversations.length === 0) deleteProject(project.project_id);
+                  else setConfirmDelete(true);
                   close();
                 }}
               />
@@ -443,7 +446,10 @@ export function Sidebar() {
   }, [conversations]);
 
   const createProject = async () => {
-    await newProject(newTitle.trim() || undefined);
+    // Require a name so the sidebar never fills up with "Untitled project" rows.
+    const title = newTitle.trim();
+    if (!title) return;
+    await newProject(title);
     setNewTitle("");
     setCreating(false);
   };
@@ -584,13 +590,13 @@ export function Sidebar() {
           onChange={(e) => setNewTitle(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && createProject()}
           className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
-          placeholder="Project name (optional)"
+          placeholder="Project name"
         />
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={() => setCreating(false)}>
             Cancel
           </Button>
-          <Button size="sm" onClick={createProject}>
+          <Button size="sm" onClick={createProject} disabled={!newTitle.trim()}>
             Create
           </Button>
         </div>
