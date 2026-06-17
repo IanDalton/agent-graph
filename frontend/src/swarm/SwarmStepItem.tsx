@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Brain, ChevronRight, FileText } from "lucide-react";
+import { Brain, ChevronRight, FileText, Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Step } from "@/types";
@@ -83,6 +83,15 @@ export function SwarmStepItem({ step }: { step: Step }) {
     return (
       <div className="prose prose-invert prose-sm max-w-none rounded-lg border border-white/10 bg-slate-900/40 px-2.5 py-2 text-xs">
         <Markdown>{step.text}</Markdown>
+      </div>
+    );
+  }
+  if (step.kind === "skill") {
+    return (
+      <div className="inline-flex items-center gap-2 self-start rounded-xl border border-primary/20 bg-primary/5 px-2.5 py-1.5 text-xs">
+        <Sparkles className="size-3.5 shrink-0 text-primary" />
+        <span className="text-muted-foreground">Using skill</span>
+        <span className="font-medium text-foreground">{step.skillName}</span>
       </div>
     );
   }

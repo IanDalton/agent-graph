@@ -8,6 +8,7 @@ import {
   Image as ImageIcon,
   Loader2,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -121,6 +122,17 @@ function AttachmentThumbs({ attachments }: { attachments: Attachment[] }) {
   );
 }
 
+/** A small "using skill X" chip, dropped into the chain when the agent invokes a skill. */
+function SkillChip({ step }: { step: Extract<Step, { kind: "skill" }> }) {
+  return (
+    <div className="inline-flex items-center gap-2 self-start rounded-xl border border-primary/20 bg-primary/5 px-2.5 py-1.5 text-xs">
+      <Sparkles className="size-3.5 shrink-0 text-primary" />
+      <span className="text-muted-foreground">Using skill</span>
+      <span className="font-medium text-foreground">{step.skillName}</span>
+    </div>
+  );
+}
+
 /** Renders one node of the chronological chain in arrival order. */
 function StepItem({ step }: { step: Step }) {
   if (step.kind === "thinking") {
@@ -129,6 +141,9 @@ function StepItem({ step }: { step: Step }) {
   }
   if (step.kind === "document") {
     return <DocumentCard step={step} />;
+  }
+  if (step.kind === "skill") {
+    return <SkillChip step={step} />;
   }
   // agent_text only appears in swarm mode (rendered by SwarmStepItem); render plainly if it
   // ever reaches the default renderer.

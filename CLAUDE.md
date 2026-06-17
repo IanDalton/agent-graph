@@ -60,7 +60,9 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   conversations), and `list_conversations` reports it with the same fallback.
   **Swarm roster:** `create_agent_spec`/`get_agent_spec` (by id OR name)/`list_agent_specs`/
   `update_agent_spec`/`delete_agent_spec` persist sub-agent definitions (name, role, system prompt,
-  tool grants) as `AgentSpec` vertices, user-scoped, linked `User -HAS_AGENT-> AgentSpec`.
+  `tools` grants, `recipients` chart edges, and `skills` — the marketplace skills the orchestrator
+  granted this specialist, a `LIST` mirroring `recipients`) as `AgentSpec` vertices, user-scoped,
+  linked `User -HAS_AGENT-> AgentSpec`.
   **Faithful replay:** `append_run_messages`/`get_run_history` store each run's serialized Pydantic
   AI messages (via `new_messages_json()`) as `RunMessages` vertices — tool calls AND their returns
   included — *separately* from the human-readable `Message` vertices. `Message` rows keep role/content
@@ -72,9 +74,14 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `delete_skill` persist Anthropic Agent Skills synced from GitHub as `Skill` vertices (user-scoped,
   linked `User -HAS_SKILL-> Skill`): `description` (frontmatter), `body` (the SKILL.md instructions),
   and `files` (a JSON map `relpath -> {content, encoding}` of the bundled scripts/assets, text or
-  base64 like Documents). A conversation's enabled subset is stored on the `Conversation` vertex via
-  `set_conversation_enabled_skills`/`get_conversation_enabled_skills` (JSON list of names; `[]` when
-  unset; `list_conversations` returns it too).
+  base64 like Documents). `source` is `"anthropics/skills@main"` for synced skills or `"user"` for
+  **user-authored** ones (`upsert_skill(..., source="user")` from `POST /api/skills` — name + body,
+  upsert-by-name = edit). **Skills are account-wide and auto-enabled:** the active skill set for a
+  regular/research turn is the user's WHOLE library (`stream_run` derives `enabled_skills` from
+  `repo.list_skills`, not per-conversation) — so installing/authoring a skill makes it active in
+  every chat. (`set/get_conversation_enabled_skills` + the `Conversation.enabled_skills` column
+  remain but are vestigial — no longer read for activation.) In swarm mode the active set per
+  specialist is its `AgentSpec.skills` instead (the orchestrator assigns).
   **Projects:** `create_project`/`list_projects`/`get_project`/`update_project`/
   `get_project_system_prompt` and `delete_project` persist `Project` vertices (user-scoped,
   `User -HAS_PROJECT-> Project`) — a container grouping conversations under a shared system prompt +
@@ -233,24 +240,32 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
   a `note`, keeping the code's stdout).
 - **`backend/skills/skill_capability.py`** — the `Skills` bundle, exposed via `build_skills()` and
-  added (by `_capabilities_for_mode`) **only when the conversation has skills enabled** (and not in
-  swarm mode). **Progressive disclosure** (the Agent Skills design): the enabled skills'
-  name+description are injected into the system prompt every turn by `enabled_skills_block` (a
-  dynamic `@agent.instructions` callable in `system_prompt.py`, best-effort like
-  `relevant_facts_block`), and the full body is loaded on demand by the one tool, `load_skill(name)`
-  — which returns the SKILL.md body + the list of bundled files (available read-only in the sandbox
-  under `$SKILLS_DIR/<name>/`). A disabled/unknown name raises `ModelRetry` (the
-  `update_document`/`update_fact` convention). Enabled names ride on `deps.enabled_skills` (set per
-  turn by `stream_run` from `repo.get_conversation_enabled_skills`). Schemas in
+  added (by `_capabilities_for_mode`) when `enabled_skills` is non-empty (regular/research; in swarm
+  the bundle is added per-specialist by `run_subagent`, not the orchestrator). **Progressive
+  disclosure** (the Agent Skills design): the active skills' name+description are injected into the
+  system prompt every turn by `enabled_skills_block` (a dynamic `@agent.instructions` callable in
+  `system_prompt.py`, best-effort like `relevant_facts_block`), and the full body is loaded on
+  demand by the one tool, `load_skill(name)` — which returns the SKILL.md body + the list of bundled
+  files (available read-only in the sandbox under `$SKILLS_DIR/<name>/`). A disabled/unknown name
+  raises `ModelRetry`. Active names ride on `deps.enabled_skills` (set per turn by `stream_run` to
+  the whole library for regular/research; set by `run_subagent` to a specialist's `AgentSpec.skills`
+  in swarm). **Skill-use notification:** `skill_use_frame(tool_name, args)` returns a
+  `{type:"skill", action:"used", skill_name}` stream frame on a `load_skill` call — emitted by both
+  `main.stream_run` (`_emit_parent`) and `subagent.emit` so a "Using skill X" chip shows for the
+  main agent AND swarm specialists (parallel to the `document` frames). Schemas in
   `backend/schemas/skill_schemas.py` (`LoadSkillArgs`, `SkillContent`). Protected types: `Skill` /
   `HAS_SKILL` are in `ontology_capability`'s `_PROTECTED_VERTEX_TYPES`/`_PROTECTED_EDGE_TYPES`, so
   the agent can't drop them.
 - **`backend/skills/subagent.py`** — the shared **delegated-run machinery** + the agency
   communication primitive: `run_subagent(deps, instructions=, tool_groups=, prompt=, recipients=,
-  request_limit=, model=)` builds a fresh single-purpose Pydantic AI agent per dispatch with a
-  granted subset of the existing capability bundles (`capabilities_for`:
+  skills=, request_limit=, model=)` builds a fresh single-purpose Pydantic AI agent per dispatch with
+  a granted subset of the existing capability bundles (`capabilities_for`:
   `web`/`documents`/`sandbox`/`memory` — tool capabilities ONLY, never `persistence_hooks`, since
-  the parent run's `after_run` already records the orchestrating turn) and runs it on the parent's
+  the parent run's `after_run` already records the orchestrating turn). When `skills=` is non-empty
+  it also adds `build_skills()`, sets the delegate's `enabled_skills` to exactly those skills (so the
+  sandbox mounts only them), and appends their name+description to the static `instructions` via
+  `_assigned_skills_block` (sub-agents get no `register_system_prompt`). `dispatch_message` passes
+  the recipient spec's `skills`. Runs it on the parent's
   deps (same per-user DB/conversation/web/sandbox; fresh `proposed_*` dicts) with a
   `UsageLimits(request_limit=)` runaway backstop (`SUBAGENT_REQUEST_LIMIT`, default 25). A
   `_document_collector` Hooks records every document the delegate persists (create_document results
@@ -368,8 +383,11 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   and `research` (the latter overlays `build_research()`); `swarm` instead builds a **lean
   pure-router** set — only `Thinking` + `build_memory()` (tools + persistence hooks) +
   `build_swarm()`, NO web/sandbox/ontology/documents — so the orchestrator can't do work itself and
-  must delegate. `MODES`/`DEFAULT_MODE` are the source of truth, unknown values fall back to
-  regular. `stream_run`
+  must delegate. In swarm mode `build_agent` also calls `register_orchestrator_skills(agent)` (a
+  swarm-only `@agent.instructions` listing the user's whole skill library via
+  `available_skills_block`) so the orchestrator can see what skills to assign — `create_agent`/
+  `update_agent` take a `skills` list that becomes the specialist's grant. `MODES`/`DEFAULT_MODE` are
+  the source of truth, unknown values fall back to regular. `stream_run`
   resolves the conversation's stored mode via `repo.get_conversation_mode` and its custom prompt via
   `repo.get_conversation_system_prompt` (both tolerantly — a lookup failure means regular / no custom
   prompt) *before* building the agent, and passes the UI model label into
@@ -411,7 +429,12 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `GET /api/skills/catalog` (the **live** marketplace catalog with an `installed` flag merged per
   user — backs the marketplace dialog; tolerant → `[]`), `POST /api/skills/sync` (install one
   (`names=[name]`) or all; tolerant — returns the `{synced,errors,source}` summary, never 500),
-  `DELETE /api/skills/{name}` (uninstall from the library), `GET /api/conversations/{id}/messages`,
+  `DELETE /api/skills/{name}` (uninstall from the library), `POST /api/skills` (create/edit a
+  **user-authored** skill — `source="user"`, upsert-by-name) + `GET /api/skills/{name}/content`
+  (full body+files for the editor); the **roster** surface — `GET|POST /api/agents`,
+  `PATCH|DELETE /api/agents/{id}` (AgentSpec CRUD incl. `tools`/`skills`/`recipients`, backing the
+  swarm Agents editor); `GET /api/config` additionally exposes `tool_groups` (the grantable swarm
+  bundles). `GET /api/conversations/{id}/messages`,
   `GET /api/conversations/{id}/summary` (one-shot LLM digest; tolerant — errors return an empty
   summary), the document surface — `GET /api/conversations/{id}/documents` (metadata list,
   tolerant), `GET|PUT|DELETE /api/documents/{id}` (PUT applies a **user edit** of title/content via
@@ -446,12 +469,19 @@ chain-of-thought timeline), right `ContextPane` (440px) — **tabbed** (hand-rol
 no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a *Context* tab
 (config + summary + memory graph; the config card's `SystemPromptRow` is a per-conversation custom
 system-prompt textarea, saved on blur via `AppContext.setConversationSystemPrompt`, and `SkillsRow`
-shows the skills *loaded onto this chat* as removable chips plus a "Browse" button that opens the
-**Skill Marketplace** dialog (`panes/SkillMarketplace.tsx`, mounted at the shell, also opened from a
-Sparkles button in the `Composer` toolbar): a full-screen gallery of Claude's live catalog
-(`AppContext.catalog` ← `GET /api/skills/catalog`) where each card's "Add to chat"
-(`AppContext.addSkillToChat` — installs via `POST /api/skills/sync` `names=[name]` if needed, then
-enables via `setConversationSkills`) loads a skill onto the active conversation). When the active
+shows the **account skill library** (active in every chat) as removable chips plus a "Browse" button
+that opens the **Skill Marketplace** dialog (`panes/SkillMarketplace.tsx`, mounted at the shell, also
+opened from a Sparkles button in the `Composer` toolbar): a full-screen gallery of Claude's live
+catalog + the user's authored skills, where each card **Install**s (`AppContext.installSkill` →
+`POST /api/skills/sync` `names=[name]`) or **Remove**s (`removeSkill` → `DELETE /api/skills/{name}`)
+a library skill, plus a **Create skill** editor (name/description/instructions → `saveSkill` →
+`POST /api/skills`, `source="user"`; authored skills get an Edit action via `getSkillContent`). In
+**swarm** conversations the Context pane gains an **Agents** tab (`panes/AgentRoster.tsx`): a roster
+editor where each `AgentSpec`'s tools (from `config.tool_groups`), skills (from the library) and
+recipients are checkbox-edited and saved via `AppContext.createAgent`/`updateAgent`/`deleteAgent`
+(`/api/agents`). A `load_skill` call streams a `skill` frame rendered as a "Using skill X" chip in
+the chat (`useChat` reducer → `ChatBubble`'s `SkillChip`; `SwarmStepItem` renders it inside specialist
+bubbles). When the active
 conversation belongs to a project, a **`ProjectCard`** (`panes/ProjectCard.tsx`) sits at the top of
 the Context tab: the project's system-prompt textarea (saved on blur via
 `AppContext.setProjectSystemPrompt`) and its reference-document list — upload (a `FileReader`

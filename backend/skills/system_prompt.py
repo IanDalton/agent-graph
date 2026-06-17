@@ -150,12 +150,14 @@ async def user_profile_block(deps: GraphDependencies) -> str:
 
 
 async def enabled_skills_block(deps: GraphDependencies) -> str:
-    """Build the 'skills enabled for this conversation' block, or "" when none are enabled.
+    """Build the 'skills available to you' block, or "" when none are active.
 
-    Lists each enabled skill by name + one-line description (the cheap, always-injected half of
-    progressive disclosure; the agent loads a skill's full body on demand via ``load_skill``).
-    Descriptions come from :func:`repo.list_skills` (metadata only), filtered to the enabled names.
-    Best-effort: any DB failure logs and returns "" so a turn is never blocked.
+    Lists each active skill by name + one-line description (the cheap, always-injected half of
+    progressive disclosure; the agent loads a skill's full body on demand via ``load_skill``). The
+    active set is ``deps.enabled_skills`` — the user's whole account library for a regular/research
+    conversation (skills are auto-enabled account-wide), or the assigned subset for a swarm
+    specialist. Descriptions come from :func:`repo.list_skills` (metadata only), filtered to the
+    active names. Best-effort: any DB failure logs and returns "" so a turn is never blocked.
     """
     names = deps.enabled_skills or []
     if not names:
@@ -173,8 +175,36 @@ async def enabled_skills_block(deps: GraphDependencies) -> str:
     if not lines:
         return ""
     return (
-        "Skills enabled for this conversation (call load_skill(name) to read a skill's full "
-        "instructions before using it):\n" + "\n".join(lines)
+        "Skills available to you (call load_skill(name) to read a skill's full instructions before "
+        "using it):\n" + "\n".join(lines)
+    )
+
+
+async def available_skills_block(deps: GraphDependencies) -> str:
+    """Build the swarm orchestrator's 'skills in the user's library' block, or "" when empty.
+
+    The orchestrator does no work itself (it has no ``load_skill``), but it ASSIGNS skills to the
+    specialists it dispatches — so it needs to know what the user's library holds. Lists every
+    installed/authored skill by name + description (independent of ``deps.enabled_skills``, which is
+    empty for the orchestrator). Best-effort: any DB failure logs and returns "".
+    """
+    try:
+        rows = await repo.list_skills(deps.db, deps.user_id)
+    except Exception:  # noqa: BLE001 — skill recall is best-effort; never abort the run.
+        logger.warning("library-skills lookup failed; continuing without it", exc_info=True)
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        name = row.get("name")
+        if not name:
+            continue
+        description = row.get("description") or ""
+        lines.append(f"- {name}: {description}" if description else f"- {name}")
+    if not lines:
+        return ""
+    return (
+        "Skills in the user's library (assign the useful ones to specialists via the `skills` field "
+        "on create_agent/update_agent):\n" + "\n".join(lines)
     )
 
 
@@ -253,3 +283,17 @@ def register_system_prompt(agent: Agent[GraphDependencies, Any]) -> None:
     @agent.instructions
     async def _project_documents(ctx: RunContext[GraphDependencies]) -> str:
         return await project_documents_block(ctx.deps)
+
+
+def register_orchestrator_skills(agent: Agent[GraphDependencies, Any]) -> None:
+    """Attach the swarm-only 'skills in the user's library' instruction (see :func:`build_agent`).
+
+    Added on top of :func:`register_system_prompt` for the swarm orchestrator so it can see the
+    library it assigns from. Kept separate because only the orchestrator (which has no ``load_skill``
+    of its own) needs the *whole* library listed; regular agents get the auto-enabled
+    ``enabled_skills_block`` instead.
+    """
+
+    @agent.instructions
+    async def _library_skills(ctx: RunContext[GraphDependencies]) -> str:
+        return await available_skills_block(ctx.deps)

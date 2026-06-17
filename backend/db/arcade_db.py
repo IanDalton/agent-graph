@@ -279,6 +279,8 @@ class ArcadeClient:
             # The agency communication chart: the names of teammates this specialist may
             # send_message to. Missing/NULL on pre-agency rows reads back as no edges (a leaf).
             "CREATE PROPERTY AgentSpec.recipients IF NOT EXISTS LIST",
+            # The marketplace skills granted to this specialist (by name). Missing/NULL ⇒ none.
+            "CREATE PROPERTY AgentSpec.skills IF NOT EXISTS LIST",
             "CREATE PROPERTY Skill.skill_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Skill (skill_id) UNIQUE",
             "CREATE PROPERTY Skill.user_id IF NOT EXISTS STRING",

@@ -9,11 +9,13 @@ import {
 
 import { api } from "@/api/client";
 import type {
+  AgentSpec,
   AppConfig,
   CatalogSkill,
   Conversation,
   Mode,
   Project,
+  SkillContent,
   SkillInfo,
   SwarmFlowState,
 } from "@/types";
@@ -102,13 +104,13 @@ interface AppState {
   setProjectTitle: (id: string, title: string) => Promise<void>;
   /** Cascade-delete a project (its conversations + non-global documents). */
   deleteProject: (id: string) => Promise<void>;
-  /** The marketplace skills this user has synced (their library). */
+  /** The user's account-wide skill library (synced + authored). Active in every regular/research chat. */
   skills: SkillInfo[];
   /** True while a marketplace sync is in flight (drives the Sync button's spinner). */
   syncingSkills: boolean;
-  /** Re-fetch the synced skills list. */
+  /** Re-fetch the library. */
   refreshSkills: () => Promise<void>;
-  /** Sync ALL skills from the marketplace into the user's DB, then refresh the list. */
+  /** Sync ALL marketplace skills into the library, then refresh. */
   syncSkills: () => Promise<void>;
   /** Whether the Skill Marketplace dialog is open. */
   skillMarketplaceOpen: boolean;
@@ -120,8 +122,20 @@ interface AppState {
   catalogLoading: boolean;
   /** Re-fetch the live marketplace catalog. */
   refreshCatalog: () => Promise<void>;
-  /** Install a skill if needed and enable it on the active conversation. */
-  addSkillToChat: (name: string, installed: boolean) => Promise<void>;
+  /** Install a marketplace skill into the library (active everywhere). */
+  installSkill: (name: string) => Promise<void>;
+  /** Remove a skill from the library (uninstall / delete authored). */
+  removeSkill: (name: string) => Promise<void>;
+  /** Create or edit (by name) a user-authored skill, then refresh. */
+  saveSkill: (draft: { name: string; description: string; body: string }) => Promise<void>;
+  /** Fetch a skill's full content (body + files) for the editor. */
+  getSkillContent: (name: string) => Promise<SkillContent>;
+  /** The user's swarm roster (AgentSpecs). Loaded for swarm conversations. */
+  agents: AgentSpec[];
+  refreshAgents: () => Promise<void>;
+  createAgent: (agent: Omit<AgentSpec, "agent_id">) => Promise<void>;
+  updateAgent: (agentId: string, patch: Partial<Omit<AgentSpec, "agent_id" | "name">>) => Promise<void>;
+  deleteAgent: (agentId: string) => Promise<void>;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -139,6 +153,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [skillMarketplaceOpen, setSkillMarketplaceOpen] = useState(false);
   const [catalog, setCatalog] = useState<CatalogSkill[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [agents, setAgents] = useState<AgentSpec[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -471,32 +486,95 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const closeSkillMarketplace = useCallback(() => setSkillMarketplaceOpen(false), []);
 
-  const addSkillToChat = useCallback(
-    async (name: string, installed: boolean) => {
-      if (!activeId) return;
-      // Install into the library first if it isn't there yet (fetches just this one skill).
-      if (!installed) {
-        try {
-          await api.syncSkills(USER_ID, [name]);
-        } catch (err) {
-          console.error("failed to install skill", err);
-          return;
-        }
+  // Install a marketplace skill into the account library (active in every regular/research chat).
+  const installSkill = useCallback(
+    async (name: string) => {
+      try {
+        await api.syncSkills(USER_ID, [name]);
+      } catch (err) {
+        console.error("failed to install skill", err);
       }
-      // Enable it on the active conversation (optimistic + persisted via setConversationSkills).
-      const conv = conversations.find((c) => c.conversation_id === activeId);
-      const enabled = conv?.enabled_skills ?? [];
-      if (!enabled.includes(name)) {
-        await setConversationSkills(activeId, [...enabled, name]);
-      }
-      // Refresh library + catalog so the installed flag reflects the new install.
       refreshSkills().catch(() => {});
       refreshCatalog().catch(() => {});
     },
-    [activeId, conversations, setConversationSkills, refreshSkills, refreshCatalog]
+    [refreshSkills, refreshCatalog]
   );
 
-  // Load the synced-skill library once so the Configuration card has it.
+  // Remove a skill from the library (uninstall a synced one or delete an authored one).
+  const removeSkill = useCallback(
+    async (name: string) => {
+      try {
+        await api.deleteSkill(USER_ID, name);
+      } catch (err) {
+        console.error("failed to remove skill", err);
+      }
+      refreshSkills().catch(() => {});
+      refreshCatalog().catch(() => {});
+    },
+    [refreshSkills, refreshCatalog]
+  );
+
+  const saveSkill = useCallback(
+    async (draft: { name: string; description: string; body: string }) => {
+      await api.createSkill(USER_ID, draft);
+      refreshSkills().catch(() => {});
+      refreshCatalog().catch(() => {});
+    },
+    [refreshSkills, refreshCatalog]
+  );
+
+  const getSkillContent = useCallback((name: string) => api.getSkillContent(USER_ID, name), []);
+
+  const refreshAgents = useCallback(async () => {
+    try {
+      setAgents(await api.listAgents(USER_ID));
+    } catch (err) {
+      console.error("failed to load agents", err);
+    }
+  }, []);
+
+  const createAgent = useCallback(
+    async (agent: Omit<AgentSpec, "agent_id">) => {
+      try {
+        await api.createAgent(USER_ID, agent);
+        await refreshAgents();
+      } catch (err) {
+        console.error("failed to create agent", err);
+        throw err;
+      }
+    },
+    [refreshAgents]
+  );
+
+  const updateAgent = useCallback(
+    async (agentId: string, patch: Partial<Omit<AgentSpec, "agent_id" | "name">>) => {
+      setAgents((prev) =>
+        prev.map((a) => (a.agent_id === agentId ? { ...a, ...patch } : a))
+      );
+      try {
+        await api.updateAgent(agentId, USER_ID, patch);
+      } catch (err) {
+        console.error("failed to update agent", err);
+        refreshAgents().catch(() => {});
+      }
+    },
+    [refreshAgents]
+  );
+
+  const deleteAgent = useCallback(
+    async (agentId: string) => {
+      setAgents((prev) => prev.filter((a) => a.agent_id !== agentId));
+      try {
+        await api.deleteAgent(agentId, USER_ID);
+      } catch (err) {
+        console.error("failed to delete agent", err);
+        refreshAgents().catch(() => {});
+      }
+    },
+    [refreshAgents]
+  );
+
+  // Load the skill library once so the Configuration card has it.
   useEffect(() => {
     refreshSkills();
   }, [refreshSkills]);
@@ -583,7 +661,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
         catalog,
         catalogLoading,
         refreshCatalog,
-        addSkillToChat,
+        installSkill,
+        removeSkill,
+        saveSkill,
+        getSkillContent,
+        agents,
+        refreshAgents,
+        createAgent,
+        updateAgent,
+        deleteAgent,
       }}
     >
       {children}

@@ -220,6 +220,16 @@ function reducer(state: ChatMessage[], action: Action): ChatMessage[] {
               },
             ],
           }));
+        case "skill":
+          // A "using skill X" chip in the chain (parallel to the document card). Tagged with the
+          // producing agent so it lands in the right bubble in swarm mode.
+          return patchLast(state, (m) => ({
+            ...m,
+            steps: [
+              ...(m.steps ?? []),
+              { id: newId(), kind: "skill", skillName: ev.skill_name, agent: tagOf(ev) },
+            ],
+          }));
         case "final":
           return patchLast(state, (m) => ({
             ...m,

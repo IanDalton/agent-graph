@@ -1,4 +1,5 @@
 import type {
+  AgentSpec,
   AppConfig,
   CatalogSkill,
   ContextUsage,
@@ -9,6 +10,7 @@ import type {
   MemoryGraph,
   Mode,
   Project,
+  SkillContent,
   SkillInfo,
   SkillSyncResult,
   StoredMessage,
@@ -147,10 +149,55 @@ export const api = {
       body: JSON.stringify({ user_id: userId, names }),
     }).then(json<SkillSyncResult>),
 
-  // Remove a skill from the user's library (does not touch any conversation's selection).
+  // Remove a skill from the user's library (synced uninstall or authored delete).
   deleteSkill: (userId: string, name: string) =>
     fetch(
       `/api/skills/${encodeURIComponent(name)}?user_id=${encodeURIComponent(userId)}`,
+      { method: "DELETE" }
+    ).then(json<{ deleted: string }>),
+
+  // Create or edit (by name) a user-authored skill. source = "user".
+  createSkill: (
+    userId: string,
+    draft: { name: string; description: string; body: string }
+  ) =>
+    fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...draft }),
+    }).then(json<{ name: string; description: string; source: string }>),
+
+  // A skill's full content (body + files) for the editor.
+  getSkillContent: (userId: string, name: string) =>
+    fetch(
+      `/api/skills/${encodeURIComponent(name)}/content?user_id=${encodeURIComponent(userId)}`
+    ).then(json<SkillContent>),
+
+  // --- Swarm roster (AgentSpecs) ----------------------------------------------------------
+  listAgents: (userId: string) =>
+    fetch(`/api/agents?user_id=${encodeURIComponent(userId)}`).then(json<AgentSpec[]>),
+
+  createAgent: (userId: string, agent: Omit<AgentSpec, "agent_id">) =>
+    fetch("/api/agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...agent }),
+    }).then(json<AgentSpec>),
+
+  updateAgent: (
+    agentId: string,
+    userId: string,
+    patch: Partial<Omit<AgentSpec, "agent_id" | "name">>
+  ) =>
+    fetch(`/api/agents/${agentId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, ...patch }),
+    }).then(json<AgentSpec>),
+
+  deleteAgent: (agentId: string, userId: string) =>
+    fetch(
+      `/api/agents/${agentId}?user_id=${encodeURIComponent(userId)}`,
       { method: "DELETE" }
     ).then(json<{ deleted: string }>),
 

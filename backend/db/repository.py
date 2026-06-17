@@ -1120,14 +1120,15 @@ async def create_agent_spec(
     instructions: str,
     tools: list[str],
     recipients: list[str] | None = None,
+    skills: list[str] | None = None,
 ) -> str:
     """Create a swarm sub-agent definition, linked to the User. Returns the agent_id.
 
     AgentSpec vertices are the swarm's persistent roster: the orchestrator defines a specialist
-    once (name, role, system prompt, granted tool groups, and the teammates it may ``send_message``
-    via ``recipients`` — the agency communication chart) and re-dispatches it across turns and
-    conversations. Name uniqueness per user is enforced by the capability layer (it checks
-    :func:`get_agent_spec` first), not by the database.
+    once (name, role, system prompt, granted tool groups, the teammates it may ``send_message``
+    via ``recipients`` — the agency communication chart — and the marketplace ``skills`` it is
+    granted) and re-dispatches it across turns and conversations. Name uniqueness per user is
+    enforced by the capability layer (it checks :func:`get_agent_spec` first), not by the database.
     """
     agent_id = _new_id()
     now = _now()
@@ -1138,7 +1139,7 @@ async def create_agent_spec(
     await db.command(
         "CREATE VERTEX AgentSpec SET agent_id = :aid, user_id = :uid, name = :name, "
         "role = :role, instructions = :instructions, tools = :tools, recipients = :recipients, "
-        "created_at = :ts, updated_at = :ts",
+        "skills = :skills, created_at = :ts, updated_at = :ts",
         {
             "aid": agent_id,
             "uid": user_id,
@@ -1147,6 +1148,7 @@ async def create_agent_spec(
             "instructions": instructions,
             "tools": tools,
             "recipients": list(recipients or []),
+            "skills": list(skills or []),
             "ts": now,
         },
     )
@@ -1162,7 +1164,7 @@ async def create_agent_spec(
 async def get_agent_spec(db: ArcadeClient, user_id: str, ref: str) -> dict[str, Any] | None:
     """Return one sub-agent spec by its agent_id OR its name, or None. User-scoped."""
     rows = await db.query(
-        "SELECT agent_id, name, role, instructions, tools, recipients, created_at, updated_at "
+        "SELECT agent_id, name, role, instructions, tools, recipients, skills, created_at, updated_at "
         "FROM AgentSpec WHERE user_id = :uid AND (agent_id = :ref OR name = :ref)",
         {"uid": user_id, "ref": ref},
     )
@@ -1172,7 +1174,7 @@ async def get_agent_spec(db: ArcadeClient, user_id: str, ref: str) -> dict[str, 
 async def list_agent_specs(db: ArcadeClient, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
     """Return this user's swarm roster (full specs, instructions included), oldest first."""
     return await db.query(
-        "SELECT agent_id, name, role, instructions, tools, recipients, created_at, updated_at "
+        "SELECT agent_id, name, role, instructions, tools, recipients, skills, created_at, updated_at "
         "FROM AgentSpec WHERE user_id = :uid ORDER BY created_at ASC LIMIT :limit",
         {"uid": user_id, "limit": limit},
     )
@@ -1186,12 +1188,13 @@ async def update_agent_spec(
     instructions: str | None = None,
     tools: list[str] | None = None,
     recipients: list[str] | None = None,
+    skills: list[str] | None = None,
 ) -> int:
     """Revise a sub-agent spec in place. Returns the number updated (0 if not this user's).
 
     Pass only the fields to change; ``name`` is immutable (it is how the orchestrator and the
     stored reports refer to the agent). ``recipients`` rewires this agent's outgoing edges in the
-    communication chart.
+    communication chart; ``skills`` replaces the marketplace skills it is granted.
     """
     set_clauses = ["updated_at = :ts"]
     params: dict[str, Any] = {"ts": _now(), "aid": agent_id, "uid": user_id}
@@ -1207,6 +1210,9 @@ async def update_agent_spec(
     if recipients is not None:
         set_clauses.append("recipients = :recipients")
         params["recipients"] = list(recipients)
+    if skills is not None:
+        set_clauses.append("skills = :skills")
+        params["skills"] = list(skills)
     result = await db.command(
         "UPDATE AgentSpec SET " + ", ".join(set_clauses) + " WHERE agent_id = :aid AND user_id = :uid",
         params,

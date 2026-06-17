@@ -858,3 +858,95 @@ def test_document_events_from_send_messages_reports() -> None:
     )
     events = _document_events("send_messages", result, args=None)
     assert [e["document_id"] for e in events] == ["d1", "d2"]
+
+
+# --------------------------------------------------------------------------- #
+# Skill assignment to specialists
+# --------------------------------------------------------------------------- #
+def test_dispatch_message_forwards_skills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dispatched specialist's AgentSpec.skills reach run_subagent (so it's granted them)."""
+    captured: dict[str, Any] = {}
+
+    async def fake_run_subagent(deps: Any, **kw: Any) -> SubagentOutcome:
+        captured.update(kw)
+        return SubagentOutcome(output="ok")
+
+    monkeypatch.setattr(subagent_mod, "run_subagent", fake_run_subagent)
+    row = {**SPEC_ROW, "skills": ["pdf"]}
+    db = FakeDb(rows=[row])
+    report = asyncio.run(dispatch_message(_deps(db), "market-researcher", "do it"))
+    assert captured["skills"] == ["pdf"]
+    assert report.error is None
+
+
+def test_run_subagent_grants_skills_and_sets_enabled_skills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_subagent(skills=...) adds the Skills capability AND scopes the sub-agent's active set."""
+    from pydantic_ai.capabilities import Capability
+
+    seen: dict[str, Any] = {}
+    probe = Capability(id="Probe")
+
+    @probe.tool
+    async def probe_skill(ctx: RunContext[GraphDependencies]) -> str:
+        seen["enabled"] = list(ctx.deps.enabled_skills)
+        return "ok"
+
+    # Swap the real Skills bundle for a probe that records the delegate's active skill set.
+    monkeypatch.setattr(subagent_mod, "build_skills", lambda: [probe])
+
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c")
+    model = TestModel(call_tools=["probe_skill"])
+    outcome = asyncio.run(
+        run_subagent(
+            deps,
+            instructions="x",
+            tool_groups=[],
+            prompt="go",
+            skills=["pdf"],
+            model=model,
+        )
+    )
+    assert outcome.error is None
+    assert seen["enabled"] == ["pdf"]
+
+
+def test_run_subagent_without_skills_has_no_skills_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No assigned skills ⇒ build_skills is never invoked and the delegate's active set is empty."""
+    from pydantic_ai.capabilities import Capability
+
+    calls: list[int] = []
+    probe = Capability(id="Probe")
+
+    @probe.tool
+    async def probe_skill(ctx: RunContext[GraphDependencies]) -> str:
+        return "ok"
+
+    def _build() -> list[Capability]:
+        calls.append(1)
+        return [probe]
+
+    monkeypatch.setattr(subagent_mod, "build_skills", _build)
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c")
+    outcome = asyncio.run(
+        run_subagent(
+            deps,
+            instructions="x",
+            tool_groups=[],
+            prompt="go",
+            model=TestModel(call_tools=[]),
+        )
+    )
+    assert outcome.error is None
+    assert calls == []  # build_skills not called when no skills are assigned
+
+
+def test_create_agent_args_accept_and_normalize_skills() -> None:
+    args = CreateAgentArgs(
+        name="pdf-author", role="r", instructions="i", skills=["PDF", "pdf", "docx"]
+    )
+    assert args.skills == ["pdf", "docx"]  # lowercased + de-duplicated
+
+
+def test_create_agent_args_reject_bad_skill_names() -> None:
+    with pytest.raises(ValidationError):
+        CreateAgentArgs(name="a", role="r", instructions="i", skills=["Not Valid!"])

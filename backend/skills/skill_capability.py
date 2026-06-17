@@ -18,6 +18,7 @@ conversation's stored selection). ``load_skill`` raises ``ModelRetry`` for a nam
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.capabilities import Capability
@@ -29,17 +30,36 @@ from backend.schemas.skill_schemas import LoadSkillArgs, SkillContent
 logger = logging.getLogger("agent_graph.skills")
 
 INSTRUCTIONS = (
-    "SKILLS are enabled for this conversation — focused procedures (with optional bundled scripts) "
-    "for specific tasks. Their names and one-line descriptions are listed in your instructions "
-    "under 'Skills enabled for this conversation'.\n"
-    "- When a task matches an enabled skill, call `load_skill(name)` FIRST to read its full "
+    "SKILLS are available to you — focused procedures (with optional bundled scripts) for specific "
+    "tasks. Their names and one-line descriptions are listed in your instructions under 'Skills "
+    "available'.\n"
+    "- When a task matches an available skill, call `load_skill(name)` FIRST to read its full "
     "instructions, then follow them. Don't guess a skill's steps from its description alone.\n"
     "- A skill may ship files (scripts/templates/references). When it does, they are available "
     "READ-ONLY inside the `run_python` sandbox under `$SKILLS_DIR/<name>/`. The sandbox has NO "
     "network, so a skill cannot `pip install`; rely on what the sandbox image already provides.\n"
-    "- Only skills listed as enabled can be loaded. If a skill you need isn't enabled, tell the "
-    "user they can enable it from the Configuration card."
+    "- Only the skills listed as available can be loaded."
 )
+
+
+def skill_use_frame(tool_name: str | None, args: Any) -> dict[str, Any] | None:
+    """A ``skill`` stream frame for a ``load_skill`` call, or ``None`` for any other tool.
+
+    Lets the UI surface "Using skill X" the moment the agent invokes a skill (parallel to the
+    ``document`` frames emitted after create_document). ``args`` is the tool call's arguments;
+    handles both the flat ``{"name": ...}`` and nested ``{"args": {"name": ...}}`` shapes Pydantic
+    AI may produce (same defensive read as ``main._document_events`` does for update_document).
+    """
+    if tool_name != "load_skill":
+        return None
+    data = args if isinstance(args, dict) else {}
+    inner = data.get("args")
+    if isinstance(inner, dict):
+        data = inner
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return None
+    return {"type": "skill", "action": "used", "skill_name": name, "title": name}
 
 skill_capability = Capability(id="Skills", instructions=INSTRUCTIONS)
 
@@ -58,13 +78,13 @@ async def load_skill(ctx: RunContext[GraphDependencies], args: LoadSkillArgs) ->
     if name not in enabled:
         available = ", ".join(sorted(enabled)) or "(none)"
         raise ModelRetry(
-            f"Skill {name!r} is not enabled for this conversation. Enabled skills: {available}."
+            f"Skill {name!r} is not available to you. Available skills: {available}."
         )
     skill = await repo.get_skill(deps.db, deps.user_id, name)
     if skill is None:
         raise ModelRetry(
-            f"Skill {name!r} is enabled but its content could not be found. It may need to be "
-            "re-synced from the marketplace."
+            f"Skill {name!r} is listed as available but its content could not be found. It may "
+            "need to be re-synced/re-saved."
         )
     files = sorted((skill.get("files") or {}).keys())
     return SkillContent(

@@ -73,6 +73,12 @@ INSTRUCTIONS = (
     "in its own `recipients`, and those messages flow multi-hop along the chart. Leave recipients "
     "empty for a leaf worker that only reports back. Retire obsolete specialists with "
     "`delete_agent`.\n"
+    "SKILLS: the user has a library of installed skills (focused procedures, some with runnable "
+    "scripts) — they are listed below under 'Skills in the user's library'. When a specialist's job "
+    "matches one, GRANT it by putting the skill name in that agent's `skills` (on create_agent / "
+    "update_agent); the agent then gets `load_skill` and uses it. A skill that ships scripts ALSO "
+    "needs the `sandbox` tool group to run them. Assign only the skills relevant to each agent's job "
+    "— don't grant the whole library.\n"
     "DELEGATING — PREFER PARALLEL: when subtasks are INDEPENDENT (e.g. research the market AND draft "
     "the copy AND build a model), you MUST batch them into ONE `send_messages` call so they run in "
     "PARALLEL — do NOT issue them as separate sequential `send_message` calls. Use a single "
@@ -226,6 +232,7 @@ def _spec_info(row: dict) -> AgentSpecInfo:
         instructions=row.get("instructions") or "",
         tools=list(row.get("tools") or []),
         recipients=list(row.get("recipients") or []),
+        skills=list(row.get("skills") or []),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )
@@ -266,6 +273,7 @@ async def create_agent(
         instructions=args.instructions,
         tools=args.tools,
         recipients=args.recipients,
+        skills=args.skills,
     )
     return AgentSpecInfo(
         agent_id=agent_id,
@@ -274,24 +282,27 @@ async def create_agent(
         instructions=args.instructions,
         tools=args.tools,
         recipients=args.recipients,
+        skills=args.skills,
     )
 
 
 @swarm_capability.tool
 async def update_agent(ctx: RunContext[GraphDependencies], args: UpdateAgentArgs) -> str:
-    """Revise an existing agent's role, instructions, tools and/or recipients (name is immutable).
+    """Revise an existing agent's role, instructions, tools, recipients and/or skills (name is immutable).
 
-    `instructions`, `tools` and `recipients` REPLACE the old values — send the complete new
-    prompt/lists. Pass `recipients=[]` to cut an agent's outgoing edges (make it a leaf).
+    `instructions`, `tools`, `recipients` and `skills` REPLACE the old values — send the complete new
+    prompt/lists. Pass `recipients=[]` to cut an agent's outgoing edges (make it a leaf), or
+    `skills=[]` to revoke all its skills.
     """
     if (
         args.role is None
         and args.instructions is None
         and args.tools is None
         and args.recipients is None
+        and args.skills is None
     ):
         raise ModelRetry(
-            "Nothing to update: pass a new role, instructions, tools and/or recipients."
+            "Nothing to update: pass a new role, instructions, tools, recipients and/or skills."
         )
     deps = ctx.deps
     row = await repo.get_agent_spec(deps.db, deps.user_id, args.agent)
@@ -307,6 +318,7 @@ async def update_agent(ctx: RunContext[GraphDependencies], args: UpdateAgentArgs
         instructions=args.instructions,
         tools=args.tools,
         recipients=args.recipients,
+        skills=args.skills,
     )
     return f"Updated agent {row.get('name') or row['agent_id']}."
 

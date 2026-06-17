@@ -21,19 +21,31 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
+import re
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend import main, marketplace, summarization
 from backend.db import repository as repo
+from backend.schemas.swarm_schemas import (
+    TOOL_GROUPS,
+    CreateAgentArgs,
+    _valid_recipients,
+    _valid_skills,
+    _valid_tools,
+)
 from backend.skills.subagent import (
     SWARM_MAX_DEPTH,
     SWARM_MAX_DEPTH_RANGE,
     SWARM_MAX_PARALLEL,
     SWARM_MAX_PARALLEL_RANGE,
 )
+
+# kebab-case skill name (lowercase letters/digits/hyphens), for user-authored skills.
+_SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 from backend.db.arcade_db import (
     DEFAULT_URL,
     ArcadeClient,
@@ -129,6 +141,9 @@ async def get_config() -> dict[str, Any]:
         "efforts": main.THINKING_EFFORTS,
         # Conversation modes (agent profiles) selectable at conversation creation.
         "modes": main.MODES,
+        # The tool bundles a swarm specialist can be granted (name -> description); backs the
+        # roster editor's tool checkboxes.
+        "tool_groups": TOOL_GROUPS,
         # The fixed base system prompt; a conversation's custom prompt is appended to it. Shown
         # read-only in the UI so the user knows what their custom instructions add to.
         "base_system_prompt": main.BASE_SYSTEM_PROMPT,
@@ -752,6 +767,160 @@ async def sync_skills(body: SyncSkills) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — never 500; report as a summary error.
         logger.warning("skills sync failed", exc_info=True)
         return {"synced": [], "errors": [{"name": "*", "error": str(exc)}], "source": ""}
+
+
+class CreateSkill(BaseModel):
+    """A user-authored skill (name + description + instructions body). Upsert-by-name = edit."""
+
+    user_id: str = "default"
+    name: str
+    description: str = ""
+    body: str = ""
+    # Optional bundled files (relpath -> {content, encoding}); usually empty for hand-authored skills.
+    files: dict[str, dict[str, str]] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, v: str) -> str:
+        low = v.strip().lower()
+        if not _SKILL_NAME_RE.match(low):
+            raise ValueError(
+                "name must be kebab-case (lowercase letters, digits, hyphens), e.g. 'my-skill'."
+            )
+        return low
+
+
+@app.post("/api/skills")
+async def create_user_skill(body: CreateSkill) -> dict[str, Any]:
+    """Create (or edit, by name) a user-authored skill in the library. `source` is `"user"`.
+
+    Distinct from POST /api/skills/sync (which pulls from GitHub). Upsert-by-name means re-posting
+    the same name edits it. The skill then participates in everything a synced skill does
+    (auto-enable account-wide, swarm assignment, the use-notification).
+    """
+    async with _client_for(body.user_id, ensure=True) as db:
+        await repo.upsert_skill(
+            db,
+            body.user_id,
+            name=body.name,
+            description=body.description,
+            body=body.body,
+            files=body.files or {},
+            source="user",
+        )
+    return {"name": body.name, "description": body.description, "source": "user"}
+
+
+@app.get("/api/skills/{name}/content")
+async def get_skill_content(name: str, user_id: str = "default") -> dict[str, Any]:
+    """Return a skill's full record (body + files) so the editor can load it (404 if missing)."""
+    try:
+        async with _client_for(user_id) as db:
+            row = await repo.get_skill(db, user_id, name)
+    except Exception:  # noqa: BLE001
+        logger.warning("get_skill_content failed", exc_info=True)
+        row = None
+    if row is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return row
+
+
+# ----------------------------------------------------------------------------- agents
+
+
+class NewAgent(CreateAgentArgs):
+    """Create a swarm roster agent via the REST API (CreateAgentArgs + the owning user)."""
+
+    user_id: str = "default"
+
+
+class EditAgent(BaseModel):
+    """Partial update of a roster agent (only the fields sent change). Name is immutable."""
+
+    user_id: str = "default"
+    role: str | None = None
+    instructions: str | None = None
+    tools: list[str] | None = None
+    skills: list[str] | None = None
+    recipients: list[str] | None = None
+
+    @field_validator("tools")
+    @classmethod
+    def _check_tools(cls, v: list[str] | None) -> list[str] | None:
+        return _valid_tools(v) if v is not None else None
+
+    @field_validator("skills")
+    @classmethod
+    def _check_skills(cls, v: list[str] | None) -> list[str] | None:
+        return _valid_skills(v) if v is not None else None
+
+    @field_validator("recipients")
+    @classmethod
+    def _check_recipients(cls, v: list[str] | None) -> list[str] | None:
+        return _valid_recipients(v) if v is not None else None
+
+
+@app.get("/api/agents")
+async def list_agents(user_id: str = "default") -> list[dict[str, Any]]:
+    """List the user's swarm roster (full specs incl. tools/skills/recipients). Tolerant → []."""
+    try:
+        async with _client_for(user_id) as db:
+            return await repo.list_agent_specs(db, user_id)
+    except Exception:  # noqa: BLE001 — the roster editor must never break the page.
+        logger.warning("list_agents failed", exc_info=True)
+        return []
+
+
+@app.post("/api/agents")
+async def create_agent(body: NewAgent) -> dict[str, Any]:
+    """Create a roster agent (409 if the name is taken — edit it with PATCH instead)."""
+    async with _client_for(body.user_id, ensure=True) as db:
+        existing = await repo.get_agent_spec(db, body.user_id, body.name)
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="an agent with that name already exists")
+        agent_id = await repo.create_agent_spec(
+            db,
+            body.user_id,
+            name=body.name,
+            role=body.role,
+            instructions=body.instructions,
+            tools=body.tools,
+            recipients=body.recipients,
+            skills=body.skills,
+        )
+        row = await repo.get_agent_spec(db, body.user_id, agent_id)
+    return row or {"agent_id": agent_id, "name": body.name}
+
+
+@app.patch("/api/agents/{agent_id}")
+async def update_agent(agent_id: str, body: EditAgent) -> dict[str, Any]:
+    """Update a roster agent's role/instructions/tools/skills/recipients (404 if not the caller's)."""
+    fields = body.model_fields_set
+    async with _client_for(body.user_id, ensure=True) as db:
+        updated = await repo.update_agent_spec(
+            db,
+            body.user_id,
+            agent_id,
+            role=body.role if "role" in fields else None,
+            instructions=body.instructions if "instructions" in fields else None,
+            tools=body.tools if "tools" in fields else None,
+            recipients=body.recipients if "recipients" in fields else None,
+            skills=body.skills if "skills" in fields else None,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="agent not found")
+        row = await repo.get_agent_spec(db, body.user_id, agent_id)
+    return row or {"agent_id": agent_id}
+
+
+@app.delete("/api/agents/{agent_id}")
+async def remove_agent(agent_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Delete a roster agent (404 if not the caller's)."""
+    async with _client_for(user_id, ensure=True) as db:
+        deleted = await repo.delete_agent_spec(db, user_id, agent_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="agent not found")
+    return {"deleted": agent_id}
 
 
 # ----------------------------------------------------------------------------- chat

@@ -55,6 +55,29 @@ export interface CatalogSkill {
   installed: boolean;
 }
 
+/** A skill's full record (GET /api/skills/{name}/content), used to load an authored skill for editing. */
+export interface SkillContent {
+  skill_id?: string;
+  name: string;
+  description: string;
+  body: string;
+  source?: string;
+  files?: Record<string, { content: string; encoding: string }>;
+}
+
+/** A swarm roster agent (GET/POST/PATCH /api/agents). `skills` are the marketplace skills it is granted. */
+export interface AgentSpec {
+  agent_id: string;
+  name: string;
+  role: string;
+  instructions: string;
+  tools: string[];
+  skills: string[];
+  recipients: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
 /** A user-uploaded file attached to a message. During the live turn `data` holds the base64 bytes
  *  (so the bubble can render a thumbnail inline); after a reload only `document_id` is present —
  *  the file was persisted as a Document, and its card opens it in the Documents tab. */
@@ -101,6 +124,7 @@ export type Step =
   | { id: string; kind: "thinking"; text: string; agent?: AgentRef }
   | { id: string; kind: "agent_text"; text: string; agent?: AgentRef }
   | { id: string; kind: "tool"; tool: ToolEvent; agent?: AgentRef }
+  | { id: string; kind: "skill"; skillName: string; agent?: AgentRef }
   | {
       id: string;
       kind: "document";
@@ -152,6 +176,7 @@ export type StreamEvent =
       title: string;
       mime_type: string;
     }
+  | ({ type: "skill"; action: "used"; skill_name: string } & AgentTag)
   | { type: "agent_start"; agent_id: string; name: string; instance_id: string }
   | { type: "agent_end"; agent_id: string; name: string; instance_id: string }
   | { type: "final"; text: string }
@@ -186,6 +211,8 @@ export interface AppConfig {
   efforts?: string[];
   /** Conversation modes (agent profiles) selectable at conversation creation. */
   modes?: string[];
+  /** The grantable swarm tool bundles (name -> description), for the roster editor checkboxes. */
+  tool_groups?: Record<string, string>;
   /** The fixed base system prompt; a conversation's custom prompt is appended to it. */
   base_system_prompt?: string;
   /** Swarm bounds: env defaults + allowed override ranges for the per-conversation settings. */

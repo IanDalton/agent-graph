@@ -44,9 +44,13 @@ from backend.skills.ontology_capability import build_ontology
 from backend.skills.research_capability import build_research
 from backend.skills.sandbox_capability import build_sandbox
 from backend.skills.search_capability import build_search
-from backend.skills.skill_capability import build_skills
+from backend.skills.skill_capability import build_skills, skill_use_frame
 from backend.skills.swarm_capability import build_swarm
-from backend.skills.system_prompt import BASE_SYSTEM_PROMPT, register_system_prompt
+from backend.skills.system_prompt import (
+    BASE_SYSTEM_PROMPT,
+    register_orchestrator_skills,
+    register_system_prompt,
+)
 from backend.web.client import WebClient, html_to_text
 
 logger = logging.getLogger("agent_graph.main")
@@ -134,6 +138,10 @@ def build_agent(
     )
     # Auto-load the user's relevant stored facts into the system prompt each run (and the date).
     register_system_prompt(agent)
+    # The swarm orchestrator also sees the user's whole skill library so it can assign skills to the
+    # specialists it dispatches (it has no load_skill of its own).
+    if mode == "swarm":
+        register_orchestrator_skills(agent)
     return agent
 
 
@@ -474,11 +482,13 @@ async def stream_run(
         except Exception:  # noqa: BLE001 — a missing override must never block a turn.
             logger.warning("swarm-settings lookup failed; using defaults", exc_info=True)
             swarm = {}
-        # Marketplace skills enabled for this conversation; empty ⇒ the Skills capability is omitted.
+        # Skills are an ACCOUNT-WIDE library, auto-enabled in every (non-swarm) conversation: the
+        # active set is the user's whole installed/authored library, not a per-conversation subset.
+        # Empty ⇒ the Skills capability is omitted. Tolerant: a lookup failure means no skills.
         try:
-            enabled_skills = await repo.get_conversation_enabled_skills(db, conversation_id)
-        except Exception:  # noqa: BLE001 — a missing selection must never block a turn.
-            logger.warning("enabled-skills lookup failed; using none", exc_info=True)
+            enabled_skills = [s["name"] for s in await repo.list_skills(db, user_id) if s.get("name")]
+        except Exception:  # noqa: BLE001 — a missing library must never block a turn.
+            logger.warning("skill-library lookup failed; using none", exc_info=True)
             enabled_skills = []
         # The conversation's owning project (None ⇒ ungrouped) and that project's system prompt are
         # layered in: the prompt sits between the base and the conversation prompt, and project_id
@@ -601,12 +611,18 @@ async def stream_run(
             nonlocal final_text
             if isinstance(event, FunctionToolCallEvent):
                 call_args[event.part.tool_call_id] = event.part.args_as_dict() or {}
+                args = _jsonable(event.part.args)
                 sink.put_nowait({
                     "type": "tool_call",
                     "tool_name": event.part.tool_name,
                     "tool_call_id": event.part.tool_call_id,
-                    "args": _jsonable(event.part.args),
+                    "args": args,
                 })
+                # Surface "Using skill X" the moment the agent invokes a skill (parallel to the
+                # document frames after create_document).
+                skill_frame = skill_use_frame(event.part.tool_name, args)
+                if skill_frame is not None:
+                    sink.put_nowait(skill_frame)
                 return
             if isinstance(event, FunctionToolResultEvent):
                 part = event.part

@@ -40,6 +40,7 @@ from pydantic_ai.usage import UsageLimits
 from backend.db import repository as repo
 from backend.db.dependencies import GraphDependencies
 from backend.model_selection import resolve_model
+from backend.skills.skill_capability import build_skills, skill_use_frame
 from backend.reasoning_split import ReasoningSplitter
 from backend.schemas.document_schemas import DocumentInfo
 from backend.schemas.swarm_schemas import (
@@ -160,6 +161,34 @@ def _subagent_system_prompt(row: dict, can_delegate: bool) -> str:
     return prompt
 
 
+async def _assigned_skills_block(deps: GraphDependencies, skills: list[str]) -> str:
+    """A prompt block listing the skills assigned to a sub-agent (name + description).
+
+    Sub-agents don't get :func:`register_system_prompt`, so the per-turn "skills available" block the
+    main agent enjoys must be baked into the delegate's static ``instructions`` here. Descriptions
+    come from :func:`repo.list_skills` (metadata), filtered to the assigned names. Best-effort: any
+    failure returns "" so a dispatch is never blocked.
+    """
+    if not skills:
+        return ""
+    try:
+        catalog = {s.get("name"): s for s in await repo.list_skills(deps.db, deps.user_id)}
+    except Exception:  # noqa: BLE001 — skill recall is best-effort; never abort the dispatch.
+        logger.warning("assigned-skills lookup failed; continuing without it", exc_info=True)
+        return ""
+    lines: list[str] = []
+    for name in skills:
+        meta = catalog.get(name)
+        description = (meta.get("description") if meta else "") or ""
+        lines.append(f"- {name}: {description}" if description else f"- {name}")
+    if not lines:
+        return ""
+    return (
+        "\n\nSKILLS available to you (focused procedures; call load_skill(name) to read a skill's "
+        "full instructions before using it):\n" + "\n".join(lines)
+    )
+
+
 async def dispatch_message(
     deps: GraphDependencies,
     recipient: str,
@@ -215,6 +244,7 @@ async def dispatch_message(
         tool_groups=list(row.get("tools") or []),
         prompt=prompt,
         recipients=recipients,
+        skills=list(row.get("skills") or []),
         agent_id=row.get("agent_id", recipient),
         agent_name=row.get("name") or recipient,
         instance_id=uuid4().hex[:8],
@@ -326,6 +356,7 @@ async def run_subagent(
     tool_groups: list[str],
     prompt: str,
     recipients: list[str] | None = None,
+    skills: list[str] | None = None,
     request_limit: int | None = None,
     model: Model | str | None = None,
     agent_id: str = "",
@@ -353,12 +384,20 @@ async def run_subagent(
     ``SubagentOutcome.error``.
     """
     documents: list[DocumentInfo] = []
+    # Skills assigned to this specialist (swarm orchestrator's choice): grant the load_skill tool,
+    # scope the delegate's active skill set to exactly these (so the sandbox mounts only them), and
+    # bake their descriptions into the static prompt (sub-agents have no register_system_prompt).
+    skill_caps: list[Capability] = []
+    if skills:
+        skill_caps = build_skills()
+        instructions = instructions + await _assigned_skills_block(deps, list(skills))
     sub_deps = replace(
         deps,
         proposed_schemas={},
         proposed_edges={},
         agency_recipients=recipients,
         agency_depth=deps.agency_depth + 1,
+        enabled_skills=list(skills or []),
     )
     comms = (
         [build_communication_capability()]
@@ -369,7 +408,12 @@ async def run_subagent(
         model if model is not None else resolve_model(deps.model),
         deps_type=GraphDependencies,
         instructions=instructions,
-        capabilities=[*capabilities_for(tool_groups), *comms, _document_collector(documents)],
+        capabilities=[
+            *capabilities_for(tool_groups),
+            *skill_caps,
+            *comms,
+            _document_collector(documents),
+        ],
     )
     limits = UsageLimits(request_limit=request_limit or DEFAULT_REQUEST_LIMIT)
 
@@ -419,14 +463,20 @@ async def run_subagent(
         ) as stream:
             async for event in stream:
                 if isinstance(event, FunctionToolCallEvent):
+                    args = _jsonable(event.part.args)
                     emit({
                         "type": "tool_call",
                         "tool_name": event.part.tool_name,
                         # Namespace by instance so the UI's tool_result->tool_call match never
                         # collides with the orchestrator or a sibling running the same spec.
                         "tool_call_id": f"{instance_id}:{event.part.tool_call_id}",
-                        "args": _jsonable(event.part.args),
+                        "args": args,
                     })
+                    # Surface "Using skill X" the moment a specialist invokes one (tagged like the
+                    # other frames so it lands in the specialist's bubble).
+                    skill_frame = skill_use_frame(event.part.tool_name, args)
+                    if skill_frame is not None:
+                        emit(skill_frame)
                     continue
                 if isinstance(event, FunctionToolResultEvent):
                     part = event.part

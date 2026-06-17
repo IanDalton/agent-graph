@@ -27,8 +27,8 @@ from backend.sandbox.runner import DEFAULT_IMAGE, PythonSandbox, SandboxResult
 from backend.schemas.sandbox_schemas import RunPythonArgs
 from backend.schemas.skill_schemas import LoadSkillArgs
 from backend.skills.sandbox_capability import run_python
-from backend.skills.skill_capability import build_skills, load_skill
-from backend.skills.system_prompt import enabled_skills_block
+from backend.skills.skill_capability import build_skills, load_skill, skill_use_frame
+from backend.skills.system_prompt import available_skills_block, enabled_skills_block
 
 
 class FakeDb:
@@ -309,6 +309,48 @@ def test_enabled_skills_block_tolerant_on_db_error(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("backend.skills.system_prompt.repo.list_skills", boom)
     deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c", enabled_skills=["pdf"])
     assert asyncio.run(enabled_skills_block(deps)) == ""
+
+
+# --------------------------------------------------------------------------- #
+# available_skills_block (swarm orchestrator: the whole library to assign from)
+# --------------------------------------------------------------------------- #
+def test_available_skills_block_lists_whole_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_list_skills(db: Any, uid: str, limit: int = 100) -> list[dict[str, Any]]:
+        return [
+            {"name": "pdf", "description": "Make PDFs"},
+            {"name": "docx", "description": "Make Word docs"},
+        ]
+
+    monkeypatch.setattr("backend.skills.system_prompt.repo.list_skills", fake_list_skills)
+    # The orchestrator has no enabled_skills, but the block lists the library regardless.
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c", enabled_skills=[])
+    block = asyncio.run(available_skills_block(deps))
+    assert "pdf: Make PDFs" in block and "docx: Make Word docs" in block
+
+
+def test_available_skills_block_empty_library_is_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_list_skills(db: Any, uid: str, limit: int = 100) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr("backend.skills.system_prompt.repo.list_skills", fake_list_skills)
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c")
+    assert asyncio.run(available_skills_block(deps)) == ""
+
+
+# --------------------------------------------------------------------------- #
+# skill_use_frame (the "Using skill X" notification)
+# --------------------------------------------------------------------------- #
+def test_skill_use_frame_flat_and_nested_args() -> None:
+    flat = skill_use_frame("load_skill", {"name": "pdf"})
+    assert flat == {"type": "skill", "action": "used", "skill_name": "pdf", "title": "pdf"}
+    nested = skill_use_frame("load_skill", {"args": {"name": "docx"}})
+    assert nested is not None and nested["skill_name"] == "docx"
+
+
+def test_skill_use_frame_none_for_other_tools_or_empty_name() -> None:
+    assert skill_use_frame("run_python", {"code": "x"}) is None
+    assert skill_use_frame("load_skill", {"name": ""}) is None
+    assert skill_use_frame("load_skill", "not-a-dict") is None
 
 
 # --------------------------------------------------------------------------- #

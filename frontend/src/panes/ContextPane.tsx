@@ -11,6 +11,7 @@ import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { MemoryGraphCard } from "@/panes/GraphPane";
 import { DocumentsCard } from "@/panes/DocumentsPane";
+import { AgentRoster } from "@/panes/AgentRoster";
 import { ProjectCard } from "@/panes/ProjectCard";
 import { FactsCard } from "@/panes/FactsPane";
 import { SwarmFlowCard } from "@/swarm/SwarmFlowCard";
@@ -173,19 +174,10 @@ function SwarmSettingsRows() {
   );
 }
 
-/** Per-conversation marketplace skills (non-swarm modes). Shows the skills loaded onto this chat as
- *  removable chips; "Browse" opens the Skill Marketplace dialog to add more. */
+/** The account skill library (active in every chat). Shows installed/authored skills as removable
+ *  chips; "Browse" opens the Skill Marketplace dialog to add or author more. */
 function SkillsRow() {
-  const { conversations, activeId, setConversationSkills, openSkillMarketplace } = useApp();
-  if (!activeId) return null;
-  const conv = conversations.find((c) => c.conversation_id === activeId);
-  const enabled = conv?.enabled_skills ?? [];
-
-  const remove = (name: string) =>
-    setConversationSkills(
-      activeId,
-      enabled.filter((n) => n !== name)
-    );
+  const { skills, removeSkill, openSkillMarketplace } = useApp();
 
   return (
     <div className="space-y-2">
@@ -205,22 +197,24 @@ function SkillsRow() {
           Browse
         </Button>
       </div>
-      {enabled.length === 0 ? (
+      {skills.length === 0 ? (
         <p className="text-[11px] text-muted-foreground">
-          No skills loaded — Browse the marketplace to add some.
+          No skills yet — Browse the marketplace to install or author some. Installed skills are
+          active in every chat.
         </p>
       ) : (
         <div className="flex flex-wrap gap-1">
-          {enabled.map((name) => (
+          {skills.map((s) => (
             <span
-              key={name}
+              key={s.name}
+              title={s.description}
               className="inline-flex items-center gap-1 rounded-full border border-border bg-background/60 px-2 py-0.5 text-[11px]"
             >
-              {name}
+              {s.name}
               <button
                 type="button"
-                onClick={() => remove(name)}
-                title="Remove from this chat"
+                onClick={() => removeSkill(s.name)}
+                title="Remove from your library"
                 className="text-muted-foreground transition-colors hover:text-foreground"
               >
                 <X className="size-3" />
@@ -537,6 +531,11 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
     if (featuredDoc) setTab("documents");
   }, [featuredDoc]);
 
+  // The Agents tab only exists in swarm mode; fall back to Context if the mode changes while open.
+  useEffect(() => {
+    if (!isSwarm && tab === "agents") setTab("context");
+  }, [isSwarm, tab]);
+
   return (
     <aside className="h-full border-l border-border bg-card">
       <Tabs defaultValue="context" value={tab} onValueChange={setTab} className="flex h-full flex-col">
@@ -554,6 +553,12 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
               <FileText className="size-3.5" />
               Documents
             </TabsTrigger>
+            {isSwarm && (
+              <TabsTrigger value="agents">
+                <Bot className="size-3.5" />
+                Agents
+              </TabsTrigger>
+            )}
           </TabsList>
         </div>
         {/* The tab panel itself is the scroll container (native overflow on a min-h-0 flex
@@ -581,6 +586,13 @@ export function ContextPane({ refreshKey }: { refreshKey: number }) {
             <DocumentsCard refreshKey={refreshKey} />
           </div>
         </TabsContent>
+        {isSwarm && (
+          <TabsContent value="agents" className="min-h-0 flex-1 overflow-y-auto">
+            <div className="p-3">
+              <AgentRoster />
+            </div>
+          </TabsContent>
+        )}
       </Tabs>
     </aside>
   );

@@ -57,6 +57,21 @@ def _valid_recipients(recipients: list[str]) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _valid_skills(skills: list[str]) -> list[str]:
+    """Normalize the granted skill names: kebab-case, de-duplicated.
+
+    Shape only — whether each names a skill in the user's library is checked tolerantly at dispatch
+    (``load_skill`` rejects an unknown name), since the library isn't a fixed set.
+    """
+    cleaned = [s.strip().lower() for s in skills]
+    bad = [s for s in cleaned if not _AGENT_NAME_RE.match(s)]
+    if bad:
+        raise ValueError(
+            f"Invalid skill name(s) {bad}; each must be a kebab-case skill name, e.g. 'pdf'."
+        )
+    return list(dict.fromkeys(cleaned))
+
+
 class CreateAgentArgs(BaseModel):
     """A new specialist sub-agent for the swarm roster."""
 
@@ -87,6 +102,14 @@ class CreateAgentArgs(BaseModel):
             "back. Recipients may name agents you create later in the same turn."
         ),
     )
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Marketplace skills (by name, from the user's library) to grant this agent — assign the "
+            "ones useful for its job. The agent gets `load_skill`; a skill that ships scripts also "
+            "needs the `sandbox` tool group to run them."
+        ),
+    )
 
     @field_validator("name")
     @classmethod
@@ -109,6 +132,11 @@ class CreateAgentArgs(BaseModel):
     def _check_recipients(cls, v: list[str]) -> list[str]:
         return _valid_recipients(v)
 
+    @field_validator("skills")
+    @classmethod
+    def _check_skills(cls, v: list[str]) -> list[str]:
+        return _valid_skills(v)
+
 
 class UpdateAgentArgs(BaseModel):
     """Revise an existing sub-agent in place (instead of creating a near-duplicate)."""
@@ -128,6 +156,13 @@ class UpdateAgentArgs(BaseModel):
             "agent may `send_message`. Pass [] to make it a leaf; omit to keep the current edges."
         ),
     )
+    skills: list[str] | None = Field(
+        None,
+        description=(
+            "New granted-skills list (replaces the old one): marketplace skill names from the "
+            "user's library. Pass [] to revoke all; omit to keep the current grants."
+        ),
+    )
 
     @field_validator("tools")
     @classmethod
@@ -138,6 +173,11 @@ class UpdateAgentArgs(BaseModel):
     @classmethod
     def _check_recipients(cls, v: list[str] | None) -> list[str] | None:
         return _valid_recipients(v) if v is not None else None
+
+    @field_validator("skills")
+    @classmethod
+    def _check_skills(cls, v: list[str] | None) -> list[str] | None:
+        return _valid_skills(v) if v is not None else None
 
 
 class AgentSpecInfo(BaseModel):
@@ -151,6 +191,10 @@ class AgentSpecInfo(BaseModel):
     recipients: list[str] = Field(
         default_factory=list,
         description="Teammates this agent may send_message (its outgoing communication-chart edges).",
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description="Marketplace skills granted to this agent (by name).",
     )
     created_at: str | None = None
     updated_at: str | None = None
