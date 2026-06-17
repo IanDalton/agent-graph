@@ -14,6 +14,39 @@ from __future__ import annotations
 import os
 
 from pydantic_ai.models import Model
+from pydantic_ai.settings import ModelSettings
+
+
+def _ollama_settings() -> ModelSettings | None:
+    """Build per-request model settings for a local Ollama model from env, or ``None``.
+
+    Local reasoning models can get cut off mid-chain-of-thought when the context/output budget is
+    too small, which leaves the answer trapped on the thinking channel (see ``main.stream_run``'s
+    fallback). Two env knobs widen that budget:
+
+    * ``OLLAMA_NUM_PREDICT`` → ``max_tokens`` (the max output/answer tokens). Honored by Ollama's
+      OpenAI-compatible endpoint that ``OllamaModel`` speaks.
+    * ``OLLAMA_NUM_CTX`` → a best-effort ``extra_body={"options": {"num_ctx": N}}`` (the prompt
+      context window). The OpenAI-compatible endpoint does NOT reliably honor a per-request
+      ``num_ctx``; the dependable lever is the Ollama server's ``OLLAMA_CONTEXT_LENGTH`` env (or a
+      custom Modelfile). We pass it anyway in case the server accepts it.
+
+    Returns ``None`` when neither var is set, so default behaviour is unchanged.
+    """
+    settings: ModelSettings = {}
+    num_predict = os.getenv("OLLAMA_NUM_PREDICT")
+    if num_predict:
+        try:
+            settings["max_tokens"] = int(num_predict)
+        except ValueError:
+            pass  # a malformed override is ignored, not fatal
+    num_ctx = os.getenv("OLLAMA_NUM_CTX")
+    if num_ctx:
+        try:
+            settings["extra_body"] = {"options": {"num_ctx": int(num_ctx)}}
+        except ValueError:
+            pass
+    return settings or None
 
 
 def select_model(
@@ -22,15 +55,16 @@ def select_model(
     """Resolve a model from env: ``primary_env`` if set, else a local Ollama model.
 
     Returns a model *string* (passed straight to ``Agent``) when ``primary_env`` is set, otherwise
-    an ``OllamaModel`` instance. The Ollama import is lazy so importing this module never requires
-    the local-model dependency when a hosted provider is configured.
+    an ``OllamaModel`` instance (carrying :func:`_ollama_settings` token-budget overrides). The
+    Ollama import is lazy so importing this module never requires the local-model dependency when a
+    hosted provider is configured.
     """
     model_string = os.getenv(primary_env)
     if model_string:
         return model_string
     from pydantic_ai.models.ollama import OllamaModel
 
-    return OllamaModel(os.getenv(fallback_env, fallback_default))
+    return OllamaModel(os.getenv(fallback_env, fallback_default), settings=_ollama_settings())
 
 
 # The built-in dropdown choices when ``AGENT_MODELS`` is unset. Labels follow the same convention
@@ -151,5 +185,5 @@ def resolve_model(model: str | None) -> Model | str:
     if model.startswith("ollama/"):
         from pydantic_ai.models.ollama import OllamaModel
 
-        return OllamaModel(model[len("ollama/") :])
+        return OllamaModel(model[len("ollama/") :], settings=_ollama_settings())
     return model

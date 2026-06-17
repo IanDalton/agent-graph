@@ -83,3 +83,39 @@ def test_trailing_partial_tag_flushed_as_text() -> None:
     s = ReasoningSplitter()
     out = s.feed_text("answer<thin") + s.flush()
     assert _joined(out) == {"thinking": "", "text": "answer<thin"}
+
+
+# --------------------------------------------------------------------------- #
+# Empty-answer fallback (main._empty_answer_fallback): never leave the UI stuck
+# in the reasoning bubble when a turn reasons but produces no answer.
+# --------------------------------------------------------------------------- #
+def test_empty_answer_fallback_fires_when_reasoning_but_no_answer() -> None:
+    """Model cut off mid-<think> (no closing tag): all content stays on the thinking channel."""
+    from backend.main import _empty_answer_fallback
+
+    s = ReasoningSplitter()
+    out = _drain_thinking(s, "<think>reasoning that never closes")
+    routed = _joined(out)
+    assert routed["text"] == ""  # nothing on the answer channel
+    assert routed["thinking"]  # reasoning is present
+    notice = _empty_answer_fallback(routed["text"], routed["thinking"])
+    assert notice is not None and notice.strip()
+
+
+def test_empty_answer_fallback_fires_for_unterminated_text_think() -> None:
+    from backend.main import _empty_answer_fallback
+
+    s = ReasoningSplitter()
+    out = s.feed_text("<think>still reasoning") + s.flush()
+    routed = _joined(out)
+    assert routed["text"] == "" and routed["thinking"]
+    assert _empty_answer_fallback(routed["text"], routed["thinking"]) is not None
+
+
+def test_empty_answer_fallback_silent_on_normal_answer() -> None:
+    """A turn that produced an answer (or nothing at all) gets no fallback notice."""
+    from backend.main import _empty_answer_fallback
+
+    assert _empty_answer_fallback("Here is the answer.", "some reasoning") is None
+    assert _empty_answer_fallback("", "") is None  # tool-only / empty turn: no spurious notice
+    assert _empty_answer_fallback("  ", "   ") is None  # whitespace doesn't count

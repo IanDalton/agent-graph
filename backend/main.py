@@ -124,9 +124,11 @@ def build_agent(
     project's prompt, layered in between the base and the conversation prompt. Both main agent only
     — delegated sub-agents keep their own task-specific prompts.
 
-    ``enabled_skills`` are the marketplace skills turned on for the conversation. When non-empty
-    (and not in swarm mode) the Skills capability is added so the agent can ``load_skill`` and use
-    their bundled files; the names also ride on the deps for the per-turn description block.
+    ``enabled_skills`` are the marketplace skills active for the conversation (the whole account
+    library). For non-swarm modes the Skills capability is always added — it provides ``load_skill``
+    for the active library AND ``save_skill`` so the agent can author its own skills (including its
+    first, when the library is empty). The names also ride on the deps for the per-turn description
+    block + sandbox file mounting.
     """
     effort = effort if effort in THINKING_EFFORTS else DEFAULT_EFFORT
     mode = mode if mode in MODES else DEFAULT_MODE
@@ -153,8 +155,10 @@ def _capabilities_for_mode(
     Factored out so the context-window meter can introspect the exact tool set a mode exposes
     without rebuilding the agent's other wiring.
 
-    When ``enabled_skills`` is non-empty (and not swarm mode) the Skills capability is appended so
-    the agent gets the ``load_skill`` tool; an empty list keeps it out of context.
+    The Skills capability (``load_skill`` + ``save_skill``) is always added for non-swarm modes —
+    even with an empty library — so the agent can author its own first skill. ``enabled_skills`` is
+    accepted for call-site compatibility but no longer gates the bundle (the active library still
+    rides on ``GraphDependencies.enabled_skills`` per turn).
     """
     if mode == "swarm":
         # Pure orchestrator: no web/sandbox/ontology/document tools, so it cannot do the work
@@ -172,10 +176,11 @@ def _capabilities_for_mode(
     ]
     if mode == "research":
         capabilities += build_research()
-    # Marketplace skills (progressive disclosure + sandbox-mounted files) when the conversation
-    # has any enabled. Skipped when none are on, so the load_skill tool stays out of context.
-    if enabled_skills:
-        capabilities += build_skills()
+    # Skills bundle (progressive disclosure + sandbox-mounted files) is always present for non-swarm
+    # modes: it provides load_skill for the enabled library AND save_skill so the agent can author
+    # its own skills — including its very first one, when the library is still empty. load_skill
+    # ModelRetries cleanly on an empty/unknown library, so always-on is safe.
+    capabilities += build_skills()
     return capabilities
 
 
@@ -430,6 +435,26 @@ def build_user_content(
     return content or prompt
 
 
+# Surfaced as the answer when a turn reasoned but produced no final text (see _empty_answer_fallback).
+_REASONING_FALLBACK_NOTICE = (
+    "_(The model stopped while reasoning and didn't produce a final answer — the response may "
+    "have been cut off. Try again, or raise the model's context length / output limit.)_"
+)
+
+
+def _empty_answer_fallback(final_text: str, thinking_text: str) -> str | None:
+    """The notice to surface when a turn produced reasoning but no answer, else ``None``.
+
+    Local reasoning models sometimes get cut off mid-``<think>`` (no closing tag), so everything
+    stays trapped on the thinking channel and ``final_text`` is empty. Returning a non-empty notice
+    here keeps the turn from leaving the UI stuck showing an open reasoning bubble with no answer.
+    Only fires when there *was* reasoning but no answer — a normal answered turn returns ``None``.
+    """
+    if not final_text.strip() and thinking_text.strip():
+        return _REASONING_FALLBACK_NOTICE
+    return None
+
+
 async def stream_run(
     prompt: str,
     user_id: str = "default",
@@ -585,6 +610,9 @@ async def stream_run(
         user_content = build_user_content(prompt, attachments or [], vision=vision)
 
         final_text = ""
+        # Reasoning seen on the thinking channel — used only to detect the "ended with no answer"
+        # case (see _drive's fallback), so a turn never leaves the UI stuck in the thinking bubble.
+        thinking_text = ""
         # Args of in-flight tool calls, keyed by tool_call_id — _document_event needs the
         # document_id from update_document's *arguments* (its return is just a string).
         call_args: dict[str, dict[str, Any]] = {}
@@ -595,11 +623,13 @@ async def stream_run(
 
         def _route(channel: str, text: str) -> None:
             """Emit a routed chunk, accumulating the user-facing answer into ``final_text``."""
-            nonlocal final_text
+            nonlocal final_text, thinking_text
             if not text:
                 return
             if channel == "text":
                 final_text += text
+            else:
+                thinking_text += text
             sink.put_nowait({"type": channel, "delta": text})
 
         def _emit_parent(event: Any) -> None:
@@ -669,6 +699,18 @@ async def stream_run(
                 # Release any partial-tag tail the splitter held back at the very end.
                 for channel, text in splitter.flush():
                     _route(channel, text)
+                # Fallback: the model reasoned but produced no answer — typically a local reasoning
+                # model cut off mid-<think> (no closing tag, so everything stayed on the thinking
+                # channel). Without this the UI is stuck showing an open reasoning bubble with no
+                # answer below it. Surface a clear notice on the text channel so the turn always
+                # ends with a visible answer; the reasoning itself stays in the thinking step.
+                notice = _empty_answer_fallback(final_text, thinking_text)
+                if notice:
+                    logger.warning(
+                        "run produced reasoning but no answer (likely truncated mid-reasoning); "
+                        "emitting fallback notice"
+                    )
+                    _route("text", notice)
                 sink.put_nowait({"type": "final", "text": final_text})
             finally:
                 sink.put_nowait(_STREAM_SENTINEL)

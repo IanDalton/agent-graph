@@ -122,12 +122,13 @@ function AttachmentThumbs({ attachments }: { attachments: Attachment[] }) {
   );
 }
 
-/** A small "using skill X" chip, dropped into the chain when the agent invokes a skill. */
+/** A small "using/saved skill X" chip, dropped into the chain when the agent uses or authors a skill. */
 function SkillChip({ step }: { step: Extract<Step, { kind: "skill" }> }) {
+  const label = step.action === "created" ? "Saved skill" : "Using skill";
   return (
     <div className="inline-flex items-center gap-2 self-start rounded-xl border border-primary/20 bg-primary/5 px-2.5 py-1.5 text-xs">
       <Sparkles className="size-3.5 shrink-0 text-primary" />
-      <span className="text-muted-foreground">Using skill</span>
+      <span className="text-muted-foreground">{label}</span>
       <span className="font-medium text-foreground">{step.skillName}</span>
     </div>
   );
@@ -138,6 +139,14 @@ function StepItem({ step }: { step: Step }) {
   if (step.kind === "thinking") {
     if (!step.text.trim()) return null;
     return <ThinkingBlock text={step.text} />;
+  }
+  if (step.kind === "text") {
+    // The main agent's own answer, interleaved in the chain (same styling as the bottom bubble).
+    return step.text.trim() ? (
+      <div className="break-words rounded-2xl border border-white/10 bg-slate-900/40 px-4 py-2.5 text-sm leading-relaxed text-foreground">
+        <Markdown>{step.text}</Markdown>
+      </div>
+    ) : null;
   }
   if (step.kind === "document") {
     return <DocumentCard step={step} />;
@@ -222,7 +231,16 @@ export function ChatBubble({
   const isUser = message.role === "user";
   const steps = message.steps ?? [];
   const empty = !message.content && steps.length === 0;
-  const completed = !isUser && !message.streaming && !message.error && !!message.content;
+  // A finished assistant turn is "complete" once it has produced *something* — normally answer
+  // content, but also a thinking-only turn (steps but no text): the backend's empty-answer fallback
+  // (see main.stream_run) keeps that case rare, but the guard ensures such a turn still renders as
+  // done (shows actions, no stuck spinner) rather than appearing hung.
+  const completed =
+    !isUser && !message.streaming && !message.error && (!!message.content || steps.length > 0);
+  // On a live turn the answer is interleaved into the chain as `text` step(s); the bottom content
+  // bubble is then redundant and is suppressed. Reloaded history turns carry content but no steps,
+  // so they still fall back to the bottom bubble.
+  const hasInlineText = steps.some((s) => s.kind === "text");
 
   return (
     <div className={cn("group flex w-full", isUser ? "justify-end" : "justify-start")}>
@@ -244,7 +262,7 @@ export function ChatBubble({
             </div>
           ))}
 
-        {(message.content || (!isUser && empty && message.streaming)) && (
+        {!hasInlineText && (message.content || (!isUser && empty && message.streaming)) && (
           <div
             className={cn(
               "break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",

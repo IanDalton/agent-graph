@@ -240,20 +240,28 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   exception, so Docker being offline can't abort the run (a per-file persistence failure becomes
   a `note`, keeping the code's stdout).
 - **`backend/skills/skill_capability.py`** — the `Skills` bundle, exposed via `build_skills()` and
-  added (by `_capabilities_for_mode`) when `enabled_skills` is non-empty (regular/research; in swarm
-  the bundle is added per-specialist by `run_subagent`, not the orchestrator). **Progressive
+  added (by `_capabilities_for_mode`) for **every non-swarm conversation** — even with an empty
+  library — because it carries `save_skill` (authoring) as well as `load_skill`; in swarm the bundle
+  is added per-specialist by `run_subagent`, not the orchestrator. **Progressive
   disclosure** (the Agent Skills design): the active skills' name+description are injected into the
   system prompt every turn by `enabled_skills_block` (a dynamic `@agent.instructions` callable in
   `system_prompt.py`, best-effort like `relevant_facts_block`), and the full body is loaded on
-  demand by the one tool, `load_skill(name)` — which returns the SKILL.md body + the list of bundled
+  demand by `load_skill(name)` — which returns the SKILL.md body + the list of bundled
   files (available read-only in the sandbox under `$SKILLS_DIR/<name>/`). A disabled/unknown name
   raises `ModelRetry`. Active names ride on `deps.enabled_skills` (set per turn by `stream_run` to
   the whole library for regular/research; set by `run_subagent` to a specialist's `AgentSpec.skills`
-  in swarm). **Skill-use notification:** `skill_use_frame(tool_name, args)` returns a
-  `{type:"skill", action:"used", skill_name}` stream frame on a `load_skill` call — emitted by both
-  `main.stream_run` (`_emit_parent`) and `subagent.emit` so a "Using skill X" chip shows for the
-  main agent AND swarm specialists (parallel to the `document` frames). Schemas in
-  `backend/schemas/skill_schemas.py` (`LoadSkillArgs`, `SkillContent`). Protected types: `Skill` /
+  in swarm). **Agent-authored skills:** `save_skill(name, description, instructions)` lets the agent
+  write a reusable procedure (e.g. an `agent-architect` skill) into its own library via
+  `repo.upsert_skill(..., source="user")` — the same path as the UI's `POST /api/skills`, so an
+  authored skill behaves identically (auto-enabled account-wide, swarm-assignable). A saved skill is
+  only loadable on the **next** turn (the active set is fixed at turn start in `stream_run`); editing
+  by name preserves any existing bundled `files`. **Skill notification:**
+  `skill_use_frame(tool_name, args)` returns a `{type:"skill", action, skill_name}` stream frame for
+  `load_skill` (`action:"used"`) **or `save_skill` (`action:"created"`)** — emitted by both
+  `main.stream_run` (`_emit_parent`) and `subagent.emit` so a "Using skill X" / "Saved skill X" chip
+  shows for the main agent AND swarm specialists (parallel to the `document` frames). Schemas in
+  `backend/schemas/skill_schemas.py` (`LoadSkillArgs`, `SkillContent`, `SaveSkillArgs`,
+  `SaveSkillResult`). Protected types: `Skill` /
   `HAS_SKILL` are in `ontology_capability`'s `_PROTECTED_VERTEX_TYPES`/`_PROTECTED_EDGE_TYPES`, so
   the agent can't drop them.
 - **`backend/skills/subagent.py`** — the shared **delegated-run machinery** + the agency
@@ -396,7 +404,13 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   lives in `stream_run(prompt, user_id, conversation_id)`, an async generator that maps Pydantic AI
   events to a **stable event vocabulary** — `thinking`/`text`/`tool_call`/`tool_result`/`document`/
   `final` dicts — so callers never depend on the library's event classes; `run()` just consumes it
-  for the CLI (thinking in blue, text plain). `document` frames
+  for the CLI (thinking in blue, text plain). Reasoning leaked across channels via literal
+  `<think>`/`</think>` tags is repaired by `reasoning_split.ReasoningSplitter` (a no-op for providers
+  that split natively). **Empty-answer fallback:** if a turn ends with reasoning but no answer
+  (`final_text` empty while thinking was produced — typically a local reasoning model cut off
+  mid-`<think>` with no closing tag, so everything stayed on the thinking channel),
+  `_empty_answer_fallback` surfaces a clear notice on the `text` channel so the UI never gets stuck
+  showing an open reasoning bubble with no answer. `document` frames
   (`{action, document_id, title, mime_type}`) are emitted right after the tool_result of
   `create_document`/`update_document`/`run_python`/`send_message`/`deep_research`/`send_messages`
   (see `_document_events`; update's id comes from
@@ -554,7 +568,12 @@ curl "http://localhost:8085/search?q=arcadedb&format=json"
 ```
 
 Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL` (e.g.
-`openai:gpt-5.2`) to use a hosted provider instead. Secrets load from `.env` via `python-dotenv`.
+`openai:gpt-5.2`) to use a hosted provider instead. For local reasoning models that get cut off
+mid-chain-of-thought, widen the token budget: `OLLAMA_NUM_PREDICT` (→ `max_tokens`, the max answer
+length) and `OLLAMA_NUM_CTX` (best-effort `num_ctx` via `extra_body`) are applied to the
+`OllamaModel` by `model_selection._ollama_settings`. The **reliable** context lever is the Ollama
+*server's* `OLLAMA_CONTEXT_LENGTH` env (or a custom Modelfile) — its OpenAI-compatible endpoint
+doesn't honor a per-request `num_ctx`. Secrets load from `.env` via `python-dotenv`.
 The marketplace sync reads `SKILLS_REPO`/`SKILLS_REF` (default `anthropics/skills`/`main`) and an
 optional `GITHUB_TOKEN` (lifts GitHub's 60 req/hr unauthenticated limit; the backend needs outbound
 access to GitHub for the sync).

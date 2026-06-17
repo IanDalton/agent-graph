@@ -74,6 +74,14 @@ export function SwarmStepItem({ step }: { step: Step }) {
     if (!step.text.trim()) return null;
     return <ThinkingBlock text={step.text} />;
   }
+  if (step.kind === "text") {
+    // The orchestrator's own answer, interleaved in the chain (same styling as the bottom bubble).
+    return step.text.trim() ? (
+      <div className="break-words rounded-2xl border border-white/10 bg-slate-900/40 px-4 py-2.5 text-sm leading-relaxed text-foreground">
+        <Markdown>{step.text}</Markdown>
+      </div>
+    ) : null;
+  }
   if (step.kind === "document") {
     return <DocumentCard step={step} />;
   }
@@ -90,7 +98,9 @@ export function SwarmStepItem({ step }: { step: Step }) {
     return (
       <div className="inline-flex items-center gap-2 self-start rounded-xl border border-primary/20 bg-primary/5 px-2.5 py-1.5 text-xs">
         <Sparkles className="size-3.5 shrink-0 text-primary" />
-        <span className="text-muted-foreground">Using skill</span>
+        <span className="text-muted-foreground">
+          {step.action === "created" ? "Saved skill" : "Using skill"}
+        </span>
         <span className="font-medium text-foreground">{step.skillName}</span>
       </div>
     );

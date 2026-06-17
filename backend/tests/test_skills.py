@@ -25,9 +25,9 @@ from backend.main import _capabilities_for_mode
 from backend.marketplace import _parse_frontmatter
 from backend.sandbox.runner import DEFAULT_IMAGE, PythonSandbox, SandboxResult
 from backend.schemas.sandbox_schemas import RunPythonArgs
-from backend.schemas.skill_schemas import LoadSkillArgs
+from backend.schemas.skill_schemas import LoadSkillArgs, SaveSkillArgs
 from backend.skills.sandbox_capability import run_python
-from backend.skills.skill_capability import build_skills, load_skill, skill_use_frame
+from backend.skills.skill_capability import build_skills, load_skill, save_skill, skill_use_frame
 from backend.skills.system_prompt import available_skills_block, enabled_skills_block
 
 
@@ -281,6 +281,79 @@ def test_load_skill_missing_content_raises_model_retry(monkeypatch: pytest.Monke
 
 
 # --------------------------------------------------------------------------- #
+# save_skill (the agent authors a skill for itself)
+# --------------------------------------------------------------------------- #
+def test_save_skill_tool_is_registered() -> None:
+    model = TestModel(call_tools=[])
+    agent = Agent(model, deps_type=GraphDependencies, capabilities=[*build_skills()])
+    # No library at all — save_skill must still be available so the agent can author its first one.
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c", enabled_skills=[])
+    asyncio.run(agent.run("hi", deps=deps))
+    names = {t.name for t in model.last_model_request_parameters.function_tools}
+    assert "save_skill" in names
+
+
+def test_save_skill_creates_new_skill_as_user_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_get_skill(db: Any, uid: str, ref: str) -> None:
+        return None  # not found → a create
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_upsert_skill(db: Any, uid: str, **kw: Any) -> str:
+        calls.append({"uid": uid, **kw})
+        return "sid-1"
+
+    monkeypatch.setattr("backend.skills.skill_capability.repo.get_skill", fake_get_skill)
+    monkeypatch.setattr("backend.skills.skill_capability.repo.upsert_skill", fake_upsert_skill)
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c")
+    res = asyncio.run(
+        save_skill(
+            _ctx(deps),
+            SaveSkillArgs(name="agent-architect", description="Design agents", instructions="# Steps"),
+        )
+    )
+    assert res.created is True
+    assert res.name == "agent-architect"
+    assert calls == [
+        {
+            "uid": "u",
+            "name": "agent-architect",
+            "description": "Design agents",
+            "body": "# Steps",
+            "files": {},
+            "source": "user",
+        }
+    ]
+
+
+def test_save_skill_edits_existing_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_get_skill(db: Any, uid: str, ref: str) -> dict[str, Any]:
+        # An existing skill (with files) → an edit; its files are preserved.
+        return {"name": "agent-architect", "files": {"a.py": {"content": "x", "encoding": "text"}}}
+
+    captured: dict[str, Any] = {}
+
+    async def fake_upsert_skill(db: Any, uid: str, **kw: Any) -> str:
+        captured.update(kw)
+        return "sid-1"
+
+    monkeypatch.setattr("backend.skills.skill_capability.repo.get_skill", fake_get_skill)
+    monkeypatch.setattr("backend.skills.skill_capability.repo.upsert_skill", fake_upsert_skill)
+    deps = GraphDependencies(db=FakeDb(), user_id="u", conversation_id="c")
+    res = asyncio.run(
+        save_skill(_ctx(deps), SaveSkillArgs(name="agent-architect", instructions="# Revised"))
+    )
+    assert res.created is False
+    assert captured["body"] == "# Revised"
+    assert captured["files"] == {"a.py": {"content": "x", "encoding": "text"}}  # preserved
+
+
+def test_save_skill_args_rejects_non_kebab_name() -> None:
+    with pytest.raises(ValueError):
+        SaveSkillArgs(name="Bad Name", description="", instructions="")
+
+
+# --------------------------------------------------------------------------- #
 # enabled_skills_block (system prompt injection)
 # --------------------------------------------------------------------------- #
 def test_enabled_skills_block_lists_enabled_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -347,6 +420,16 @@ def test_skill_use_frame_flat_and_nested_args() -> None:
     assert nested is not None and nested["skill_name"] == "docx"
 
 
+def test_skill_use_frame_created_for_save_skill() -> None:
+    frame = skill_use_frame("save_skill", {"name": "agent-architect"})
+    assert frame == {
+        "type": "skill",
+        "action": "created",
+        "skill_name": "agent-architect",
+        "title": "agent-architect",
+    }
+
+
 def test_skill_use_frame_none_for_other_tools_or_empty_name() -> None:
     assert skill_use_frame("run_python", {"code": "x"}) is None
     assert skill_use_frame("load_skill", {"name": ""}) is None
@@ -360,10 +443,13 @@ def _capability_ids(caps: list[Any]) -> set[str | None]:
     return {getattr(c, "id", None) for c in caps}
 
 
-def test_skills_capability_added_only_when_enabled() -> None:
+def test_skills_capability_always_present_for_non_swarm() -> None:
+    # The Skills bundle (load_skill + save_skill) is always on for non-swarm modes — even with an
+    # empty/absent library — so the agent can author its own first skill.
     assert "Skills" in _capability_ids(_capabilities_for_mode("regular", "minimal", ["pdf"]))
-    assert "Skills" not in _capability_ids(_capabilities_for_mode("regular", "minimal", []))
-    assert "Skills" not in _capability_ids(_capabilities_for_mode("regular", "minimal", None))
+    assert "Skills" in _capability_ids(_capabilities_for_mode("regular", "minimal", []))
+    assert "Skills" in _capability_ids(_capabilities_for_mode("regular", "minimal", None))
+    assert "Skills" in _capability_ids(_capabilities_for_mode("research", "minimal", None))
 
 
 def test_skills_capability_absent_in_swarm_mode() -> None:

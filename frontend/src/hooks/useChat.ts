@@ -133,12 +133,28 @@ function reducer(state: ChatMessage[], action: Action): ChatMessage[] {
           });
         }
         case "text": {
-          // Orchestrator text (untagged) is the final answer, accumulated below the chain.
-          // A sub-agent's text (tagged) is its report — a step inside that agent's bubble, never
-          // the final answer.
+          // Orchestrator text (untagged) is the agent's own answer — interleaved into the chain as
+          // a `text` step (coalesced like thinking, so `text → tool → text` renders chronologically)
+          // AND mirrored into `content` (the canonical answer string for Copy/regenerate/reload).
+          // A sub-agent's text (tagged) is its report — an `agent_text` step inside that agent's
+          // bubble, never the final answer.
           const agent = tagOf(ev);
           if (!agent) {
-            return patchLast(state, (m) => ({ ...m, content: m.content + ev.delta }));
+            return patchLast(state, (m) => {
+              const steps = m.steps ?? [];
+              const last = steps[steps.length - 1];
+              const content = m.content + ev.delta;
+              if (last && last.kind === "text" && sameInstance(last.agent, agent)) {
+                const next = steps.slice();
+                next[next.length - 1] = { ...last, text: last.text + ev.delta };
+                return { ...m, content, steps: next };
+              }
+              return {
+                ...m,
+                content,
+                steps: [...steps, { id: newId(), kind: "text", text: ev.delta, agent }],
+              };
+            });
           }
           return patchLast(state, (m) => {
             const steps = m.steps ?? [];
@@ -221,16 +237,27 @@ function reducer(state: ChatMessage[], action: Action): ChatMessage[] {
             ],
           }));
         case "skill":
-          // A "using skill X" chip in the chain (parallel to the document card). Tagged with the
-          // producing agent so it lands in the right bubble in swarm mode.
+          // A "using/saved skill X" chip in the chain (parallel to the document card). Tagged with
+          // the producing agent so it lands in the right bubble in swarm mode.
           return patchLast(state, (m) => ({
             ...m,
             steps: [
               ...(m.steps ?? []),
-              { id: newId(), kind: "skill", skillName: ev.skill_name, agent: tagOf(ev) },
+              {
+                id: newId(),
+                kind: "skill",
+                skillName: ev.skill_name,
+                action: ev.action,
+                agent: tagOf(ev),
+              },
             ],
           }));
         case "final":
+          // The streamed `text` deltas already built both `content` and the inline `text` step(s)
+          // faithfully, so don't rewrite the steps here (ev.text is the WHOLE answer — overwriting
+          // a single step with it would duplicate any pre-tool text fragment). Just finalize content
+          // (falling back to ev.text for the no-stream case, where there are no text steps and the
+          // bottom bubble renders it).
           return patchLast(state, (m) => ({
             ...m,
             content: ev.text || m.content,

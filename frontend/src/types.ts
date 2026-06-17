@@ -115,16 +115,18 @@ export interface AgentRef {
   instanceId: string;
 }
 
-/** One node of the agent's chronological execution chain. Thinking runs and tool
- *  calls are kept in arrival order so the UI can render `thinking → tool → thinking`
- *  exactly as it streamed, rather than collapsing reasoning into a single block.
+/** One node of the agent's chronological execution chain. Thinking runs, the main
+ *  agent's own answer `text`, and tool calls are kept in arrival order so the UI can
+ *  render `thinking → tool → text → tool → text` exactly as it streamed, rather than
+ *  collapsing reasoning into a single block or pushing all answer text to the bottom.
  *  In swarm mode each step carries the `agent` that produced it (undefined = orchestrator);
  *  a sub-agent's streamed report text becomes an `agent_text` step inside its bubble. */
 export type Step =
   | { id: string; kind: "thinking"; text: string; agent?: AgentRef }
+  | { id: string; kind: "text"; text: string; agent?: AgentRef }
   | { id: string; kind: "agent_text"; text: string; agent?: AgentRef }
   | { id: string; kind: "tool"; tool: ToolEvent; agent?: AgentRef }
-  | { id: string; kind: "skill"; skillName: string; agent?: AgentRef }
+  | { id: string; kind: "skill"; skillName: string; action: "used" | "created"; agent?: AgentRef }
   | {
       id: string;
       kind: "document";
@@ -136,8 +138,10 @@ export type Step =
     };
 
 /** A rendered chat turn. The assistant turn additionally carries its ordered
- *  reasoning/tool `steps` chain plus the streamed `content` (the final answer,
- *  rendered as markdown below the chain). */
+ *  reasoning/tool/text `steps` chain. On a live turn the answer is interleaved into that
+ *  chain as `text` steps; `content` still holds the canonical full answer string (used for
+ *  Copy/regenerate and as the single bottom-bubble fallback for reloaded history turns,
+ *  which carry no steps). */
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -176,7 +180,7 @@ export type StreamEvent =
       title: string;
       mime_type: string;
     }
-  | ({ type: "skill"; action: "used"; skill_name: string } & AgentTag)
+  | ({ type: "skill"; action: "used" | "created"; skill_name: string } & AgentTag)
   | { type: "agent_start"; agent_id: string; name: string; instance_id: string }
   | { type: "agent_end"; agent_id: string; name: string; instance_id: string }
   | { type: "final"; text: string }

@@ -8,7 +8,9 @@ The whole stack is containerized: **arcadedb** (graph memory), **searxng** (web 
 
 - Docker Desktop (or Docker Engine) running.
 - A `.env` file (already present) with at least `OLLAMA_BASE_URL`/`OLLAMA_MODEL`, or
-  `AGENT_MODEL` + the matching provider key (e.g. `OPENAI_API_KEY`).
+  `AGENT_MODEL` + the matching provider key (e.g. `OPENAI_API_KEY`). For local reasoning models,
+  set `OLLAMA_NUM_PREDICT` (max answer tokens) and raise the Ollama server's `OLLAMA_CONTEXT_LENGTH`
+  so long chains-of-thought aren't cut off mid-reasoning.
 
 Everything lives in `docker-compose.yml`, selected by a **`dev` or `prod` profile**. The infra
 services (`arcadedb`, `searxng`) have no profile, so they always come up under either profile (and
