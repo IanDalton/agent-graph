@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from backend import main, marketplace, summarization
+from backend import kb_compiler, main, marketplace, summarization
 from backend.db import repository as repo
 from backend.schemas.swarm_schemas import (
     TOOL_GROUPS,
@@ -615,7 +615,10 @@ async def upload_project_document(
             encoding=encoding,
             project_id=project_id,
             embedding=embedding,
+            vertex_type="KbSource",
         )
+    # Auto-compile this project's knowledge base (debounced + best-effort; coalesces bulk uploads).
+    kb_compiler.schedule_kb_compile(body.user_id, project_id, _client_for)
     return {
         "document_id": document_id,
         "project_id": project_id,
@@ -623,6 +626,28 @@ async def upload_project_document(
         "mime_type": mime,
         "encoding": encoding,
     }
+
+
+@app.get("/api/projects/{project_id}/kb")
+async def get_project_kb(project_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Return the project's knowledge-base status + its compiled pages (metadata only). Tolerant."""
+    try:
+        async with _client_for(user_id) as db:
+            status = await repo.get_project_kb_status(db, user_id, project_id)
+            pages = await repo.list_documents(
+                db, user_id, project_id=project_id, from_type="KbPage", limit=200
+            )
+        return {**status, "pages": pages}
+    except Exception:  # noqa: BLE001 — the project pane must never break the page.
+        logger.warning("get project kb failed", exc_info=True)
+        return {"status": "idle", "compiled_at": None, "pages": []}
+
+
+@app.post("/api/projects/{project_id}/kb/rebuild")
+async def rebuild_project_kb(project_id: str, user_id: str = "default") -> dict[str, Any]:
+    """Kick a full knowledge-base rebuild for a project in the background. Returns the new status."""
+    kb_compiler.schedule_kb_compile(user_id, project_id, _client_for, full=True, delay=0)
+    return {"status": "compiling" if kb_compiler.KB_COMPILE_ENABLED else "idle"}
 
 
 # ---------------------------------------------------------------------------- graph

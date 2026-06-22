@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FileText, FolderOpen, Globe, Trash2, Upload } from "lucide-react";
+import { BookOpen, FileText, FolderOpen, Globe, RefreshCw, Trash2, Upload } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,7 +7,23 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/api/client";
 import { useApp } from "@/state/AppContext";
 import { DocumentView } from "@/panes/DocumentsPane";
-import type { DocumentMeta } from "@/types";
+import type { DocumentMeta, ProjectKb } from "@/types";
+
+/** Document vertex types that are generated knowledge-base pages (vs. uploaded sources). */
+const KB_PAGE_KINDS = new Set([
+  "KbPage",
+  "KbSummary",
+  "KbConcept",
+  "KbEntity",
+  "KbExploration",
+  "KbIndex",
+]);
+
+const isKbPage = (d: DocumentMeta) => !!d.kind && KB_PAGE_KINDS.has(d.kind);
+
+/** Human label for a KB page kind, e.g. "KbConcept" -> "Concept". */
+const kbKindLabel = (kind?: string) =>
+  (kind || "Page").replace(/^Kb/, "") || "Page";
 
 /** Read a File into the {filename, mime_type, data(base64)} shape the upload endpoint expects. */
 function readAsUpload(
@@ -65,6 +81,7 @@ export function ProjectCard() {
   const project = projects.find((p) => p.project_id === projectId) ?? null;
 
   const [docs, setDocs] = useState<DocumentMeta[]>([]);
+  const [kb, setKb] = useState<ProjectKb | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -80,13 +97,47 @@ export function ProjectCard() {
       .catch(() => setDocs([]));
   };
 
+  const loadKb = () => {
+    if (!projectId) {
+      setKb(null);
+      return;
+    }
+    api
+      .getProjectKb(projectId, userId)
+      .then(setKb)
+      .catch(() => setKb(null));
+  };
+
   useEffect(() => {
     setOpenId(null);
     load();
+    loadKb();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, userId]);
 
+  // While a compile is running, poll the KB so the status + new pages appear without a manual refresh.
+  useEffect(() => {
+    if (!projectId || kb?.status !== "compiling") return;
+    const t = setInterval(loadKb, 4000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, userId, kb?.status]);
+
+  const rebuildKb = async () => {
+    if (!projectId) return;
+    try {
+      await api.rebuildProjectKb(projectId, userId);
+      setKb((prev) => ({ status: "compiling", compiled_at: prev?.compiled_at ?? null, pages: prev?.pages ?? [] }));
+    } catch (err) {
+      console.error("rebuild knowledge base failed", err);
+    }
+  };
+
   if (!projectId) return null;
+
+  // The KB pages now live in the same project document set; show only the uploaded sources here.
+  const sources = docs.filter((d) => !isKbPage(d));
+  const kbPages = kb?.pages ?? [];
 
   const onPick = async (files: FileList | null) => {
     if (!files || files.length === 0 || !projectId) return;
@@ -97,6 +148,7 @@ export function ProjectCard() {
         await api.uploadProjectDocument(projectId, userId, upload);
       }
       load();
+      loadKb();
     } catch (err) {
       console.error("project upload failed", err);
     } finally {
@@ -139,16 +191,22 @@ export function ProjectCard() {
       <CardContent className="space-y-3">
         <ProjectSystemPromptRow projectId={projectId} />
 
-        <div className="space-y-2 border-t border-border/50 pt-2">
+        {openId && (
+          <div className="border-t border-border/50 pt-2">
+            <DocumentView documentId={openId} onBack={() => setOpenId(null)} />
+          </div>
+        )}
+
+        <div className={`space-y-2 border-t border-border/50 pt-2${openId ? " hidden" : ""}`}>
           <div className="flex items-center justify-between">
-            <span className="text-xs text-muted-foreground">Reference documents</span>
+            <span className="text-xs text-muted-foreground">Sources</span>
             <Button
               variant="ghost"
               size="icon"
               className="size-6 text-muted-foreground"
               onClick={() => fileInput.current?.click()}
               disabled={uploading}
-              title="Upload a reference document"
+              title="Upload a source document"
             >
               <Upload className={`size-3.5 ${uploading ? "animate-pulse" : ""}`} />
             </Button>
@@ -161,11 +219,9 @@ export function ProjectCard() {
             />
           </div>
 
-          {openId ? (
-            <DocumentView documentId={openId} onBack={() => setOpenId(null)} />
-          ) : docs.length > 0 ? (
+          {sources.length > 0 ? (
             <div className="space-y-2">
-              {docs.map((d) => (
+              {sources.map((d) => (
                 <div
                   key={d.document_id}
                   className="group flex items-center gap-2 rounded-md border border-border p-2"
@@ -216,8 +272,65 @@ export function ProjectCard() {
             </div>
           ) : (
             <p className="text-xs text-muted-foreground">
-              No reference documents yet. Upload files the agent can search and read across this
-              project's chats.
+              No source documents yet. Upload files and they're auto-compiled into the knowledge
+              base below.
+            </p>
+          )}
+        </div>
+
+        <div className={`space-y-2 border-t border-border/50 pt-2${openId ? " hidden" : ""}`}>
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <BookOpen className="size-3.5" />
+              Knowledge base
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 text-muted-foreground"
+              onClick={rebuildKb}
+              disabled={kb?.status === "compiling"}
+              title="Rebuild the knowledge base from the current sources"
+            >
+              <RefreshCw
+                className={`size-3.5 ${kb?.status === "compiling" ? "animate-spin" : ""}`}
+              />
+            </Button>
+          </div>
+
+          {kbPages.length > 0 ? (
+            <div className="space-y-2">
+              {kbPages.map((d) => (
+                <button
+                  key={d.document_id}
+                  type="button"
+                  onClick={() => setOpenId(d.document_id)}
+                  className="group flex w-full items-center gap-2 rounded-md border border-border p-2 text-left"
+                  title="Open knowledge-base page"
+                >
+                  <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                    {d.title || "Untitled"}
+                  </span>
+                  <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {kbKindLabel(d.kind)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {kb?.status === "compiling"
+                ? "Compiling the knowledge base from your sources…"
+                : kb?.status === "error"
+                  ? "The last compile failed — try Rebuild, or check the server logs."
+                  : "No knowledge-base pages yet. Upload sources (or click Rebuild) to compile summaries, concepts and entities."}
+            </p>
+          )}
+
+          {kb?.compiled_at && kb.status !== "compiling" && (
+            <p className="text-[10px] text-muted-foreground">
+              Last built {new Date(kb.compiled_at).toLocaleString()}
             </p>
           )}
         </div>

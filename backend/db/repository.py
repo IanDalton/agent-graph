@@ -885,6 +885,31 @@ async def delete_fact(db: ArcadeClient, user_id: str, fact_id: str) -> int:
     return _affected(result)
 
 
+# The Document type hierarchy a caller may target. The vertex TYPE encodes a knowledge-base page's
+# kind (see backend.kb_compiler); every Kb* type EXTENDS Document so it inherits the document_id /
+# embedding / project_id properties + indexes and resolves polymorphically in SELECT FROM Document.
+# This is the DDL-injection boundary for the vertex_type/from_type params (ArcadeDB can't bind a
+# type name), mirroring the ontology identifier validators — only these literals are ever spliced in.
+_DOCUMENT_TYPES = frozenset(
+    {"Document", "KbSource", "KbPage", "KbSummary", "KbConcept", "KbEntity", "KbExploration", "KbIndex"}
+)
+# page_type (compiler-facing) -> vertex type for the generated wiki pages.
+_KB_PAGE_TYPES = {
+    "summary": "KbSummary",
+    "concept": "KbConcept",
+    "entity": "KbEntity",
+    "exploration": "KbExploration",
+    "index": "KbIndex",
+}
+
+
+def _checked_doc_type(vertex_type: str) -> str:
+    """Return ``vertex_type`` if it is an allowed Document (sub)type, else raise (injection guard)."""
+    if vertex_type not in _DOCUMENT_TYPES:
+        raise ValueError(f"unknown document vertex type {vertex_type!r}")
+    return vertex_type
+
+
 async def create_document(
     db: ArcadeClient,
     user_id: str,
@@ -896,8 +921,13 @@ async def create_document(
     project_id: str | None = None,
     is_global: bool = False,
     embedding: list[float] | None = None,
+    vertex_type: str = "Document",
 ) -> str:
     """Create a document and link it to its owner. Returns the document_id.
+
+    ``vertex_type`` (default ``"Document"``) selects which Document (sub)type to create — pass a
+    ``Kb*`` type for a knowledge-base source/page. It is validated against an allowlist before being
+    spliced into the DDL (ArcadeDB can't parameterize a type name).
 
     Documents are durable artifacts (reports, notes, code listings, uploaded reference files). They
     surface in the web UI's Documents pane, where text-based ones can be edited by the user via
@@ -937,7 +967,7 @@ async def create_document(
     if embedding is not None:
         set_clause += ", embedding = :emb"
         params["emb"] = embedding
-    await db.command("CREATE VERTEX Document SET " + set_clause, params)
+    await db.command("CREATE VERTEX " + _checked_doc_type(vertex_type) + " SET " + set_clause, params)
     # Anchor the HAS_DOCUMENT edge to the most specific owner that exists.
     if conversation_id is not None:
         anchor = "SELECT FROM Conversation WHERE conversation_id = :aid"
@@ -986,8 +1016,8 @@ async def update_document(
 async def get_document(db: ArcadeClient, user_id: str, document_id: str) -> dict[str, Any] | None:
     """Return one document (full content included), or None if it doesn't exist for this user."""
     rows = await db.query(
-        "SELECT document_id, conversation_id, project_id, is_global, title, content, mime_type, "
-        "encoding, created_at, updated_at "
+        "SELECT @type AS kind, document_id, conversation_id, project_id, is_global, title, content, "
+        "mime_type, encoding, created_at, updated_at "
         "FROM Document WHERE document_id = :did AND user_id = :uid",
         {"did": document_id, "uid": user_id},
     )
@@ -1021,6 +1051,7 @@ async def list_documents(
     limit: int = 50,
     project_id: str | None = None,
     include_global: bool = False,
+    from_type: str = "Document",
 ) -> list[dict[str, Any]]:
     """Return this user's documents (metadata only, no content), most recently updated first.
 
@@ -1029,8 +1060,13 @@ async def list_documents(
     - ``project_id`` — restrict to one project's reference documents.
     - ``include_global`` — also include the user's global documents (``is_global = true``),
       regardless of project/conversation. With no scope at all, returns all of the user's documents.
+    - ``from_type`` — which Document (sub)type to query; thanks to inheritance, the default
+      ``"Document"`` returns everything (chat docs + KB sources + KB pages), ``"KbPage"`` returns only
+      generated wiki pages, ``"KbSource"`` only sources. Each row carries its concrete ``kind``
+      (``@type``). Validated against the type allowlist.
     Content is excluded so the list stays light — fetch one document's body with :func:`get_document`.
     """
+    from_type = _checked_doc_type(from_type)
     params: dict[str, Any] = {"uid": user_id, "limit": limit}
     clauses: list[str] = []
     if conversation_id is not None:
@@ -1045,8 +1081,9 @@ async def list_documents(
     if clauses:
         where += " AND (" + " OR ".join(clauses) + ")"
     rows = await db.query(
-        "SELECT document_id, conversation_id, project_id, is_global, title, mime_type, encoding, "
-        f"created_at, updated_at FROM Document WHERE {where} ORDER BY updated_at DESC LIMIT :limit",
+        "SELECT @type AS kind, document_id, conversation_id, project_id, is_global, title, mime_type, "
+        f"encoding, created_at, updated_at FROM {from_type} WHERE {where} "
+        "ORDER BY updated_at DESC LIMIT :limit",
         params,
     )
     for row in rows:
@@ -1116,6 +1153,193 @@ async def delete_document(db: ArcadeClient, user_id: str, document_id: str) -> i
         {"did": document_id, "uid": user_id},
     )
     return _affected(result)
+
+
+# --------------------------------------------------------------------------- knowledge base
+
+
+async def get_kb_page_by_title(
+    db: ArcadeClient, user_id: str, project_id: str, title: str
+) -> dict[str, Any] | None:
+    """Return a KB page (any Kb* type) in this project by its title, or None. User-scoped.
+
+    Titles are the KB's stable identity (the compiler keeps them unique per project), so this backs
+    both upsert-by-title (revise instead of duplicate) and [[wikilink]] resolution. Scoped to the
+    ``KbPage`` subtree so a generated page never collides with (and overwrites) a source document
+    that happens to share its title.
+    """
+    rows = await db.query(
+        "SELECT @type AS kind, document_id, title FROM KbPage "
+        "WHERE user_id = :uid AND project_id = :pid AND title = :title",
+        {"uid": user_id, "pid": project_id, "title": title},
+    )
+    return rows[0] if rows else None
+
+
+async def upsert_kb_page(
+    db: ArcadeClient,
+    user_id: str,
+    project_id: str,
+    page_type: str,
+    title: str,
+    content: str,
+    embedding: list[float] | None = None,
+) -> str:
+    """Create or revise a knowledge-base page by (project, title). Returns its document_id.
+
+    ``page_type`` is one of ``summary``/``concept``/``entity``/``exploration``/``index`` (mapped to a
+    ``Kb*`` vertex type). A re-compile that produces a page with an existing title updates it in place
+    (content + embedding) rather than creating a duplicate. KB pages are project-scoped (no
+    conversation), so they surface in the project's Documents UI and search_documents.
+    """
+    vertex_type = _KB_PAGE_TYPES.get(page_type)
+    if vertex_type is None:
+        raise ValueError(f"unknown KB page type {page_type!r}")
+    existing = await get_kb_page_by_title(db, user_id, project_id, title)
+    if existing and existing.get("document_id"):
+        set_clauses = ["content = :content", "updated_at = :ts"]
+        params: dict[str, Any] = {
+            "content": content,
+            "ts": _now(),
+            "did": existing["document_id"],
+            "uid": user_id,
+        }
+        if embedding is not None:
+            set_clauses.append("embedding = :emb")
+            params["emb"] = embedding
+        await db.command(
+            "UPDATE Document SET " + ", ".join(set_clauses)
+            + " WHERE document_id = :did AND user_id = :uid",
+            params,
+        )
+        return str(existing["document_id"])
+    return await create_document(
+        db,
+        user_id,
+        title=title,
+        content=content,
+        mime_type="text/markdown",
+        project_id=project_id,
+        embedding=embedding,
+        vertex_type=vertex_type,
+    )
+
+
+# The KB edge types the compiler builds (from resolved [[wikilinks]] + provenance). This is the
+# DDL-injection boundary for create_kb_edge/clear_kb_edges — only these literals are spliced in.
+_KB_EDGE_TYPES = frozenset({"KB_LINK", "MENTIONS", "HAS_SUMMARY"})
+
+
+def _checked_kb_edge(edge_type: str) -> str:
+    if edge_type not in _KB_EDGE_TYPES:
+        raise ValueError(f"unknown KB edge type {edge_type!r}")
+    return edge_type
+
+
+async def create_kb_edge(
+    db: ArcadeClient, user_id: str, edge_type: str, from_id: str, to_id: str
+) -> int:
+    """Create a typed KB edge (KB_LINK/MENTIONS/HAS_SUMMARY) between two of this user's documents.
+
+    Returns 1/0. Tolerant of bad ids — a missing endpoint yields 0 edges. ``edge_type`` is validated
+    against an allowlist (ArcadeDB can't parameterize a type name).
+    """
+    et = _checked_kb_edge(edge_type)
+    result = await db.command(
+        f"CREATE EDGE {et} "
+        "FROM (SELECT FROM Document WHERE document_id = :fid AND user_id = :uid) "
+        "TO (SELECT FROM Document WHERE document_id = :tid AND user_id = :uid)",
+        {"fid": from_id, "tid": to_id, "uid": user_id},
+    )
+    return _affected(result)
+
+
+async def clear_kb_edges(db: ArcadeClient, user_id: str, from_id: str, edge_type: str) -> int:
+    """Delete all outgoing edges of ``edge_type`` from this user's document ``from_id``.
+
+    Lets a re-compile REPLACE a page's links/provenance instead of piling duplicates. Returns the
+    number of edges deleted. ``UNSAFE`` is required to delete edge records in ArcadeDB.
+    """
+    et = _checked_kb_edge(edge_type)
+    result = await db.command(
+        f"DELETE FROM {et} WHERE out IN "
+        "(SELECT FROM Document WHERE document_id = :fid AND user_id = :uid) UNSAFE",
+        {"fid": from_id, "uid": user_id},
+    )
+    return _affected(result)
+
+
+async def create_kb_link(db: ArcadeClient, user_id: str, from_id: str, to_id: str) -> int:
+    """Create a KB_LINK edge between two of this user's KB pages (thin wrapper over create_kb_edge)."""
+    return await create_kb_edge(db, user_id, "KB_LINK", from_id, to_id)
+
+
+async def list_kb_page_index(
+    db: ArcadeClient, user_id: str, project_id: str
+) -> list[dict[str, Any]]:
+    """Return ``[{title, document_id, kind}]`` for every KB page in a project (the wikilink whitelist).
+
+    Backs the compiler's whitelist + title->id resolution for the link/ghost-strip pass.
+    """
+    rows = await list_documents(db, user_id, project_id=project_id, from_type="KbPage", limit=500)
+    return [
+        {"title": r.get("title") or "", "document_id": r.get("document_id", ""), "kind": r.get("kind")}
+        for r in rows
+        if r.get("document_id")
+    ]
+
+
+async def list_kb_pages_full(
+    db: ArcadeClient, user_id: str, project_id: str
+) -> list[dict[str, Any]]:
+    """Return ``[{document_id, kind, title, content}]`` for every KB page in a project (bodies incl.).
+
+    Used by the compiler's plan phase (concept/entity briefs) and the link/backlink pass (which
+    rewrites bodies + rebuilds KB_LINK edges from the resolved ``[[wikilinks]]``).
+    """
+    rows = await db.query(
+        "SELECT @type AS kind, document_id, title, content FROM KbPage "
+        "WHERE user_id = :uid AND project_id = :pid ORDER BY updated_at DESC LIMIT 500",
+        {"uid": user_id, "pid": project_id},
+    )
+    return [r for r in rows if r.get("document_id")]
+
+
+async def set_project_kb_status(
+    db: ArcadeClient,
+    user_id: str,
+    project_id: str,
+    status: str,
+    compiled_at: str | None = None,
+) -> int:
+    """Set a project's KB compilation status ('idle'/'compiling'/'error'), and optionally stamp the
+    last successful build time. User-scoped; returns rows updated (0 if not this user's)."""
+    set_clauses = ["kb_status = :st"]
+    params: dict[str, Any] = {"st": status, "pid": project_id, "uid": user_id}
+    if compiled_at is not None:
+        set_clauses.append("kb_compiled_at = :ca")
+        params["ca"] = compiled_at
+    result = await db.command(
+        "UPDATE Project SET " + ", ".join(set_clauses)
+        + " WHERE project_id = :pid AND user_id = :uid",
+        params,
+    )
+    return _affected(result)
+
+
+async def get_project_kb_status(
+    db: ArcadeClient, user_id: str, project_id: str
+) -> dict[str, Any]:
+    """Return ``{status, compiled_at}`` for a project's KB (``status='idle'`` when never compiled)."""
+    rows = await db.query(
+        "SELECT kb_status, kb_compiled_at FROM Project WHERE project_id = :pid AND user_id = :uid",
+        {"pid": project_id, "uid": user_id},
+    )
+    row = rows[0] if rows else {}
+    return {
+        "status": row.get("kb_status") or "idle",
+        "compiled_at": row.get("kb_compiled_at"),
+    }
 
 
 async def create_agent_spec(

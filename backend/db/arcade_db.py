@@ -235,6 +235,20 @@ class ArcadeClient:
             # Projects group conversations under a shared system prompt + uploaded reference
             # documents the agent can query across the group. See repository.create_project.
             "CREATE VERTEX TYPE Project IF NOT EXISTS",
+            # Knowledge-base artifacts (OpenKB-style wiki) — vertex types that EXTEND Document so
+            # they inherit its document_id/embedding/project_id properties + indexes and resolve
+            # polymorphically in every SELECT FROM Document (the Documents UI, search_documents and
+            # the vector index keep working unchanged). The vertex TYPE itself encodes the kind, so
+            # no extra "kind" column is needed; @type is read back. See backend.kb_compiler.
+            #   KbSource  = an uploaded reference doc (the KB's raw material)
+            #   KbPage    = base for every generated wiki page; its subtypes are the page kinds.
+            "CREATE VERTEX TYPE KbSource IF NOT EXISTS EXTENDS Document",
+            "CREATE VERTEX TYPE KbPage IF NOT EXISTS EXTENDS Document",
+            "CREATE VERTEX TYPE KbSummary IF NOT EXISTS EXTENDS KbPage",
+            "CREATE VERTEX TYPE KbConcept IF NOT EXISTS EXTENDS KbPage",
+            "CREATE VERTEX TYPE KbEntity IF NOT EXISTS EXTENDS KbPage",
+            "CREATE VERTEX TYPE KbExploration IF NOT EXISTS EXTENDS KbPage",
+            "CREATE VERTEX TYPE KbIndex IF NOT EXISTS EXTENDS KbPage",
             # Edge types
             "CREATE EDGE TYPE HAS_CONVERSATION IF NOT EXISTS",
             "CREATE EDGE TYPE HAS_MESSAGE IF NOT EXISTS",
@@ -251,6 +265,15 @@ class ArcadeClient:
             # Links the User to their projects (HAS_DOCUMENT is reused to link a Project to its
             # uploaded reference documents — edge types aren't endpoint-typed in ArcadeDB).
             "CREATE EDGE TYPE HAS_PROJECT IF NOT EXISTS",
+            # Cross-links between knowledge-base pages (concept->entity, summary->concept, …). The
+            # compiler also writes Obsidian-style [[wikilinks]] in bodies; this edge is the
+            # graph-traversable form. Endpoints are Document subtypes (Kb* pages).
+            "CREATE EDGE TYPE KB_LINK IF NOT EXISTS",
+            # A source document's generated summary: KbSource -HAS_SUMMARY-> KbSummary.
+            "CREATE EDGE TYPE HAS_SUMMARY IF NOT EXISTS",
+            # Provenance: which source(s) a KB page was derived from / mentions.
+            # KbSummary|KbConcept|KbEntity -MENTIONS-> KbSource. Makes "which docs mention X" a 1-hop query.
+            "CREATE EDGE TYPE MENTIONS IF NOT EXISTS",
             # Key properties + unique indexes (enable lookups and uniqueness).
             "CREATE PROPERTY User.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON User (user_id) UNIQUE",
@@ -290,6 +313,11 @@ class ArcadeClient:
             "CREATE INDEX IF NOT EXISTS ON Project (project_id) UNIQUE",
             "CREATE PROPERTY Project.user_id IF NOT EXISTS STRING",
             "CREATE INDEX IF NOT EXISTS ON Project (user_id) NOTUNIQUE",
+            # Knowledge-base compilation status surfaced in the UI: kb_status is
+            # 'idle'/'compiling'/'error' (NULL/absent ⇒ never compiled) and kb_compiled_at is the
+            # ISO timestamp of the last successful build. See backend.kb_compiler.
+            "CREATE PROPERTY Project.kb_status IF NOT EXISTS STRING",
+            "CREATE PROPERTY Project.kb_compiled_at IF NOT EXISTS STRING",
             # A conversation's owning project (NULL/absent ⇒ ungrouped) and a document's owning
             # project (set on project-scoped uploads instead of conversation_id). Both NOTUNIQUE.
             "CREATE PROPERTY Conversation.project_id IF NOT EXISTS STRING",

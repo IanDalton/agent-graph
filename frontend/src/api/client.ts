@@ -10,6 +10,7 @@ import type {
   MemoryGraph,
   Mode,
   Project,
+  ProjectKb,
   SkillContent,
   SkillInfo,
   SkillSyncResult,
@@ -120,6 +121,18 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId, ...file }),
     }).then(json<DocumentMeta>),
+
+  // A project's compiled knowledge base (status + the generated wiki pages).
+  getProjectKb: (projectId: string, userId: string) =>
+    fetch(
+      `/api/projects/${projectId}/kb?user_id=${encodeURIComponent(userId)}`
+    ).then(json<ProjectKb>),
+
+  // Kick a full knowledge-base rebuild for a project (runs in the background).
+  rebuildProjectKb: (projectId: string, userId: string) =>
+    fetch(`/api/projects/${projectId}/kb/rebuild?user_id=${encodeURIComponent(userId)}`, {
+      method: "POST",
+    }).then(json<{ status: string }>),
 
   // Mark a document global (survives project cascade-delete, queryable everywhere) or not.
   setDocumentGlobal: (documentId: string, userId: string, isGlobal: boolean) =>

@@ -39,6 +39,12 @@ _MAX_IMPORTANT = 20
 # Bounds the prompt; the agent reads or searches the full set on demand via the project doc tools.
 _MAX_PROJECT_DOCS = 30
 
+# The Document subtypes that are compiled knowledge-base pages (see backend.kb_compiler) — surfaced
+# first in the manifest and labelled by kind so the agent prefers the curated wiki over raw sources.
+_KB_PAGE_KINDS = frozenset(
+    {"KbPage", "KbSummary", "KbConcept", "KbEntity", "KbExploration", "KbIndex"}
+)
+
 BASE_SYSTEM_PROMPT = (
     "You are a helpful, capable assistant backed by a persistent graph memory of THIS user. "
     "You remember durable facts about them across conversations, and you can search the web, run "
@@ -237,21 +243,38 @@ async def project_documents_block(deps: GraphDependencies) -> str:
             title = (project or {}).get("title") or ""
         except Exception:  # noqa: BLE001 — the title is cosmetic; degrade silently.
             logger.warning("project lookup failed; omitting project title", exc_info=True)
+    # KB pages (compiled wiki) are Document subtypes; surface them first, index page leading, so the
+    # agent knows a compiled knowledge base exists. Sources/other reference docs follow.
+    def _rank(row: dict) -> tuple[int, str]:
+        kind = row.get("kind") or ""
+        order = {"KbIndex": 0, "KbConcept": 1, "KbEntity": 2, "KbSummary": 3, "KbExploration": 4}
+        return (order.get(kind, 9), (row.get("title") or "").lower())
+
+    ordered = sorted(rows, key=_rank)
+    has_kb = any((r.get("kind") or "") in _KB_PAGE_KINDS for r in ordered)
     lines: list[str] = []
-    for row in rows[:_MAX_PROJECT_DOCS]:
+    for row in ordered[:_MAX_PROJECT_DOCS]:
         did = row.get("document_id")
         if not did:
             continue
         name = row.get("title") or "(untitled)"
         tag = " [global]" if row.get("is_global") else ""
-        lines.append(f"- {name} ({did}){tag}")
+        kind = (row.get("kind") or "").replace("Kb", "KB ") if (row.get("kind") or "") in _KB_PAGE_KINDS else ""
+        label = f" [{kind.strip().lower()}]" if kind else ""
+        lines.append(f"- {name} ({did}){label}{tag}")
     if not lines:
         return ""
+    kb_note = (
+        " A compiled KNOWLEDGE BASE (summaries, concept and entity pages, starting from the KB index) "
+        "is available below — prefer reading those curated pages."
+        if has_kb
+        else ""
+    )
     header = (
         f'This conversation belongs to the project "{title}". ' if title else ""
     ) + (
         "Reference documents available to you (call read_project_document(document_id) to read one, "
-        "or search_project_documents(query) to search across them):"
+        "or search_project_documents(query) to search across them):" + kb_note
     )
     return header + "\n" + "\n".join(lines)
 

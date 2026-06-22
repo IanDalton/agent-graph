@@ -288,6 +288,8 @@ export interface Fact {
 export interface DocumentMeta {
   document_id: string;
   conversation_id?: string;
+  /** The document's vertex type (@type): "Document"/"KbSource" for sources, "Kb*" for KB pages. */
+  kind?: string;
   /** Owning project id (set on project reference documents instead of conversation_id). */
   project_id?: string | null;
   /** True when the document is global (available in every project, exempt from cascade-delete). */
@@ -303,4 +305,13 @@ export interface DocumentMeta {
 /** A full document, body included (GET /api/documents/{id}). */
 export interface DocumentFull extends DocumentMeta {
   content: string;
+}
+
+/** A project's compiled knowledge-base state (GET /api/projects/{id}/kb). */
+export interface ProjectKb {
+  /** "idle" | "compiling" | "error" — "idle" also means never compiled. */
+  status: string;
+  /** ISO timestamp of the last successful build, or null. */
+  compiled_at?: string | null;
+  pages: DocumentMeta[];
 }
