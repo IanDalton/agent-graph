@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -m pytest backend/tests/test_swarm.py -q 2>$null)",
+      "PowerShell(python -m pytest backend/tests/ -q)",
+      "Bash(docker compose *)",
+      "Bash(docker run *)"
+    ]
+  },
+  "enabledPlugins": {
+    "pydantic-ai@claude-plugins-official": true
+  }
+}

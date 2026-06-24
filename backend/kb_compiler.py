@@ -52,7 +52,7 @@ KB_COMPILER_REQUEST_LIMIT = int(os.getenv("KB_COMPILER_REQUEST_LIMIT", "3"))
 # How many summary threads run at once. The local model serializes on one GPU, but overlapping the
 # request/parse latency still helps. Tune down to 1 if the backend pressures the model server.
 KB_COMPILE_MAX_PARALLEL = int(os.getenv("KB_COMPILE_MAX_PARALLEL", "3"))
-# Retries on a transient model error (e.g. LM Studio "Model unloaded" while it reloads on demand).
+# Retries on a transient model error (e.g. the local llama-server reloading a model on demand).
 KB_GENERATE_RETRIES = int(os.getenv("KB_GENERATE_RETRIES", "2"))
 # Debounce window: rapid successive uploads to one project coalesce into a single compile.
 KB_COMPILE_DEBOUNCE_SECONDS = float(os.getenv("KB_COMPILE_DEBOUNCE_SECONDS", "20"))

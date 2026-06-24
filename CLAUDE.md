@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `agent-graph` is a **Pydantic AI agent with persistent graph memory** backed by ArcadeDB.
 ArcadeDB is both the agent's memory (the LLM queries/stores conversation context) and the
 business datastore (every turn, tool call, and error is persisted). A SearXNG instance is
-included for web search. `testing.ipynb` holds the original prototype; the real implementation
-now lives in the `backend/` package.
+included for web search. The LLM is served **locally by llama.cpp** (`llama-server`'s
+OpenAI-compatible API); the web UI's **Model Manager** downloads GGUF models from HuggingFace,
+shows what fits the NVIDIA hardware, and generates the `llama-server` launch command. `testing.ipynb`
+holds the original prototype; the real implementation now lives in the `backend/` package.
 
 ## Architecture
 
@@ -376,8 +378,9 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   appends them under an `ADDITIONAL INSTRUCTIONS (from the user)` header on top of
   `BASE_SYSTEM_PROMPT`; `stream_run` reads them each turn via `repo.get_conversation_system_prompt`
   (tolerant) and passes them to `build_agent(..., system_prompt=)`. Main agent only.
-- **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL`, else local Ollama via
-  `OLLAMA_MODEL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
+- **`backend/main.py`** — `build_agent()` (model from `AGENT_MODEL` escape hatch, else a local
+  **llama.cpp** model via `model_selection.resolve_model` — an `OpenAIChatModel`+`OpenAIProvider`
+  pointed at `LLAMACPP_BASE_URL`) and an async `run(prompt, user_id, conversation_id)` that points `ArcadeClient` at
   the user's own database (`database_name_for_user`), calls `ensure_database()` then `ensure_schema()`,
   loads prior turns into `message_history` via `_to_message_history(repo.get_run_history(...))` (the
   serialized `RunMessages` blobs deserialized with `ModelMessagesTypeAdapter` — faithful, tool calls
@@ -423,6 +426,32 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   `list_documents` → `list[DocumentInfo]`), and a bare `json.dumps` on those used to kill the SSE
   stream; `api._sse` also passes `default=str` as a net. This is the single streaming source of
   truth, shared with the API.
+- **`backend/model_selection.py`** — the dependency-free leaf that resolves the active model.
+  `resolve_model(label)`/`select_model(env)` build an `OpenAIChatModel` via `OpenAIProvider(base_url=
+  LLAMACPP_BASE_URL, api_key=...)` for a local llama.cpp model (label `local/<name>`); the **api_key
+  is set explicitly** (`LLAMACPP_API_KEY` or a placeholder) so the embeddings `OPENAI_API_KEY` can't
+  leak into llama.cpp requests. `AGENT_MODEL`/`AGENT_MODELS` remain a hidden hosted escape hatch.
+  `available_models`/`context_window_for`/`is_vision_capable` are llama.cpp-oriented (local models
+  are text-only unless in `VISION_MODELS`).
+- **`backend/models/`** — the **Model Manager** services (system-level, NOT per-user; filesystem, no
+  ArcadeDB): `huggingface.py` (a `marketplace.py`-style httpx client to search GGUF models, list a
+  repo's quant files+sizes, read `config.json`, and **stream-download** a `.gguf` with progress —
+  tolerant module helpers + a `HuggingFaceClient`); `hardware.py` (the editable `HardwareProfile` —
+  the **source of truth** for recommendations — + best-effort `nvidia-smi`/`/proc/meminfo` detection,
+  stdlib only); `recommend.py` (pure VRAM/GQA-KV-cache math → a `fit` classification
+  gpu/partial/cpu/too_big + `-ngl`/`-c`/KV-quant/flash-attn/batch/threads and the `llama-server`
+  launch command, incl. an `-hf` self-download variant); `library.py` (the filesystem manifest of
+  downloaded GGUFs on `LLAMACPP_MODELS_DIR`, reconciled with on-disk files; models' UI label is
+  `local/<stem>`). The API surfaces these at `GET /api/models`, `GET|PUT /api/hardware` +
+  `POST /api/hardware/detect`, `GET /api/models/search`, `GET /api/models/repo/{repo_id}/files`
+  (per-quant fit badges), `POST /api/models/recommend`, `POST /api/models/download` (SSE progress,
+  like `chat_stream`), `DELETE /api/models/{filename}` (traversal-guarded), and
+  `GET /api/llamacpp/status` (pings llama-server `/v1/models` — how the UI reflects the served
+  model). The frontend page is `frontend/src/panes/modelspage.tsx` (a `Dialog` with Discover/Library/
+  Hardware/Server tabs + an advanced settings panel; opened from the Composer's Boxes button), wired
+  through `AppContext` (`openModelsPage`, `localModels`, `hardware`, `llamacppStatus`, `downloadModel`
+  via `api/stream.ts`'s shared `readSseStream`). The model picker lists the downloaded `local/…`
+  models (from `/api/config`'s merged list).
 - **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
   DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
   `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
@@ -524,6 +553,14 @@ GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxi
 
 ## Infrastructure (docker-compose.yml)
 
+- **caddy** (`agent_graph_caddy` / `agent_graph_caddy_dev`) — the **single published entry point**
+  (`docker/caddy/Caddyfile`): the only service with a host port (`${APP_PORT:-8080}`). It serves the
+  whole app on one origin — the SPA at `/`, the FastAPI backend at `/api` (`flush_interval -1` so SSE
+  streams unbuffered; WebSocket upgrades forwarded for Vite HMR in dev). Upstreams are env-driven
+  (`BACKEND_UPSTREAM`/`FRONTEND_UPSTREAM`) so one Caddyfile serves both profiles; each profile runs
+  its own proxy (`caddy` → `backend`/`frontend`, `caddy-dev` → `backend-dev`/`frontend-dev`). All
+  other services (`backend`, `frontend`, `arcadedb`, `searxng`) only `expose` their ports on the
+  compose network — **no host ports** — so they're reachable only through Caddy.
 - **arcadedb** (`agent_memory_db`) — graph DB. HTTP API on `:2480`, binary on `:2424`. The compose
   `defaultDatabases=AgentMemory` only seeds the base/template database; the real per-user databases
   (`AgentMemory_<user>_<hash>`) are created on demand by `ensure_database()`. Server superuser `root`
@@ -540,21 +577,36 @@ GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxi
   `sandbox` entry is **build-only** (`profiles: [build-only]`, never started by `up`): it builds
   the `agent-sandbox` image (`docker/sandbox/Dockerfile` = python:3.12-slim + fpdf2 for PDFs) via
   `docker compose build sandbox`. Unbuilt ⇒ runs fall back to plain `python:3.12-slim`.
+- **llama.cpp server** — the LLM provider. An **optional, opt-in** `llamacpp` service
+  (`profiles: [llamacpp]`, `ghcr.io/ggml-org/llama.cpp:server-cuda`, GPU via a **CDI device**
+  `nvidia.com/gpu=all` — legacy-runtime hosts use a `deploy…driver: nvidia` reservation instead) the
+  app **connects to but does not manage** — reachable at `http://llamacpp:8080/v1`. It self-downloads
+  `LLAMACPP_HF_REPO` via `-hf` by default (override its `command` to serve a Model-Manager-downloaded
+  file with `-m /models/<file>`). It and the backend share the `llamacpp_models`
+  volume mounted at `/models` (`LLAMACPP_MODELS_DIR`; set `MODELS_HOST_DIR` to a host path to share
+  with a host-run server instead). For a separate GPU machine, run llama-server there and point
+  `LLAMACPP_BASE_URL` at it. The backend image has no `nvidia-smi` (it can't see a remote GPU), so
+  hardware auto-detect returns nothing there and the manual hardware profile is authoritative.
 
 ## Commands
 
-The **whole stack is containerized** (arcadedb + searxng + backend + frontend); see `DOCKER.md`.
+The **whole stack is containerized** (caddy + arcadedb + searxng + backend + frontend); see
+`DOCKER.md`.
 
-One `docker-compose.yml` with `dev`/`prod` profiles (infra is profile-less, so it always starts):
+One `docker-compose.yml` with `dev`/`prod` profiles (infra is profile-less, so it always starts).
+**A Caddy reverse proxy is the single host port** (`${APP_PORT:-8080}`); everything else is
+network-internal:
 
 ```bash
 docker compose build sandbox                  # one-time: agent-sandbox image for run_python (python:3.12-slim + fpdf2)
-docker compose --profile prod up -d --build   # prod stack (built images, nginx UI) — UI :8080, API :8000, DB :2480, SearXNG :8085
+docker compose --profile prod up -d --build   # prod stack — whole app at http://localhost:8080
 # hot-reloading dev stack (uvicorn --reload + Vite HMR; source bind-mounted, saving a file updates it):
-docker compose --profile dev up --build       # UI :5173, API :8000
+docker compose --profile dev up --build       # dev stack — same single entry at http://localhost:8080
 ```
 
-Run pieces directly (infra in Docker, app on the host) instead:
+Run pieces directly (infra in Docker, app on the host) instead — note infra ports are no longer
+published, so this needs a temporary `ports:` mapping on `arcadedb`/`searxng` (or a compose
+override) to reach them from the host:
 
 ```bash
 docker compose up -d arcadedb searxng  # just the infra (ArcadeDB DB AgentMemory auto-created + SearXNG)
@@ -567,13 +619,17 @@ cd frontend && npm install && npm run dev       # web UI on http://localhost:517
 curl "http://localhost:8085/search?q=arcadedb&format=json"
 ```
 
-Local-model runs also need a reachable Ollama (`OLLAMA_MODEL`); set `AGENT_MODEL` (e.g.
-`openai:gpt-5.2`) to use a hosted provider instead. For local reasoning models that get cut off
-mid-chain-of-thought, widen the token budget: `OLLAMA_NUM_PREDICT` (→ `max_tokens`, the max answer
-length) and `OLLAMA_NUM_CTX` (best-effort `num_ctx` via `extra_body`) are applied to the
-`OllamaModel` by `model_selection._ollama_settings`. The **reliable** context lever is the Ollama
-*server's* `OLLAMA_CONTEXT_LENGTH` env (or a custom Modelfile) — its OpenAI-compatible endpoint
-doesn't honor a per-request `num_ctx`. Secrets load from `.env` via `python-dotenv`.
+The LLM is served by an **external llama.cpp `llama-server`** (the app connects but does not manage
+it). Set `LLAMACPP_BASE_URL` to its OpenAI-compatible `/v1` endpoint (default
+`http://localhost:8080/v1`; the optional `llamacpp` compose service is `http://llamacpp:8080/v1`),
+`LLAMACPP_API_KEY` only if launched with `--api-key`, and `HF_TOKEN` for gated/rate-limited
+HuggingFace downloads. Use the **Model Manager** UI (Composer's Boxes button) to download GGUFs to
+`LLAMACPP_MODELS_DIR`, fill in the **hardware profile** (the source of truth — the backend can't see
+a GPU on another machine), and copy the generated `llama-server` launch command (it sets `-c`/`-ngl`/
+KV-cache/flash-attn from the hardware fit). The context window is the server's `-c` flag, not a
+per-request value; `LLAMACPP_NUM_PREDICT` (→ `max_tokens`) widens the output budget so long reasoning
+isn't truncated mid-`<think>`. `AGENT_MODEL` (e.g. `openai:gpt-5.2`) remains a hidden escape hatch to
+a hosted provider. Secrets load from `.env` via `python-dotenv`.
 The marketplace sync reads `SKILLS_REPO`/`SKILLS_REF` (default `anthropics/skills`/`main`) and an
 optional `GITHUB_TOKEN` (lifts GitHub's 60 req/hr unauthenticated limit; the backend needs outbound
 access to GitHub for the sync).
@@ -587,6 +643,21 @@ nginx serving the built SPA and proxying `/api` → `backend`. See `DOCKER.md`.
 
 - Built on **Pydantic AI** — use the Pydantic AI skill for `Agent`, `Capability`, `Hooks`,
   `RunContext`, `deps_type`, and streaming APIs.
+- **Keep frontend filenames lowercase.** This repo checkout lives on a case-folding filesystem
+  (the `/run/media/.../SSD` `fuseblk` mount **lowercases every filename on write**), so a PascalCase
+  source file (`SwarmStepItem.tsx`) lands on disk lowercase while git/imports may reference it
+  PascalCase. The host resolves both (case-insensitive), but the **case-sensitive Linux frontend
+  build container** can't — `npm run build` fails with `Cannot find module './SwarmStepItem'`. All
+  `frontend/src` files + their `./`/`../`/`@/` import specifiers are therefore normalized to
+  lowercase (dirs were already lowercase); keep new components lowercase too, or the Docker build
+  breaks again. Backend (Python, lowercase modules) is unaffected.
+- **Docker single entry:** a Caddy reverse proxy (`docker/caddy/Caddyfile`) is the only published
+  host port (`${APP_PORT:-8080}`) — `/` → frontend, `/api` → backend; the other services are
+  network-internal (`expose:`, not `ports:`). Run `docker compose --profile prod up -d --build`
+  (or `--profile dev`) and open `http://localhost:8080`. On hosts with a read-only root fs set
+  `SANDBOX_SHARED_DIR` in `.env` to a writable path (the `/sandbox-tmp` default `mkdir` fails).
+  `arcadedb` needs `ARCADEDB_JMX=-Dcom.sun.management.jmxremote=false` (already in compose) — the
+  image's default JMX remote agent aborts the JVM on an unresolvable hostname inside the container.
 - **ArcadeDB SQL DDL quirk:** `IF NOT EXISTS` is a *suffix* for types/properties
   (`CREATE VERTEX TYPE X IF NOT EXISTS`) but a *prefix* for indexes
   (`CREATE INDEX IF NOT EXISTS ON ...`). See `ArcadeClient.ensure_schema`.

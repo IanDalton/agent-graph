@@ -7,10 +7,16 @@ import type {
   DocumentFull,
   DocumentMeta,
   Fact,
+  HardwareProfile,
+  HfFile,
+  HfModel,
+  LlamacppStatus,
+  LocalModel,
   MemoryGraph,
   Mode,
   Project,
   ProjectKb,
+  RecommendResult,
   SkillContent,
   SkillInfo,
   SkillSyncResult,
@@ -303,4 +309,67 @@ export const api = {
       `/api/documents/${documentId}?user_id=${encodeURIComponent(userId)}`,
       { method: "DELETE" }
     ).then(json<{ deleted: string }>),
+
+  // --- Local model manager (llama.cpp + HuggingFace) ----------------------------------------
+  // System-level (machine-wide), so these carry no user_id.
+
+  // The downloaded GGUF models (the local library).
+  getModels: () => fetch("/api/models").then(json<LocalModel[]>),
+
+  // Search HuggingFace for GGUF models.
+  searchModels: (query: string, sort = "downloads", limit = 30) =>
+    fetch(
+      `/api/models/search?query=${encodeURIComponent(query)}&sort=${encodeURIComponent(
+        sort
+      )}&limit=${limit}`
+    ).then(json<HfModel[]>),
+
+  // A repo's GGUF files with per-quant fit badges + recommendations. `repoId` contains a slash and
+  // the backend route is `{repo_id:path}`, so it's interpolated raw (its chars are URL-safe).
+  listRepoFiles: (repoId: string, revision = "main") =>
+    fetch(`/api/models/repo/${repoId}/files?revision=${encodeURIComponent(revision)}`).then(
+      json<HfFile[]>
+    ),
+
+  // Recompute a recommendation + the copyable llama-server command for given overrides.
+  recommendModel: (body: {
+    size_bytes: number;
+    quant?: string;
+    repo_id?: string;
+    filename?: string;
+    requested_context?: number;
+    kv_cache_type?: string;
+  }) =>
+    fetch("/api/models/recommend", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(json<RecommendResult>),
+
+  // Delete a downloaded GGUF (+ its manifest entry).
+  deleteModel: (filename: string) =>
+    fetch(`/api/models/${encodeURIComponent(filename)}`, { method: "DELETE" }).then(
+      json<{ deleted: string }>
+    ),
+
+  // The editable hardware profile (the recommendation source of truth).
+  getHardware: () => fetch("/api/hardware").then(json<HardwareProfile>),
+
+  updateHardware: (profile: {
+    gpus: { name: string; vram_mb: number }[];
+    system_ram_mb: number;
+    cpu_threads: number;
+  }) =>
+    fetch("/api/hardware", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(profile),
+    }).then(json<HardwareProfile>),
+
+  // Best-effort NVIDIA/system auto-detect (a suggestion the UI can then save).
+  detectHardware: () =>
+    fetch("/api/hardware/detect", { method: "POST" }).then(json<HardwareProfile>),
+
+  // Ping the configured llama-server: reachable? what model is it serving?
+  llamacppStatus: () => fetch("/api/llamacpp/status").then(json<LlamacppStatus>),
 };

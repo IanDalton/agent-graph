@@ -1,0 +1,39 @@
+# Single entry point for the whole stack.
+#
+# Caddy is the ONLY published port; backend/frontend/arcadedb/searxng have no host
+# ports and are reachable only on the compose network. The browser sees one origin:
+#   /api/*  -> FastAPI backend  (SSE streamed, never buffered)
+#   /*      -> the frontend     (nginx-served SPA in prod, Vite dev server in dev)
+#
+# Upstreams are env-driven so the same file serves both profiles:
+#   prod: BACKEND_UPSTREAM=backend:8000     FRONTEND_UPSTREAM=frontend:80
+#   dev:  BACKEND_UPSTREAM=backend-dev:8000  FRONTEND_UPSTREAM=frontend-dev:5173
+{
+	admin off
+	# Plain HTTP on a single LAN/dev port — no automatic certificate provisioning.
+	auto_https off
+}
+
+:80 {
+	encode gzip
+
+	# API + Server-Sent Events. Keep the /api prefix (backend routes live under /api/*).
+	# flush_interval -1 disables response buffering so the chat stream flushes token-by-token,
+	# and the long read timeout keeps SSE connections open.
+	@api path /api/*
+	handle @api {
+		reverse_proxy {$BACKEND_UPSTREAM:backend:8000} {
+			flush_interval -1
+			transport http {
+				read_timeout 3600s
+			}
+		}
+	}
+
+	# Everything else -> the frontend. The SPA fallback (index.html for unknown routes)
+	# is handled by the frontend itself (nginx try_files in prod, Vite in dev), and Caddy
+	# transparently forwards WebSocket upgrades so Vite HMR works through the proxy in dev.
+	handle {
+		reverse_proxy {$FRONTEND_UPSTREAM:frontend:80}
+	}
+}

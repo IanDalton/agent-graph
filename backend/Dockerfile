@@ -39,6 +39,12 @@ COPY backend ./backend
 ENV TMPDIR=/sandbox-tmp
 RUN mkdir -p /sandbox-tmp
 
+# Downloaded GGUF models live here (a shared volume in compose). No nvidia-smi in this image —
+# the backend can't see a remote GPU anyway, so hardware auto-detect returns nothing and the
+# manual hardware profile (the source of truth) is used. See backend/models/.
+ENV LLAMACPP_MODELS_DIR=/models
+RUN mkdir -p /models
+
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.api:app", "--host", "0.0.0.0", "--port", "8000"]

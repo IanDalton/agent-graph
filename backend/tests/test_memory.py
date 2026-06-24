@@ -140,8 +140,8 @@ def test_hooks_generate_title_after_turn(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_title_model_label_uses_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TITLE_MODEL", raising=False)
-    monkeypatch.setenv("TITLE_OLLAMA_MODEL", "supra-title-350m-exp")
-    assert title_generation.title_model_label() == "ollama/supra-title-350m-exp"
+    monkeypatch.setenv("TITLE_LLAMACPP_MODEL", "supra-title-350m-exp")
+    assert title_generation.title_model_label() == "local/supra-title-350m-exp"
 
     monkeypatch.setenv("TITLE_MODEL", "openai:gpt-5.2")
     assert title_generation.title_model_label() == "openai:gpt-5.2"

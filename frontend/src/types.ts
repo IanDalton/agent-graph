@@ -207,9 +207,13 @@ export interface SwarmFlowState {
 
 export interface AppConfig {
   model: string;
-  /** Selectable model labels for the dropdown (backend's AGENT_MODELS or a default list). */
+  /** Selectable model labels for the dropdown (the downloaded local GGUFs, `local/<name>`). */
   models?: string[];
   model_source: string;
+  /** Active model provider — "llamacpp" (local llama-server). */
+  provider?: string;
+  /** The configured llama-server OpenAI-compatible base URL (e.g. http://llamacpp:8080/v1). */
+  llamacpp_base_url?: string;
   /** Default thinking-effort level, and the selectable set for the dropdown. */
   effort?: string;
   efforts?: string[];
@@ -315,3 +319,95 @@ export interface ProjectKb {
   compiled_at?: string | null;
   pages: DocumentMeta[];
 }
+
+// --- Local model manager (llama.cpp + HuggingFace) -----------------------------------------
+
+/** A downloaded GGUF model in the local library (GET /api/models). */
+export interface LocalModel {
+  filename: string;
+  path: string;
+  size_bytes: number;
+  quant: string;
+  repo_id?: string;
+  revision?: string;
+  downloaded_at?: string;
+  /** The picker/model label, `local/<filename-stem>`. */
+  label: string;
+}
+
+/** One HuggingFace GGUF repo from a search (GET /api/models/search). */
+export interface HfModel {
+  repo_id: string;
+  downloads: number;
+  likes: number;
+  last_modified: string;
+  gated: boolean;
+}
+
+/** How a model/quant fits the configured hardware. */
+export type Fit = "gpu" | "partial" | "cpu" | "too_big";
+
+/** A llama.cpp configuration recommendation for one model on the current hardware profile. */
+export interface Recommendation {
+  fit: Fit;
+  n_gpu_layers: number;
+  context_length: number;
+  kv_cache_type: string;
+  flash_attn: boolean;
+  batch_size: number;
+  ubatch_size: number;
+  threads: number;
+  est_vram_mb: number;
+  est_ram_mb: number;
+  confidence: "high" | "low";
+  notes: string[];
+}
+
+/** One GGUF file (or shard group) in a repo, with its fit + recommendation
+ *  (GET /api/models/repo/{repo_id}/files). */
+export interface HfFile {
+  path: string;
+  filename: string;
+  quant: string;
+  size_bytes: number;
+  shards: number;
+  recommendation?: Recommendation;
+  fit?: Fit;
+}
+
+/** A recommendation + the copyable launch commands (POST /api/models/recommend). */
+export interface RecommendResult {
+  recommendation: Recommendation;
+  command: string;
+  command_hf: string;
+}
+
+export interface GpuInfo {
+  name: string;
+  vram_mb: number;
+}
+
+/** The editable hardware profile — the source of truth for recommendations (GET/PUT /api/hardware). */
+export interface HardwareProfile {
+  gpus: GpuInfo[];
+  system_ram_mb: number;
+  cpu_threads: number;
+  source: "manual" | "auto" | "default";
+  updated_at?: string;
+  gpu_count?: number;
+  vram_total_mb?: number;
+}
+
+/** llama-server connectivity + the model it currently serves (GET /api/llamacpp/status). */
+export interface LlamacppStatus {
+  reachable: boolean;
+  base_url: string;
+  served_model: string | null;
+  models: string[];
+}
+
+/** SSE frames from POST /api/models/download (mirrors the chat stream vocabulary). */
+export type DownloadEvent =
+  | { type: "progress"; downloaded: number; total: number }
+  | { type: "done"; filename: string; path: string; size_bytes: number; label: string }
+  | { type: "error"; message: string };

@@ -12,6 +12,7 @@ Run it with::
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -23,12 +24,17 @@ from typing import Any, AsyncIterator, Literal
 
 import re
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from backend import kb_compiler, main, marketplace, summarization
+from backend.models import hardware as hw_models
+from backend.models import huggingface as hf_models
+from backend.models import library as model_library
+from backend.models import recommend as model_recommend
 from backend.db import repository as repo
 from backend.schemas.swarm_schemas import (
     TOOL_GROUPS,
@@ -52,7 +58,12 @@ from backend.db.arcade_db import (
     database_name_for_user,
 )
 from backend.embeddings import Embedder, embeddings_enabled
-from backend.model_selection import available_models, context_window_for, default_model_label
+from backend.model_selection import (
+    DEFAULT_LLAMACPP_BASE_URL,
+    available_models,
+    context_window_for,
+    default_model_label,
+)
 from backend.token_count import count_tokens
 
 logger = logging.getLogger("agent_graph.api")
@@ -133,10 +144,24 @@ async def get_config() -> dict[str, Any]:
     chosen model is sent per-request on ``/api/chat/stream``, not stored server-side.
     """
     agent_model = os.getenv("AGENT_MODEL")
+    # The picker lists the user's downloaded local GGUFs (`local/<name>`); fall back to the env
+    # default set only when nothing has been downloaded yet. The configured default label is always
+    # present so the active selection is never an unlisted option.
+    try:
+        local_labels = model_library.local_model_labels()
+    except Exception:  # noqa: BLE001 — the config endpoint must never break the page.
+        logger.warning("local model scan failed for /api/config", exc_info=True)
+        local_labels = []
+    models = list(local_labels) if local_labels else available_models()
+    default = default_model_label()
+    if default not in models:
+        models.insert(0, default)
     return {
-        "model": default_model_label(),
-        "models": available_models(),
-        "model_source": "AGENT_MODEL" if agent_model else "OLLAMA_MODEL (local fallback)",
+        "model": default,
+        "models": models,
+        "provider": "llamacpp",
+        "llamacpp_base_url": os.getenv("LLAMACPP_BASE_URL", DEFAULT_LLAMACPP_BASE_URL),
+        "model_source": "AGENT_MODEL" if agent_model else "llama.cpp (local)",
         "effort": main.DEFAULT_EFFORT,
         "efforts": main.THINKING_EFFORTS,
         # Conversation modes (agent profiles) selectable at conversation creation.
@@ -1032,3 +1057,274 @@ async def chat_stream(body: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ------------------------------------------------------------------- model manager
+#
+# These endpoints back the Model Manager UI (discover/download GGUFs, the hardware profile,
+# recommendations). Unlike the rest of this module they are **system-level**, not per-user: GGUFs and
+# the hardware profile are a machine resource the external llama-server must read off disk, so they
+# touch only the filesystem (``LLAMACPP_MODELS_DIR``) + the ``backend.models`` services and do NOT
+# open an ArcadeDB client. See ``backend/models/`` and the CLAUDE.md Model Manager notes.
+
+
+class GpuInfoIn(BaseModel):
+    name: str = ""
+    vram_mb: int = 0
+
+
+class HardwareProfileUpdate(BaseModel):
+    """The editable hardware profile — the source of truth for recommendations."""
+
+    gpus: list[GpuInfoIn] = Field(default_factory=list)
+    system_ram_mb: int = 0
+    cpu_threads: int = 0
+
+
+class RecommendRequest(BaseModel):
+    size_bytes: int
+    quant: str = ""
+    repo_id: str = ""
+    filename: str = ""
+    # Optional pre-fetched architecture config; if absent and repo_id is set, we fetch config.json.
+    config: dict[str, Any] | None = None
+    # Advanced-panel overrides (pin a context / KV-cache type and recompute).
+    requested_context: int | None = None
+    kv_cache_type: str | None = None
+
+
+class DownloadRequest(BaseModel):
+    repo_id: str
+    file_path: str
+    revision: str = "main"
+    quant: str = ""
+
+
+async def _load_hardware() -> hw_models.HardwareProfile:
+    """The saved hardware profile, or a best-effort auto-detected one when none has been saved."""
+    saved = hw_models.load_profile(model_library.hardware_path())
+    if saved is not None:
+        return saved
+    return await hw_models.auto_profile()
+
+
+def _alias_for(filename: str) -> str:
+    """A short llama-server ``--alias`` derived from a GGUF filename (its stem)."""
+    return filename[:-5] if filename.lower().endswith(".gguf") else filename
+
+
+@app.get("/api/models")
+async def list_local_models() -> list[dict[str, Any]]:
+    """The downloaded GGUF models (filesystem manifest, reconciled with on-disk files). Tolerant."""
+    try:
+        return model_library.scan_models_dir()
+    except Exception:  # noqa: BLE001
+        logger.warning("list_local_models failed", exc_info=True)
+        return []
+
+
+@app.get("/api/hardware")
+async def get_hardware() -> dict[str, Any]:
+    """The current hardware profile (saved, else auto-detected). Tolerant → a default profile."""
+    try:
+        return (await _load_hardware()).to_dict()
+    except Exception:  # noqa: BLE001
+        logger.warning("get_hardware failed", exc_info=True)
+        return hw_models.default_profile().to_dict()
+
+
+@app.put("/api/hardware")
+async def update_hardware(body: HardwareProfileUpdate) -> dict[str, Any]:
+    """Save the user-entered hardware profile (``source="manual"``) — the recommendation source of truth."""
+    profile = hw_models.HardwareProfile(
+        gpus=[hw_models.GpuInfo(name=g.name, vram_mb=g.vram_mb) for g in body.gpus],
+        system_ram_mb=body.system_ram_mb,
+        cpu_threads=body.cpu_threads,
+        source="manual",
+        updated_at=hw_models.iso_now(),
+    )
+    try:
+        hw_models.save_profile(model_library.hardware_path(), profile)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not save hardware profile: {exc}")
+    return profile.to_dict()
+
+
+@app.post("/api/hardware/detect")
+async def detect_hardware() -> dict[str, Any]:
+    """Best-effort NVIDIA/system auto-detect (a *suggestion*; not saved — the UI accepts then PUTs).
+
+    Returns ``[]`` GPUs when none are visible to this process (the common containerized/remote case),
+    which is the cue for the user to fill the profile in manually.
+    """
+    return (await hw_models.auto_profile()).to_dict()
+
+
+@app.get("/api/models/search")
+async def search_models(
+    query: str = "", sort: str = "downloads", limit: int = 30
+) -> list[dict[str, Any]]:
+    """Search HuggingFace for GGUF models, or browse by ``sort`` when ``query`` is empty. Tolerant → ``[]``."""
+    return await hf_models.search(query, limit=max(1, min(limit, 100)), sort=sort)
+
+
+@app.get("/api/models/repo/{repo_id:path}/files")
+async def list_repo_files(repo_id: str, revision: str = "main") -> list[dict[str, Any]]:
+    """A repo's GGUF files, each tagged with a hardware-aware fit + recommendation. Tolerant → ``[]``.
+
+    Fetches the file list and ``config.json`` once, then runs the recommender per quant against the
+    saved hardware profile so the UI can show fit badges directly.
+    """
+    files = await hf_models.list_files(repo_id, revision)
+    if not files:
+        return []
+    config = await hf_models.fetch_config(repo_id, revision)
+    try:
+        profile = await _load_hardware()
+    except Exception:  # noqa: BLE001
+        profile = hw_models.default_profile()
+    out: list[dict[str, Any]] = []
+    for f in files:
+        rec = model_recommend.recommend(
+            profile,
+            size_bytes=int(f.get("size_bytes") or 0),
+            quant=f.get("quant", ""),
+            config=config,
+            filename=f.get("filename", ""),
+        )
+        out.append({**f, "recommendation": rec.to_dict(), "fit": rec.fit})
+    return out
+
+
+@app.post("/api/models/recommend")
+async def recommend_model(body: RecommendRequest) -> dict[str, Any]:
+    """Recompute a recommendation + the copyable ``llama-server`` command (advanced-panel backend)."""
+    try:
+        profile = await _load_hardware()
+    except Exception:  # noqa: BLE001
+        profile = hw_models.default_profile()
+    config = body.config
+    if config is None and body.repo_id:
+        config = await hf_models.fetch_config(body.repo_id)
+    rec = model_recommend.recommend(
+        profile,
+        size_bytes=body.size_bytes,
+        quant=body.quant,
+        config=config,
+        filename=body.filename,
+        requested_context=body.requested_context,
+        kv_cache_type=body.kv_cache_type,
+    )
+    filename = body.filename or "model.gguf"
+    model_path = str(model_library.models_dir() / filename)
+    command = model_recommend.launch_command(model_path, rec, alias=_alias_for(filename))
+    command_hf = (
+        model_recommend.launch_command_hf(body.repo_id, body.quant, rec) if body.repo_id else ""
+    )
+    return {"recommendation": rec.to_dict(), "command": command, "command_hf": command_hf}
+
+
+@app.post("/api/models/download")
+async def download_model(body: DownloadRequest) -> StreamingResponse:
+    """Stream a GGUF download from HuggingFace as SSE progress frames (mirrors ``/api/chat/stream``).
+
+    Frames: ``{"type":"progress","downloaded","total"}`` … then ``{"type":"done", filename, path,
+    size_bytes, label}`` (manifest updated) or ``{"type":"error","message"}``. A download task feeds an
+    ``asyncio.Queue`` that the SSE generator drains.
+    """
+
+    async def event_source() -> AsyncIterator[str]:
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        client = hf_models.HuggingFaceClient()
+        dest_dir = model_library.models_dir()
+
+        async def progress(downloaded: int, total: int) -> None:
+            await queue.put({"type": "progress", "downloaded": downloaded, "total": total})
+
+        async def run() -> None:
+            try:
+                dest = await client.stream_download(
+                    body.repo_id, body.file_path, dest_dir, revision=body.revision, progress=progress
+                )
+                filename = dest.name
+                size = dest.stat().st_size
+                model_library.add_to_manifest(
+                    {
+                        "filename": filename,
+                        "size_bytes": size,
+                        "quant": body.quant or hf_models.parse_quant(filename),
+                        "repo_id": body.repo_id,
+                        "revision": body.revision,
+                    },
+                    base=dest_dir,
+                )
+                await queue.put(
+                    {
+                        "type": "done",
+                        "filename": filename,
+                        "path": str(dest),
+                        "size_bytes": size,
+                        "label": model_library.model_label(filename),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 — surface to the client, don't 500 mid-stream.
+                logger.warning("model download failed", exc_info=True)
+                await queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            finally:
+                await queue.put(None)  # sentinel: stream complete
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield _sse(item)
+        finally:
+            task.cancel()
+            await client.aclose()
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.delete("/api/models/{filename}")
+async def delete_local_model(filename: str) -> dict[str, Any]:
+    """Delete a downloaded GGUF + its manifest entry (404 if absent). Path-traversal guarded."""
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    base = model_library.models_dir().resolve()
+    target = (base / filename).resolve()
+    if target.parent != base:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not model_library.remove_model(filename):
+        raise HTTPException(status_code=404, detail="model not found")
+    return {"deleted": filename}
+
+
+@app.get("/api/llamacpp/status")
+async def llamacpp_status() -> dict[str, Any]:
+    """Ping the configured llama-server: is it reachable, and what model is it serving?
+
+    Reads ``GET {LLAMACPP_BASE_URL}/models`` (OpenAI list). Tolerant → ``{"reachable": false}`` when
+    the server is down/unset — this is how the UI reflects whatever the external server currently serves.
+    """
+    base = os.getenv("LLAMACPP_BASE_URL", DEFAULT_LLAMACPP_BASE_URL).rstrip("/")
+    result: dict[str, Any] = {"reachable": False, "base_url": base, "served_model": None, "models": []}
+    api_key = os.getenv("LLAMACPP_API_KEY") or "api-key-not-set"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}
+            )
+            resp.raise_for_status()
+            ids = [m.get("id") for m in (resp.json().get("data") or []) if m.get("id")]
+            result["models"] = ids
+            result["served_model"] = ids[0] if ids else None
+            result["reachable"] = True
+    except Exception:  # noqa: BLE001 — unreachable is a normal, reported state.
+        logger.debug("llama-server status: unreachable at %s", base, exc_info=True)
+    return result

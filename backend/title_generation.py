@@ -4,9 +4,10 @@ The title is generated lazily after the first completed turn when a Conversation
 The model is env-driven so the local title model can be swapped without code changes:
 
 - ``TITLE_MODEL`` - any explicit Pydantic AI model string (for example ``openai:gpt-5.2``).
-- ``TITLE_OLLAMA_MODEL`` - local Ollama model name. Defaults to ``supra-title-350m-exp``.
+- ``TITLE_LLAMACPP_MODEL`` - local llama.cpp model name. Defaults to ``local-model``.
 
-When ``TITLE_MODEL`` is unset, the title generator uses Ollama with the local model name above.
+When ``TITLE_MODEL`` is unset, the title generator uses the local llama.cpp server (the model name
+above is informational; a single-model llama-server serves whatever it was launched with).
 """
 
 from __future__ import annotations
@@ -32,14 +33,14 @@ _TITLE_INSTRUCTIONS = (
 )
 
 _TITLE_MODEL = "TITLE_MODEL"
-_TITLE_OLLAMA_MODEL = "TITLE_OLLAMA_MODEL"
-_TITLE_DEFAULT = "supra-title-350m-exp"
+_TITLE_LOCAL_MODEL = "TITLE_LLAMACPP_MODEL"
+_TITLE_DEFAULT = "local-model"
 
 
 def title_model_label() -> str:
     """Return the configured title model as a UI-friendly label."""
     model = os.getenv(_TITLE_MODEL)
-    return model or f"ollama/{os.getenv(_TITLE_OLLAMA_MODEL, _TITLE_DEFAULT)}"
+    return model or f"local/{os.getenv(_TITLE_LOCAL_MODEL, _TITLE_DEFAULT)}"
 
 
 def _normalize_title(raw: str) -> str:
@@ -64,7 +65,7 @@ async def generate_title(db: ArcadeClient, conversation_id: str) -> str:
 
     transcript = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
     title_agent: Agent[None, str] = Agent(
-        select_model(_TITLE_MODEL, _TITLE_OLLAMA_MODEL, _TITLE_DEFAULT),
+        select_model(_TITLE_MODEL, _TITLE_LOCAL_MODEL, _TITLE_DEFAULT),
         instructions=_TITLE_INSTRUCTIONS,
     )
     result = await title_agent.run(transcript)

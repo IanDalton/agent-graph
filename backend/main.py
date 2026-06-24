@@ -105,8 +105,9 @@ def build_agent(
 
     ``model`` is an optional explicit model label (from the UI dropdown) — see
     :func:`backend.model_selection.resolve_model`. When omitted, model selection falls back to
-    env: ``AGENT_MODEL`` (any Pydantic AI model string, e.g. ``openai:gpt-5.2``), else a local
-    Ollama model named by ``OLLAMA_MODEL`` (mirrors the original notebook prototype).
+    env: ``AGENT_MODEL`` (any Pydantic AI model string, e.g. ``openai:gpt-5.2`` — a power-user
+    escape hatch), else a local **llama.cpp** model served over llama-server's OpenAI-compatible
+    API at ``LLAMACPP_BASE_URL`` (the managed local provider; see the Model Manager UI).
 
     ``effort`` is an optional thinking-effort level (one of :data:`THINKING_EFFORTS`); an unknown
     or missing value falls back to :data:`DEFAULT_EFFORT`.
