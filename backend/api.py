@@ -20,7 +20,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 
 import re
 
@@ -31,9 +31,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from backend import kb_compiler, main, marketplace, summarization
+from backend.models import downloads as model_downloads
 from backend.models import hardware as hw_models
 from backend.models import huggingface as hf_models
 from backend.models import library as model_library
+from backend.models import llama_runtime
 from backend.models import recommend as model_recommend
 from backend.db import repository as repo
 from backend.schemas.swarm_schemas import (
@@ -186,6 +188,9 @@ async def get_config() -> dict[str, Any]:
         # Semantic fact search: on when an embedding model is configured, else substring matching.
         "embeddings": embeddings_enabled(),
         "embed_model": os.getenv("EMBED_MODEL") or None,
+        # Known GPU name → VRAM (MB) so the hardware editor can auto-fill VRAM the moment a card is
+        # named (the source of truth for the catalog lives in backend.models.hardware).
+        "known_gpus": hw_models.KNOWN_GPUS,
     }
 
 
@@ -1100,6 +1105,15 @@ class DownloadRequest(BaseModel):
     quant: str = ""
 
 
+class LoadModelRequest(BaseModel):
+    """Ask the backend to (re)launch the local llama-server onto a downloaded GGUF."""
+
+    filename: str
+    # Advanced-panel overrides; when absent the recommender maximizes context for the saved hardware.
+    requested_context: int | None = None
+    kv_cache_type: str | None = None
+
+
 async def _load_hardware() -> hw_models.HardwareProfile:
     """The saved hardware profile, or a best-effort auto-detected one when none has been saved."""
     saved = hw_models.load_profile(model_library.hardware_path())
@@ -1154,10 +1168,22 @@ async def update_hardware(body: HardwareProfileUpdate) -> dict[str, Any]:
 async def detect_hardware() -> dict[str, Any]:
     """Best-effort NVIDIA/system auto-detect (a *suggestion*; not saved — the UI accepts then PUTs).
 
-    Returns ``[]`` GPUs when none are visible to this process (the common containerized/remote case),
-    which is the cue for the user to fill the profile in manually.
+    Tries local ``nvidia-smi`` first; when that finds no GPU (the common case — the backend image has
+    no ``nvidia-smi``), falls back to running ``nvidia-smi`` inside the GPU-bearing llama-server
+    container via the Docker socket (``llama_runtime.detect_nvidia_via_docker``). Still returns ``[]``
+    GPUs when neither path sees one (truly headless/remote), the cue to fill the profile in manually.
     """
-    return (await hw_models.auto_profile()).to_dict()
+    profile = await hw_models.auto_profile()
+    if not profile.gpus:
+        try:
+            gpus = await llama_runtime.detect_nvidia_via_docker()
+        except Exception:  # noqa: BLE001 — detection is best-effort, never fatal.
+            logger.warning("docker-exec GPU detect failed", exc_info=True)
+            gpus = []
+        if gpus:
+            profile.gpus = gpus
+            profile.source = "auto"
+    return profile.to_dict()
 
 
 @app.get("/api/models/search")
@@ -1233,47 +1259,52 @@ async def download_model(body: DownloadRequest) -> StreamingResponse:
     ``asyncio.Queue`` that the SSE generator drains.
     """
 
-    async def event_source() -> AsyncIterator[str]:
-        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    key = model_downloads.key_for(body.repo_id, body.file_path)
+    dest_dir = model_library.models_dir()
+
+    async def downloader(progress: Callable[[int, int], Awaitable[None]]) -> dict[str, Any]:
         client = hf_models.HuggingFaceClient()
-        dest_dir = model_library.models_dir()
+        try:
+            dest = await client.stream_download(
+                body.repo_id, body.file_path, dest_dir, revision=body.revision, progress=progress
+            )
+        finally:
+            await client.aclose()
+        filename = dest.name
+        size = dest.stat().st_size
+        model_library.add_to_manifest(
+            {
+                "filename": filename,
+                "size_bytes": size,
+                "quant": body.quant or hf_models.parse_quant(filename),
+                "repo_id": body.repo_id,
+                "revision": body.revision,
+            },
+            base=dest_dir,
+        )
+        return {
+            "filename": filename,
+            "path": str(dest),
+            "size_bytes": size,
+            "label": model_library.model_label(filename),
+        }
 
-        async def progress(downloaded: int, total: int) -> None:
-            await queue.put({"type": "progress", "downloaded": downloaded, "total": total})
+    # The download runs as a detached task that OUTLIVES this request, so a refresh/tab-switch (which
+    # drops the SSE connection) no longer cancels it; the client re-attaches via /api/models/downloads.
+    dl = model_downloads.start(
+        key,
+        {
+            "repo_id": body.repo_id,
+            "file_path": body.file_path,
+            "quant": body.quant,
+            "revision": body.revision,
+            "filename": body.file_path.rsplit("/", 1)[-1],
+        },
+        downloader,
+    )
+    queue = model_downloads.subscribe(dl)
 
-        async def run() -> None:
-            try:
-                dest = await client.stream_download(
-                    body.repo_id, body.file_path, dest_dir, revision=body.revision, progress=progress
-                )
-                filename = dest.name
-                size = dest.stat().st_size
-                model_library.add_to_manifest(
-                    {
-                        "filename": filename,
-                        "size_bytes": size,
-                        "quant": body.quant or hf_models.parse_quant(filename),
-                        "repo_id": body.repo_id,
-                        "revision": body.revision,
-                    },
-                    base=dest_dir,
-                )
-                await queue.put(
-                    {
-                        "type": "done",
-                        "filename": filename,
-                        "path": str(dest),
-                        "size_bytes": size,
-                        "label": model_library.model_label(filename),
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001 — surface to the client, don't 500 mid-stream.
-                logger.warning("model download failed", exc_info=True)
-                await queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-            finally:
-                await queue.put(None)  # sentinel: stream complete
-
-        task = asyncio.create_task(run())
+    async def event_source() -> AsyncIterator[str]:
         try:
             while True:
                 item = await queue.get()
@@ -1281,14 +1312,20 @@ async def download_model(body: DownloadRequest) -> StreamingResponse:
                     break
                 yield _sse(item)
         finally:
-            task.cancel()
-            await client.aclose()
+            model_downloads.unsubscribe(dl, queue)  # detach this client; the download keeps running
 
     return StreamingResponse(
         event_source(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/models/downloads")
+async def list_active_downloads() -> list[dict[str, Any]]:
+    """In-progress (and just-finished) downloads, so the UI can repopulate its progress bars and
+    re-attach their streams after a page refresh or reopening the Model Manager."""
+    return model_downloads.active_snapshot()
 
 
 @app.delete("/api/models/{filename}")
@@ -1328,3 +1365,63 @@ async def llamacpp_status() -> dict[str, Any]:
     except Exception:  # noqa: BLE001 — unreachable is a normal, reported state.
         logger.debug("llama-server status: unreachable at %s", base, exc_info=True)
     return result
+
+
+@app.post("/api/llamacpp/load")
+async def load_llamacpp_model(body: LoadModelRequest) -> dict[str, Any]:
+    """Recreate the local llama-server container to serve a downloaded GGUF (the "click a model to
+    load it" path). Tolerant — returns ``{ok:false, …}`` for expected failures (never a 500); only the
+    path-traversal guard (400) and a missing file (404) raise.
+
+    When the server isn't a manageable local Docker container (no socket, container not found, or a
+    remote ``LLAMACPP_BASE_URL``), returns ``{ok:false, unmanaged:true}`` so the UI can disable Load.
+    """
+    filename = body.filename
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    try:
+        models = model_library.scan_models_dir()
+    except Exception:  # noqa: BLE001
+        models = []
+    entry = next((m for m in models if m.get("filename") == filename), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="model not found")
+
+    # Recommend launch settings from the saved hardware profile (mirrors POST /api/models/recommend).
+    try:
+        profile = await _load_hardware()
+    except Exception:  # noqa: BLE001
+        profile = hw_models.default_profile()
+    config = None
+    repo_id = entry.get("repo_id") or ""
+    if repo_id:
+        try:
+            config = await hf_models.fetch_config(repo_id)
+        except Exception:  # noqa: BLE001 — config is optional; the recommender falls back to heuristics.
+            config = None
+    rec = model_recommend.recommend(
+        profile,
+        size_bytes=int(entry.get("size_bytes") or 0),
+        quant=entry.get("quant", ""),
+        config=config,
+        filename=filename,
+        requested_context=body.requested_context,
+        kv_cache_type=body.kv_cache_type,
+    )
+    alias = f"{model_library.LOCAL_PREFIX}{_alias_for(filename)}"
+    # The server-cuda image's entrypoint IS llama-server, so the container command is the flags only.
+    argv = model_recommend.launch_argv(f"/models/{filename}", rec, alias=alias)[1:]
+
+    base = os.getenv("LLAMACPP_BASE_URL", DEFAULT_LLAMACPP_BASE_URL).rstrip("/")
+    api_key = os.getenv("LLAMACPP_API_KEY") or "api-key-not-set"
+    result = await llama_runtime.load_model(
+        command=argv, expected_alias=alias, base_url=base, api_key=api_key
+    )
+    return {
+        "ok": result.ok,
+        "unmanaged": result.unmanaged,
+        "served_model": result.served_model,
+        "error": result.error,
+        "notes": result.notes,
+        "recommendation": rec.to_dict(),
+    }

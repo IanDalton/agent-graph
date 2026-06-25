@@ -11,6 +11,7 @@ import {
   Pin,
   PinOff,
   Plus,
+  Settings,
   Trash2,
 } from "lucide-react";
 
@@ -420,6 +421,7 @@ export function Sidebar() {
     activeProjectId,
     selectProject,
     setConversationProject,
+    openSettings,
   } = useApp();
 
   const [creating, setCreating] = useState(false);
@@ -456,8 +458,19 @@ export function Sidebar() {
 
   return (
     <aside className="flex h-full flex-col border-r border-border bg-card">
-      <div className="flex items-center justify-between px-4 py-3">
+      {/* pr-12 clears the floating collapse-sidebar chevron (absolute right-2 top-2) so the gear
+          isn't hidden behind it. */}
+      <div className="flex items-center justify-between px-4 py-3 pr-12">
         <span className="text-sm font-semibold tracking-tight">Mission Control</span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7 text-muted-foreground hover:text-foreground"
+          title="Settings — models, skills & configuration"
+          onClick={() => openSettings()}
+        >
+          <Settings className="size-4" />
+        </Button>
       </div>
 
       <div className="flex gap-2 px-3 pb-2">

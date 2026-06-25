@@ -8,8 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ArcadeDB is both the agent's memory (the LLM queries/stores conversation context) and the
 business datastore (every turn, tool call, and error is persisted). A SearXNG instance is
 included for web search. The LLM is served **locally by llama.cpp** (`llama-server`'s
-OpenAI-compatible API); the web UI's **Model Manager** downloads GGUF models from HuggingFace,
-shows what fits the NVIDIA hardware, and generates the `llama-server` launch command. `testing.ipynb`
+OpenAI-compatible API); the web UI's **Model Manager** (in the **Settings** page, opened by the
+Sidebar gear) downloads GGUF models from HuggingFace, shows what fits the NVIDIA hardware, and either
+**loads** one onto the local llama-server container or generates the `llama-server` launch command for
+a hand-managed/remote server. `testing.ipynb`
 holds the original prototype; the real implementation now lives in the `backend/` package.
 
 ## Architecture
@@ -438,20 +440,43 @@ Data flows through one repository layer so tools and hooks never duplicate SQL. 
   repo's quant files+sizes, read `config.json`, and **stream-download** a `.gguf` with progress —
   tolerant module helpers + a `HuggingFaceClient`); `hardware.py` (the editable `HardwareProfile` —
   the **source of truth** for recommendations — + best-effort `nvidia-smi`/`/proc/meminfo` detection,
-  stdlib only); `recommend.py` (pure VRAM/GQA-KV-cache math → a `fit` classification
+  stdlib only; also a small `KNOWN_GPUS` catalog + `vram_for_name` so a typed GPU name auto-fills
+  VRAM); `recommend.py` (pure VRAM/GQA-KV-cache math → a `fit` classification
   gpu/partial/cpu/too_big + `-ngl`/`-c`/KV-quant/flash-attn/batch/threads and the `llama-server`
-  launch command, incl. an `-hf` self-download variant); `library.py` (the filesystem manifest of
-  downloaded GGUFs on `LLAMACPP_MODELS_DIR`, reconciled with on-disk files; models' UI label is
-  `local/<stem>`). The API surfaces these at `GET /api/models`, `GET|PUT /api/hardware` +
-  `POST /api/hardware/detect`, `GET /api/models/search`, `GET /api/models/repo/{repo_id}/files`
-  (per-quant fit badges), `POST /api/models/recommend`, `POST /api/models/download` (SSE progress,
-  like `chat_stream`), `DELETE /api/models/{filename}` (traversal-guarded), and
-  `GET /api/llamacpp/status` (pings llama-server `/v1/models` — how the UI reflects the served
-  model). The frontend page is `frontend/src/panes/modelspage.tsx` (a `Dialog` with Discover/Library/
-  Hardware/Server tabs + an advanced settings panel; opened from the Composer's Boxes button), wired
-  through `AppContext` (`openModelsPage`, `localModels`, `hardware`, `llamacppStatus`, `downloadModel`
-  via `api/stream.ts`'s shared `readSseStream`). The model picker lists the downloaded `local/…`
-  models (from `/api/config`'s merged list).
+  launch command via `launch_argv`/`launch_command`, incl. an `-hf` self-download variant; the
+  reported VRAM estimate is `weights + KV cache + a fixed `_GPU_OVERHEAD`` (the 10%/1 GiB `reserve`
+  is a *fit budget* only, never added to the estimate, so the number reflects the model's footprint
+  not the card size) and is exposed split into `weights_mb`/`kv_cache_mb`/`overhead_mb`; by default
+  the GPU path maximizes the context up to `model_max_ctx`; the `Recommendation` carries
+  `model_max_ctx` so the UI slider knows its bound); `library.py` (the
+  filesystem manifest of downloaded GGUFs on `LLAMACPP_MODELS_DIR`, reconciled with on-disk files;
+  models' UI label is `local/<stem>`); and **`llama_runtime.py`** — manage the local llama-server
+  *container* over the mounted **Docker socket** (the backend already ships the docker CLI for the
+  sandbox): `detect_nvidia_via_docker` runs `nvidia-smi` *inside* the GPU-bearing llama-server
+  container (the auto-detect fallback, since the backend image has no `nvidia-smi`), and
+  `inspect_container`/`recreate_with_command`/`wait_until_serving`/`load_model` **recreate** that
+  container to serve a chosen GGUF (replicating its image/network-aliases/mounts/CDI-GPU/restart
+  config and changing only the command — the `llamacpp` network alias is force-preserved so the
+  backend keeps reaching its own model). Tolerant like `runner.py`; only applies when llama-server is
+  a local container (`LLAMACPP_CONTAINER`, default `agent_graph_llamacpp`), else returns
+  `unmanaged`. The API surfaces these at `GET /api/models`, `GET|PUT /api/hardware` +
+  `POST /api/hardware/detect` (local `nvidia-smi` → docker-exec fallback → empty), `GET
+  /api/models/search`, `GET /api/models/repo/{repo_id}/files` (per-quant fit badges),
+  `POST /api/models/recommend`, `POST /api/models/download` (SSE progress, like `chat_stream`),
+  `DELETE /api/models/{filename}` (traversal-guarded), `GET /api/llamacpp/status` (pings llama-server
+  `/v1/models` — how the UI reflects the served model), and **`POST /api/llamacpp/load`** (recreate
+  the container onto a downloaded GGUF + poll until serving; tolerant `{ok,unmanaged,error,...}`,
+  guarded filename, recommender-built command). The frontend is now consolidated into
+  `frontend/src/panes/settingspage.tsx` (a `Dialog` with **Models / Skills / Config** tabs, opened by
+  the **gear in the Sidebar header** — the Model Manager and Skill Marketplace are no longer composer
+  buttons): the Models tab renders `modelspage.tsx`'s exported `ModelsPanel` (Discover/Library/
+  Hardware/Server + advanced panel — the context length is now a `ui/slider.tsx`, the Library cards
+  have **Load** (confirm dialog → `POST /api/llamacpp/load`) + an **Active** badge, and Hardware has
+  save-feedback + catalog VRAM auto-fill); the Skills tab renders `skillmarketplace.tsx`'s
+  `SkillMarketplacePanel`; Config is read-only. Wired through `AppContext` (`openSettings(tab)`,
+  `settingsOpen`, `localModels`, `hardware`, `llamacppStatus`, `loadModel`/`loadingModel`,
+  `downloadModel`). The model picker lists the downloaded `local/…` models (from `/api/config`'s
+  merged list, which also carries `known_gpus`).
 - **`backend/api.py`** — `app`: a **thin** FastAPI/SSE wrapper over the existing machinery (adds no
   DB/agent logic; every handler calls `repo.*` / `main.stream_run`, opening a short-lived
   `ArcadeClient` on the caller's per-user DB via `_client_for(user_id)`). Endpoints: `GET /api/config`
@@ -513,8 +538,10 @@ no Radix dep, like the popover; supports controlled `value`/`onValueChange`): a 
 (config + summary + memory graph; the config card's `SystemPromptRow` is a per-conversation custom
 system-prompt textarea, saved on blur via `AppContext.setConversationSystemPrompt`, and `SkillsRow`
 shows the **account skill library** (active in every chat) as removable chips plus a "Browse" button
-that opens the **Skill Marketplace** dialog (`panes/SkillMarketplace.tsx`, mounted at the shell, also
-opened from a Sparkles button in the `Composer` toolbar): a full-screen gallery of Claude's live
+that opens the **Settings page** at its Skills tab (`AppContext.openSettings("skills")`). The Skill
+Marketplace is now `panes/skillmarketplace.tsx`'s exported `SkillMarketplacePanel`, rendered inside
+the Settings dialog (`panes/settingspage.tsx`) rather than its own dialog/Composer button: a
+full-screen gallery of Claude's live
 catalog + the user's authored skills, where each card **Install**s (`AppContext.installSkill` →
 `POST /api/skills/sync` `names=[name]`) or **Remove**s (`removeSkill` → `DELETE /api/skills/{name}`)
 a library skill, plus a **Create skill** editor (name/description/instructions → `saveSkill` →
@@ -585,8 +612,12 @@ GET-only; the frame vocabulary mirrors `stream_run`'s. Dev: `npm run dev` (proxi
   file with `-m /models/<file>`). It and the backend share the `llamacpp_models`
   volume mounted at `/models` (`LLAMACPP_MODELS_DIR`; set `MODELS_HOST_DIR` to a host path to share
   with a host-run server instead). For a separate GPU machine, run llama-server there and point
-  `LLAMACPP_BASE_URL` at it. The backend image has no `nvidia-smi` (it can't see a remote GPU), so
-  hardware auto-detect returns nothing there and the manual hardware profile is authoritative.
+  `LLAMACPP_BASE_URL` at it. The backend image has no `nvidia-smi`, but when llama-server is this
+  **local CUDA container**, `/api/hardware/detect` falls back to `docker exec`ing `nvidia-smi` inside
+  it (via the mounted socket + `LLAMACPP_CONTAINER`), so auto-detect works on a co-located host; for a
+  truly remote GPU it returns nothing and the manual hardware profile is authoritative. That same
+  socket lets `POST /api/llamacpp/load` recreate this container to switch the served model (Library →
+  Load).
 
 ## Commands
 
@@ -623,10 +654,12 @@ The LLM is served by an **external llama.cpp `llama-server`** (the app connects 
 it). Set `LLAMACPP_BASE_URL` to its OpenAI-compatible `/v1` endpoint (default
 `http://localhost:8080/v1`; the optional `llamacpp` compose service is `http://llamacpp:8080/v1`),
 `LLAMACPP_API_KEY` only if launched with `--api-key`, and `HF_TOKEN` for gated/rate-limited
-HuggingFace downloads. Use the **Model Manager** UI (Composer's Boxes button) to download GGUFs to
-`LLAMACPP_MODELS_DIR`, fill in the **hardware profile** (the source of truth — the backend can't see
-a GPU on another machine), and copy the generated `llama-server` launch command (it sets `-c`/`-ngl`/
-KV-cache/flash-attn from the hardware fit). The context window is the server's `-c` flag, not a
+HuggingFace downloads. Open the **Settings** page (gear in the Sidebar header) → **Models** to
+download GGUFs to `LLAMACPP_MODELS_DIR`, fill in the **hardware profile** (auto-detect works when
+llama-server is the local container; else the manual profile is the source of truth), and either
+**Load** a downloaded model directly (recreates the local llama-server container — needs
+`LLAMACPP_CONTAINER`) or copy the generated `llama-server` launch command (it sets `-c`/`-ngl`/
+KV-cache/flash-attn from the hardware fit) to run a hand-managed/remote server. The context window is the server's `-c` flag, not a
 per-request value; `LLAMACPP_NUM_PREDICT` (→ `max_tokens`) widens the output budget so long reasoning
 isn't truncated mid-`<think>`. `AGENT_MODEL` (e.g. `openai:gpt-5.2`) remains a hidden escape hatch to
 a hosted provider. Secrets load from `.env` via `python-dotenv`.

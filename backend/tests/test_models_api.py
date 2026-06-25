@@ -109,7 +109,72 @@ def test_download_sse_then_listed(client, monkeypatch) -> None:
     assert any(m["filename"] == "m.gguf" for m in client.get("/api/models").json())
 
 
+def test_active_downloads_endpoint(client) -> None:
+    # No downloads in flight → an empty list (and the route exists). Clear the process-wide registry
+    # first since other tests may have left (not-yet-expired) entries in it.
+    from backend.models import downloads as _downloads
+
+    _downloads._active.clear()
+    assert client.get("/api/models/downloads").json() == []
+
+
 def test_llamacpp_status_unreachable_is_tolerant(client) -> None:
     status = client.get("/api/llamacpp/status").json()
     assert status["reachable"] is False
     assert status["served_model"] is None
+
+
+def test_config_exposes_known_gpus(client) -> None:
+    cfg = client.get("/api/config").json()
+    assert "known_gpus" in cfg
+    assert cfg["known_gpus"].get("rtx 3090") == 24576
+
+
+def test_recommend_includes_model_max_ctx(client) -> None:
+    body = {"size_bytes": int(4.9e9), "quant": "Q4_K_M", "filename": "m.gguf"}
+    rec = client.post("/api/models/recommend", json=body).json()["recommendation"]
+    assert "model_max_ctx" in rec and rec["model_max_ctx"] > 0
+
+
+def test_recommend_includes_vram_breakdown(client) -> None:
+    body = {"size_bytes": int(4.9e9), "quant": "Q4_K_M", "filename": "Qwen3-8B-Q4_K_M.gguf"}
+    rec = client.post("/api/models/recommend", json=body).json()["recommendation"]
+    for key in ("weights_mb", "kv_cache_mb", "overhead_mb"):
+        assert key in rec
+    if rec["fit"] in {"gpu", "partial"}:
+        total = rec["weights_mb"] + rec["kv_cache_mb"] + rec["overhead_mb"]
+        assert abs(total - rec["est_vram_mb"]) <= 1
+
+
+def test_detect_tolerant_when_no_gpu(client, monkeypatch) -> None:
+    # No local nvidia-smi AND no docker → a valid (empty-GPU) profile, never a 500.
+    async def boom(*_a, **_k):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    resp = client.post("/api/hardware/detect")
+    assert resp.status_code == 200
+    assert resp.json()["gpus"] == []
+
+
+def test_load_missing_file_is_404(client) -> None:
+    assert client.post("/api/llamacpp/load", json={"filename": "nope.gguf"}).status_code == 404
+
+
+def test_load_traversal_guard(client) -> None:
+    assert client.post("/api/llamacpp/load", json={"filename": "evil..gguf"}).status_code == 400
+
+
+def test_load_unmanaged_without_docker(client, tmp_path, monkeypatch) -> None:
+    # A real library file exists, but docker is unavailable → tolerant {ok:false, unmanaged:true}.
+    (tmp_path / "m.gguf").write_bytes(b"x")
+
+    async def boom(*_a, **_k):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    resp = client.post("/api/llamacpp/load", json={"filename": "m.gguf"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["unmanaged"] is True

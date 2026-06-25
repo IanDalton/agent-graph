@@ -6,13 +6,11 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
-  Boxes,
   Brain,
   Check,
   Image as ImageIcon,
   Paperclip,
   SendHorizonal,
-  Sparkles,
   Square,
   X,
   Zap,
@@ -238,8 +236,6 @@ export function Composer({
     conversations,
     activeId,
     setConversationMode,
-    openSkillMarketplace,
-    openModelsPage,
   } = useApp();
   const activeMode = conversations.find((c) => c.conversation_id === activeId)?.mode ?? "regular";
   const [text, setText] = useState("");
@@ -388,26 +384,6 @@ export function Composer({
             className="inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
           >
             <Paperclip className="size-4" />
-          </button>
-          {activeMode !== "swarm" && (
-            <button
-              type="button"
-              onClick={openSkillMarketplace}
-              aria-label="Browse skills"
-              title="Browse the skill marketplace"
-              className="inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
-            >
-              <Sparkles className="size-4" />
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={openModelsPage}
-            aria-label="Manage local models"
-            title="Manage local models (download from HuggingFace, hardware fit, llama.cpp settings)"
-            className="inline-flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
-          >
-            <Boxes className="size-4" />
           </button>
           {/* Only when a conversation is active — the new-chat picker handles mode pre-creation. */}
           {activeId && (

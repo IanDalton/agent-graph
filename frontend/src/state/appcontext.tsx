@@ -12,16 +12,21 @@ import { api } from "@/api/client";
 import { streamDownload } from "@/api/stream";
 import { conversationLabel } from "@/panes/sidebar";
 import type {
+  ActiveDownload,
   AgentSpec,
   AppConfig,
   CatalogSkill,
   Conversation,
   DownloadEvent,
+  DownloadProgress,
   HardwareProfile,
+  HfFile,
   LlamacppStatus,
+  LoadModelResult,
   LocalModel,
   Mode,
   Project,
+  SettingsTab,
   SkillContent,
   SkillInfo,
   SwarmFlowState,
@@ -134,10 +139,6 @@ interface AppState {
   refreshSkills: () => Promise<void>;
   /** Sync ALL marketplace skills into the library, then refresh. */
   syncSkills: () => Promise<void>;
-  /** Whether the Skill Marketplace dialog is open. */
-  skillMarketplaceOpen: boolean;
-  openSkillMarketplace: () => void;
-  closeSkillMarketplace: () => void;
   /** The live marketplace catalog (name + description + installed) shown in the dialog. */
   catalog: CatalogSkill[];
   /** True while the catalog is being fetched from GitHub. */
@@ -158,11 +159,14 @@ interface AppState {
   createAgent: (agent: Omit<AgentSpec, "agent_id">) => Promise<void>;
   updateAgent: (agentId: string, patch: Partial<Omit<AgentSpec, "agent_id" | "name">>) => Promise<void>;
   deleteAgent: (agentId: string) => Promise<void>;
+  // --- Settings page (gear in the sidebar header) ----------------------------------------
+  /** Whether the unified Settings page (Models / Skills / Config) is open. */
+  settingsOpen: boolean;
+  /** Which Settings section to show when it opens (the gear / a deep-link sets this). */
+  settingsInitialTab: SettingsTab;
+  openSettings: (tab?: SettingsTab) => void;
+  closeSettings: () => void;
   // --- Local model manager (llama.cpp) ---------------------------------------------------
-  /** Whether the Model Manager dialog is open. */
-  modelsPageOpen: boolean;
-  openModelsPage: () => void;
-  closeModelsPage: () => void;
   /** The downloaded local GGUF models (Library tab + composer picker). */
   localModels: LocalModel[];
   refreshModels: () => Promise<void>;
@@ -180,14 +184,22 @@ interface AppState {
   /** llama-server connectivity + served model; null until first checked. */
   llamacppStatus: LlamacppStatus | null;
   refreshLlamacppStatus: () => Promise<void>;
-  /** Download a GGUF (SSE), forwarding progress frames; refreshes the library on completion. */
-  downloadModel: (
-    body: { repo_id: string; file_path: string; revision?: string; quant?: string },
-    onEvent: (event: DownloadEvent) => void,
-    signal?: AbortSignal
-  ) => Promise<void>;
+  /** Live download progress keyed by `${repo_id}/${file_path}`; lives here (not in the tab) so it
+   *  survives tab switches, closing the Settings dialog, and a page refresh (via refreshDownloads). */
+  downloads: Record<string, DownloadProgress>;
+  /** Start (or re-surface) a GGUF download; progress flows into `downloads` + refreshes the library. */
+  startDownload: (repoId: string, file: HfFile) => void;
+  /** Repopulate in-progress downloads from the backend and re-attach their streams (after a refresh). */
+  refreshDownloads: () => Promise<void>;
   /** Delete a downloaded GGUF, then refresh the library. */
   deleteModel: (filename: string) => Promise<void>;
+  /** The filename currently being loaded onto the llama-server (drives the per-card spinner), or null. */
+  loadingModel: string | null;
+  /** Recreate the local llama-server to serve a downloaded GGUF; refreshes status on success. */
+  loadModel: (
+    filename: string,
+    opts?: { requested_context?: number; kv_cache_type?: string }
+  ) => Promise<LoadModelResult>;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -202,17 +214,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [swarmFlow, setSwarmFlow] = useState<SwarmFlowState | null>(null);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [syncingSkills, setSyncingSkills] = useState(false);
-  const [skillMarketplaceOpen, setSkillMarketplaceOpen] = useState(false);
   const [catalog, setCatalog] = useState<CatalogSkill[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [agents, setAgents] = useState<AgentSpec[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
-  const [modelsPageOpen, setModelsPageOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>("models");
   const [localModels, setLocalModels] = useState<LocalModel[]>([]);
   const [hardware, setHardware] = useState<HardwareProfile | null>(null);
   const [llamacppStatus, setLlamacppStatus] = useState<LlamacppStatus | null>(null);
+  const [loadingModel, setLoadingModel] = useState<string | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  // Keys with a live SSE attached, so re-attach (start + refresh) never opens two streams for one file.
+  const attachedDownloads = useRef<Set<string>>(new Set());
 
   const featureDocument = useCallback((id: string) => {
     setFeaturedDoc({ id, ts: Date.now() });
@@ -535,13 +551,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const openSkillMarketplace = useCallback(() => {
-    setSkillMarketplaceOpen(true);
-    refreshCatalog().catch(() => {});
-  }, [refreshCatalog]);
-
-  const closeSkillMarketplace = useCallback(() => setSkillMarketplaceOpen(false), []);
-
   // Install a marketplace skill into the account library (active in every regular/research chat).
   const installSkill = useCallback(
     async (name: string) => {
@@ -655,14 +664,100 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const openModelsPage = useCallback(() => {
-    setModelsPageOpen(true);
-    refreshModels().catch(() => {});
-    refreshHardware().catch(() => {});
-    refreshLlamacppStatus().catch(() => {});
-  }, [refreshModels, refreshHardware, refreshLlamacppStatus]);
+  // Open (or re-open, after a refresh) the SSE for one download and pipe its frames into `downloads`.
+  // Guarded by `attachedDownloads` so startDownload + refreshDownloads can't double-attach one file.
+  const attachDownload = useCallback(
+    (body: { repo_id: string; file_path: string; revision?: string; quant?: string }, key: string) => {
+      if (attachedDownloads.current.has(key)) return;
+      attachedDownloads.current.add(key);
+      streamDownload(body, (event: DownloadEvent) => {
+        setDownloads((prev) => {
+          if (event.type === "progress") {
+            return {
+              ...prev,
+              [key]: {
+                downloaded: event.downloaded,
+                total: event.total,
+                status: "downloading",
+                speed_bps: event.speed_bps,
+                eta_seconds: event.eta_seconds,
+              },
+            };
+          }
+          if (event.type === "done") {
+            return { ...prev, [key]: { downloaded: event.size_bytes, total: event.size_bytes, status: "done" } };
+          }
+          return { ...prev, [key]: { downloaded: 0, total: 0, status: "error", message: event.message } };
+        });
+        if (event.type === "done") refreshModels().catch(() => {});
+      })
+        .catch((err) => {
+          setDownloads((prev) => ({
+            ...prev,
+            [key]: { downloaded: prev[key]?.downloaded ?? 0, total: prev[key]?.total ?? 0, status: "error", message: String(err) },
+          }));
+        })
+        .finally(() => {
+          attachedDownloads.current.delete(key);
+        });
+    },
+    [refreshModels]
+  );
 
-  const closeModelsPage = useCallback(() => setModelsPageOpen(false), []);
+  const startDownload = useCallback(
+    (repoId: string, file: HfFile) => {
+      const key = `${repoId}/${file.path}`;
+      setDownloads((prev) => ({ ...prev, [key]: { downloaded: 0, total: file.size_bytes, status: "downloading" } }));
+      attachDownload({ repo_id: repoId, file_path: file.path, quant: file.quant }, key);
+    },
+    [attachDownload]
+  );
+
+  const refreshDownloads = useCallback(async () => {
+    let active: ActiveDownload[];
+    try {
+      active = await api.activeDownloads();
+    } catch {
+      return;
+    }
+    if (active.length === 0) return;
+    setDownloads((prev) => {
+      const next = { ...prev };
+      for (const d of active) {
+        next[`${d.repo_id}/${d.file_path}`] = {
+          downloaded: d.downloaded,
+          total: d.total,
+          status: d.status,
+          message: d.message || undefined,
+          speed_bps: d.speed_bps,
+          eta_seconds: d.eta_seconds,
+        };
+      }
+      return next;
+    });
+    // Re-attach the live stream for anything still running (no-op if already attached).
+    for (const d of active) {
+      if (d.status === "downloading") {
+        attachDownload({ repo_id: d.repo_id, file_path: d.file_path, quant: d.quant }, `${d.repo_id}/${d.file_path}`);
+      }
+    }
+  }, [attachDownload]);
+
+  const openSettings = useCallback(
+    (tab: SettingsTab = "models") => {
+      setSettingsInitialTab(tab);
+      setSettingsOpen(true);
+      // Eagerly load everything the page shows (merges what the old Models/Skills dialogs did).
+      refreshModels().catch(() => {});
+      refreshHardware().catch(() => {});
+      refreshLlamacppStatus().catch(() => {});
+      refreshCatalog().catch(() => {});
+      refreshDownloads().catch(() => {});
+    },
+    [refreshModels, refreshHardware, refreshLlamacppStatus, refreshCatalog, refreshDownloads]
+  );
+
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   const saveHardware = useCallback(
     async (profile: {
@@ -675,6 +770,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         console.error("failed to save hardware profile", err);
         refreshHardware().catch(() => {});
+        throw err; // let the Hardware tab show a save error instead of silently failing
       }
     },
     [refreshHardware]
@@ -689,23 +785,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const downloadModel = useCallback(
-    async (
-      body: { repo_id: string; file_path: string; revision?: string; quant?: string },
-      onEvent: (event: DownloadEvent) => void,
-      signal?: AbortSignal
-    ) => {
-      await streamDownload(
-        body,
-        (event) => {
-          onEvent(event);
-          if (event.type === "done") refreshModels().catch(() => {});
-        },
-        signal
-      );
-    },
-    [refreshModels]
-  );
+  // Open (or re-open, after a refresh) the SSE for one download and pipe its frames into `downloads`.
+  // Guarded by `attachedDownloads` so startDownload + refreshDownloads can't double-attach one file.
 
   const deleteModel = useCallback(
     async (filename: string) => {
@@ -720,10 +801,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshModels]
   );
 
+  const loadModel = useCallback(
+    async (
+      filename: string,
+      opts?: { requested_context?: number; kv_cache_type?: string }
+    ): Promise<LoadModelResult> => {
+      setLoadingModel(filename);
+      try {
+        const res = await api.loadModel({ filename, ...opts });
+        if (res.ok) await refreshLlamacppStatus().catch(() => {});
+        return res;
+      } catch (err) {
+        console.error("failed to load model", err);
+        return { ok: false, error: String(err) };
+      } finally {
+        setLoadingModel(null);
+      }
+    },
+    [refreshLlamacppStatus]
+  );
+
   // Load the skill library once so the Configuration card has it.
   useEffect(() => {
     refreshSkills();
   }, [refreshSkills]);
+
+  // Repopulate + re-attach any in-progress downloads on first mount, so a page refresh mid-download
+  // shows its progress again (the backend keeps the download running across the dropped connection).
+  useEffect(() => {
+    refreshDownloads().catch(() => {});
+  }, [refreshDownloads]);
 
   // Load the projects list once for the sidebar groups (best-effort).
   useEffect(() => {
@@ -871,9 +978,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         syncingSkills,
         refreshSkills,
         syncSkills,
-        skillMarketplaceOpen,
-        openSkillMarketplace,
-        closeSkillMarketplace,
         catalog,
         catalogLoading,
         refreshCatalog,
@@ -886,9 +990,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
         createAgent,
         updateAgent,
         deleteAgent,
-        modelsPageOpen,
-        openModelsPage,
-        closeModelsPage,
+        settingsOpen,
+        settingsInitialTab,
+        openSettings,
+        closeSettings,
         localModels,
         refreshModels,
         hardware,
@@ -897,8 +1002,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         detectHardware,
         llamacppStatus,
         refreshLlamacppStatus,
-        downloadModel,
+        downloads,
+        startDownload,
+        refreshDownloads,
         deleteModel,
+        loadingModel,
+        loadModel,
       }}
     >
       {children}

@@ -235,6 +235,8 @@ export interface AppConfig {
   log_level: string;
   embeddings?: boolean;
   embed_model?: string | null;
+  /** Known GPU name → VRAM (MB), for auto-filling the hardware editor's VRAM field. */
+  known_gpus?: Record<string, number>;
 }
 
 /** Estimated context-window usage for a conversation (see GET /api/conversations/{id}/context).
@@ -359,8 +361,14 @@ export interface Recommendation {
   threads: number;
   est_vram_mb: number;
   est_ram_mb: number;
+  /** VRAM estimate split into parts (sums to est_vram_mb); 0 on CPU/too_big. Units: MiB. */
+  weights_mb?: number;
+  kv_cache_mb?: number;
+  overhead_mb?: number;
   confidence: "high" | "low";
   notes: string[];
+  /** The model's own maximum context — the upper bound of the context-length slider. */
+  model_max_ctx?: number;
 }
 
 /** One GGUF file (or shard group) in a repo, with its fit + recommendation
@@ -406,8 +414,51 @@ export interface LlamacppStatus {
   models: string[];
 }
 
-/** SSE frames from POST /api/models/download (mirrors the chat stream vocabulary). */
+/** The sections of the unified Settings page (sidebar gear). */
+export type SettingsTab = "models" | "skills" | "config";
+
+/** Result of asking the backend to load a model (POST /api/llamacpp/load). `unmanaged` means the
+ *  llama-server isn't a local Docker container the app can restart. */
+export interface LoadModelResult {
+  ok: boolean;
+  unmanaged?: boolean;
+  served_model?: string | null;
+  error?: string | null;
+  notes?: string[];
+  recommendation?: Recommendation;
+}
+
+/** SSE frames from POST /api/models/download (mirrors the chat stream vocabulary). `speed_bps` is the
+ *  smoothed transfer rate (bytes/sec) and `eta_seconds` the estimated time left (null = unknown). */
 export type DownloadEvent =
-  | { type: "progress"; downloaded: number; total: number }
+  | { type: "progress"; downloaded: number; total: number; speed_bps?: number; eta_seconds?: number | null }
   | { type: "done"; filename: string; path: string; size_bytes: number; label: string }
   | { type: "error"; message: string };
+
+/** Live progress for one download, kept in AppContext so it survives tab switches / dialog close. */
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+  status: "downloading" | "done" | "error";
+  message?: string;
+  /** Smoothed transfer rate (bytes/sec); 0/undefined until the first interval. */
+  speed_bps?: number;
+  /** Estimated seconds remaining; null/undefined when not yet known. */
+  eta_seconds?: number | null;
+}
+
+/** An in-progress (or just-finished) download from GET /api/models/downloads — used to repopulate
+ *  + re-attach progress after a page refresh. */
+export interface ActiveDownload {
+  key: string;
+  repo_id: string;
+  file_path: string;
+  quant: string;
+  filename: string;
+  downloaded: number;
+  total: number;
+  status: "downloading" | "done" | "error";
+  message: string;
+  speed_bps: number;
+  eta_seconds: number | null;
+}

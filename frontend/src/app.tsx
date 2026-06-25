@@ -6,8 +6,7 @@ import { AppProvider } from "@/state/appcontext";
 import { Sidebar } from "@/panes/sidebar";
 import { Canvas } from "@/panes/canvas";
 import { ContextPane } from "@/panes/contextpane";
-import { SkillMarketplace } from "@/panes/skillmarketplace";
-import { ModelsPage } from "@/panes/modelspage";
+import { SettingsPage } from "@/panes/settingspage";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_LEFT_WIDTH = 260;
@@ -318,8 +317,7 @@ function Shell() {
           </div>
         )}
       </div>
-      <SkillMarketplace />
-      <ModelsPage />
+      <SettingsPage />
     </div>
   );
 }

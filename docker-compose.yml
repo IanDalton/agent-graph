@@ -31,6 +31,10 @@ x-backend: &backend
     # (see below) so the optional `llamacpp` service reads the same files. LLAMACPP_BASE_URL is left
     # to .env (the user points it at their external llama-server) so it isn't overridden here.
     LLAMACPP_MODELS_DIR: /models
+    # The llama-server *container* name (resolvable on the host daemon via the mounted docker.sock).
+    # The Model Manager `docker exec`s it for GPU auto-detect and recreates it to load a model. Only
+    # relevant when llama-server is the bundled local Docker container (the `llamacpp` service).
+    LLAMACPP_CONTAINER: ${LLAMACPP_CONTAINER:-agent_graph_llamacpp}
     # Make uvicorn's --reload watcher poll: inotify events don't cross the Docker bind mount
     # on Windows/macOS hosts, so native watching misses host edits. Inert in prod (no --reload).
     WATCHFILES_FORCE_POLLING: "true"
@@ -186,10 +190,14 @@ services:
     profiles: ["build-only"]
 
   # --- optional local llama.cpp server (NVIDIA/CUDA) ---
-  # Opt-in only (`docker compose --profile llamacpp up llamacpp`); the app CONNECTS to it but does
-  # NOT manage it. It serves the GGUFs from the shared models volume. Replace `command` with the one
-  # the Model Manager generates for your model + hardware, and point LLAMACPP_BASE_URL at it
-  # (e.g. http://llamacpp:8080/v1). Needs the NVIDIA Container Toolkit on the host.
+  # Opt-in only (`docker compose --profile llamacpp up llamacpp`). It serves the GGUFs from the shared
+  # models volume; point LLAMACPP_BASE_URL at it (e.g. http://llamacpp:8080/v1). Needs the NVIDIA
+  # Container Toolkit on the host. When run this way (a local container the backend reaches over the
+  # mounted docker.sock — see LLAMACPP_CONTAINER), the Model Manager's "Load" button can RECREATE this
+  # container to serve a different model: it replicates this config (image, network alias `llamacpp`,
+  # models volume, CDI GPU device, restart policy) and changes only the command. A recreate detaches
+  # it from compose until the next `docker compose --profile llamacpp up -d llamacpp` reconciles it.
+  # You can still set the initial `command` by hand below (or via LLAMACPP_HF_REPO/CTX/NGL).
   llamacpp:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: agent_graph_llamacpp

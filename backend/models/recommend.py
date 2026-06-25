@@ -31,8 +31,12 @@ _GIB = 1024 ** 3
 # carry a small per-block scale overhead we round off.
 _KV_BYTES = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}
 
-# VRAM held back for the CUDA context + compute/output buffers, separate from weights + KV cache.
+# VRAM safety margin held back when deciding what fits (CUDA context + headroom). Scales with the
+# card, so it is a *fit budget* only — never added to the reported estimate (which must reflect the
+# model's footprint, not how big your GPU is).
 _MIN_RESERVE = 1 * _GIB
+# Realistic, GPU-size-independent compute/output buffer counted in the *reported* VRAM estimate.
+_GPU_OVERHEAD = 512 * _MIB
 # CPU-side runtime overhead beyond weights + KV (rough).
 _CPU_OVERHEAD = 512 * _MIB
 
@@ -48,7 +52,7 @@ _ARCH_BRACKETS = [
     (80.0, 80, 8192, 64, 8, 32768),
     (float("inf"), 96, 12288, 96, 8, 32768),
 ]
-_DEFAULT_BRACKET = (32, 4096, 32, 8, 8192)  # used when no param count can be parsed at all
+_DEFAULT_BRACKET = (32, 4096, 32, 8, 32768)  # used when no param count can be parsed at all
 
 _PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])")
 
@@ -66,7 +70,15 @@ class Recommendation:
     est_vram_mb: int
     est_ram_mb: int
     confidence: str  # "high" (from config.json) | "low" (size-class heuristic)
+    # VRAM estimate broken into its parts (sums to est_vram_mb) so the UI can show how each piece
+    # contributes. Zero on CPU/too_big where nothing is offloaded.
+    weights_mb: int = 0
+    kv_cache_mb: int = 0
+    overhead_mb: int = 0
     notes: list[str] = field(default_factory=list)
+    # The model's own maximum context (from config.json's max_position_embeddings, else the size-class
+    # bracket). The advanced UI uses it as the upper bound of the context-length slider.
+    model_max_ctx: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -168,7 +180,9 @@ def recommend(
     vram = profile.vram_total_mb * _MIB
     ram = profile.system_ram_mb * _MIB
     threads = profile.cpu_threads or os.cpu_count() or 8
-    target = min(requested_context or min(8192, model_max_ctx), model_max_ctx)
+    # Default to the model's own max and let the GPU path maximize the context that actually fits;
+    # a pinned requested_context is honored (capped at the model max).
+    target = min(requested_context or model_max_ctx, model_max_ctx)
     target = max(target, 512)
 
     notes = ["VRAM/KV-cache figures are estimates — fine-tune with the advanced controls."]
@@ -189,6 +203,7 @@ def recommend(
             fit=fit, n_gpu_layers=0, context_length=target, kv_cache_type=kv, flash_attn=True,
             batch_size=512, ubatch_size=512, threads=threads, est_vram_mb=0,
             est_ram_mb=_to_mb(est_ram), confidence=confidence, notes=notes,
+            model_max_ctx=model_max_ctx,
         )
 
     reserve = max(_MIN_RESERVE, int(0.1 * vram))
@@ -201,13 +216,15 @@ def recommend(
         if max_fit >= min(target, 2048):
             ctx = min(max(target, 2048), max_fit, model_max_ctx)
             kv_b = kv_cache_bytes(n_layers, n_kv_heads, head_dim, ctx, kv)
-            est_vram = weights + kv_b + reserve
+            weights_mb, kv_mb, overhead_mb = _to_mb(weights), _to_mb(kv_b), _to_mb(_GPU_OVERHEAD)
             if kv != "f16":
                 notes.append(f"Using {kv} KV cache so it fits at a useful context.")
             return Recommendation(
                 fit="gpu", n_gpu_layers=999, context_length=ctx, kv_cache_type=kv, flash_attn=True,
-                batch_size=2048, ubatch_size=512, threads=threads, est_vram_mb=_to_mb(est_vram),
-                est_ram_mb=0, confidence=confidence, notes=notes,
+                batch_size=2048, ubatch_size=512, threads=threads,
+                est_vram_mb=weights_mb + kv_mb + overhead_mb, est_ram_mb=0, confidence=confidence,
+                weights_mb=weights_mb, kv_cache_mb=kv_mb, overhead_mb=overhead_mb, notes=notes,
+                model_max_ctx=model_max_ctx,
             )
 
     # Partial offload — lower the context, then offload as many layers as fit.
@@ -218,16 +235,20 @@ def recommend(
     ngl = int((vram - reserve) / per_layer) if per_layer > 0 else 0
     ngl = max(0, min(ngl, n_layers))
     if ngl >= 1:
-        est_vram = ngl * per_layer + reserve
         est_ram = (n_layers - ngl) * per_layer
+        weights_mb = _to_mb(ngl * weights / n_layers)
+        kv_mb = _to_mb(ngl * kv_total / n_layers)
+        overhead_mb = _to_mb(_GPU_OVERHEAD)
         notes.append(
             f"Partial offload: ~{ngl}/{n_layers} layers on GPU. Lower the context or KV quant to "
             "raise it."
         )
         return Recommendation(
             fit="partial", n_gpu_layers=ngl, context_length=ctx, kv_cache_type=kv, flash_attn=True,
-            batch_size=512, ubatch_size=512, threads=threads, est_vram_mb=_to_mb(est_vram),
-            est_ram_mb=_to_mb(est_ram), confidence=confidence, notes=notes,
+            batch_size=512, ubatch_size=512, threads=threads,
+            est_vram_mb=weights_mb + kv_mb + overhead_mb, est_ram_mb=_to_mb(est_ram),
+            confidence=confidence, weights_mb=weights_mb, kv_cache_mb=kv_mb, overhead_mb=overhead_mb,
+            notes=notes, model_max_ctx=model_max_ctx,
         )
 
     # Nothing offloads usefully → CPU if it fits RAM, else too big.
@@ -243,11 +264,11 @@ def recommend(
     return Recommendation(
         fit=fit, n_gpu_layers=0, context_length=ctx, kv_cache_type=kv, flash_attn=True,
         batch_size=512, ubatch_size=512, threads=threads, est_vram_mb=0, est_ram_mb=_to_mb(est_ram),
-        confidence=confidence, notes=notes,
+        confidence=confidence, notes=notes, model_max_ctx=model_max_ctx,
     )
 
 
-def launch_command(
+def launch_argv(
     model_path: str,
     rec: Recommendation,
     *,
@@ -255,11 +276,17 @@ def launch_command(
     port: int = 8080,
     alias: str = "",
     api_key: str = "",
-) -> str:
-    """Build the exact ``llama-server`` command for ``rec`` (the user runs this on the GPU machine)."""
+) -> list[str]:
+    """The ``llama-server`` argv for ``rec`` as a raw (un-shell-quoted) token list.
+
+    This is the structured form :func:`launch_command` renders for display AND the form the model
+    manager feeds (minus the leading ``llama-server`` token) to ``docker create`` when auto-loading a
+    model — the server-cuda image's entrypoint *is* ``llama-server``, so the container command is the
+    flags only.
+    """
     parts = [
         "llama-server",
-        "-m", shlex.quote(model_path),
+        "-m", model_path,
         "-c", str(rec.context_length),
         "-ngl", str(rec.n_gpu_layers),
         "-ctk", rec.kv_cache_type,
@@ -272,10 +299,24 @@ def launch_command(
         parts += ["--flash-attn", "on"]
     parts += ["--host", host, "--port", str(port)]
     if alias:
-        parts += ["--alias", shlex.quote(alias)]
+        parts += ["--alias", alias]
     if api_key:
-        parts += ["--api-key", shlex.quote(api_key)]
-    return " ".join(parts)
+        parts += ["--api-key", api_key]
+    return parts
+
+
+def launch_command(
+    model_path: str,
+    rec: Recommendation,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    alias: str = "",
+    api_key: str = "",
+) -> str:
+    """Build the exact ``llama-server`` command for ``rec`` (the user runs this on the GPU machine)."""
+    argv = launch_argv(model_path, rec, host=host, port=port, alias=alias, api_key=api_key)
+    return " ".join(shlex.quote(p) for p in argv)
 
 
 def launch_command_hf(
@@ -312,6 +353,7 @@ __all__ = [
     "Recommendation",
     "recommend",
     "kv_cache_bytes",
+    "launch_argv",
     "launch_command",
     "launch_command_hf",
     "parse_params_billions",

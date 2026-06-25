@@ -177,7 +177,7 @@ function SwarmSettingsRows() {
 /** The account skill library (active in every chat). Shows installed/authored skills as removable
  *  chips; "Browse" opens the Skill Marketplace dialog to add or author more. */
 function SkillsRow() {
-  const { skills, removeSkill, openSkillMarketplace } = useApp();
+  const { skills, removeSkill, openSettings } = useApp();
 
   return (
     <div className="space-y-2">
@@ -190,7 +190,7 @@ function SkillsRow() {
           variant="ghost"
           size="sm"
           className="h-6 gap-1 px-2 text-[11px] text-muted-foreground"
-          onClick={openSkillMarketplace}
+          onClick={() => openSettings("skills")}
           title="Browse the skill marketplace"
         >
           <Sparkles className="size-3" />

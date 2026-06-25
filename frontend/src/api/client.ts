@@ -1,4 +1,5 @@
 import type {
+  ActiveDownload,
   AgentSpec,
   AppConfig,
   CatalogSkill,
@@ -11,6 +12,7 @@ import type {
   HfFile,
   HfModel,
   LlamacppStatus,
+  LoadModelResult,
   LocalModel,
   MemoryGraph,
   Mode,
@@ -316,6 +318,9 @@ export const api = {
   // The downloaded GGUF models (the local library).
   getModels: () => fetch("/api/models").then(json<LocalModel[]>),
 
+  // In-progress (and just-finished) downloads — to repopulate progress bars after a refresh.
+  activeDownloads: () => fetch("/api/models/downloads").then(json<ActiveDownload[]>),
+
   // Search HuggingFace for GGUF models.
   searchModels: (query: string, sort = "downloads", limit = 30) =>
     fetch(
@@ -372,4 +377,13 @@ export const api = {
 
   // Ping the configured llama-server: reachable? what model is it serving?
   llamacppStatus: () => fetch("/api/llamacpp/status").then(json<LlamacppStatus>),
+
+  // Recreate the local llama-server container to serve a downloaded GGUF (click-to-load). Tolerant
+  // failures come back as `{ok:false, …}` at HTTP 200; only a guard/missing-file raises.
+  loadModel: (body: { filename: string; requested_context?: number; kv_cache_type?: string }) =>
+    fetch("/api/llamacpp/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(json<LoadModelResult>),
 };

@@ -32,6 +32,44 @@ class GpuInfo:
     vram_mb: int
 
 
+# A small catalog of common NVIDIA cards → VRAM (MB), so the UI can auto-fill VRAM the moment a known
+# GPU name is typed (manual entry is otherwise easy to leave blank — the cause of the historical
+# ``vram_mb: 0`` profiles). Keys are matched case-insensitively as substrings of the entered name, so
+# "NVIDIA GeForce RTX 3090" matches "rtx 3090". Not exhaustive — auto-detect is the primary fill.
+KNOWN_GPUS: dict[str, int] = {
+    "rtx 5090": 32768,
+    "rtx 4090": 24564,
+    "rtx 3090 ti": 24576,
+    "rtx 3090": 24576,
+    "rtx 4080": 16376,
+    "rtx 3080 ti": 12288,
+    "rtx 3080": 10240,
+    "rtx 4070 ti": 12288,
+    "rtx 4070": 12288,
+    "rtx 3070": 8192,
+    "rtx 3060": 12288,
+    "rtx a6000": 49140,
+    "rtx a5000": 24564,
+    "rtx a4000": 16376,
+    "a100": 40960,
+    "h100": 81920,
+    "l40s": 49152,
+    "l4": 24576,
+    "t4": 16384,
+    "v100": 16384,
+}
+
+
+def vram_for_name(name: str) -> int | None:
+    """VRAM (MB) for a known GPU name, or ``None``. Substring match, longest key first (so
+    "rtx 3090 ti" wins over "rtx 3090")."""
+    lowered = (name or "").lower()
+    for key in sorted(KNOWN_GPUS, key=len, reverse=True):
+        if key in lowered:
+            return KNOWN_GPUS[key]
+    return None
+
+
 @dataclass
 class HardwareProfile:
     """A description of the machine that will run llama-server (the recommendation target)."""
@@ -176,6 +214,8 @@ def save_profile(path: str | Path, profile: HardwareProfile) -> None:
 __all__ = [
     "GpuInfo",
     "HardwareProfile",
+    "KNOWN_GPUS",
+    "vram_for_name",
     "detect_nvidia",
     "detect_system",
     "auto_profile",

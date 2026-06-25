@@ -85,6 +85,29 @@ If `agent-sandbox` isn't built, `run_python` still runs Python on the stdlib-onl
 > Override the shared scratch path with `SANDBOX_SHARED_DIR` in `.env` if `/sandbox-tmp` is
 > unsuitable on your host.
 
+## Automatic model loading (same Docker socket)
+
+The Model Manager (Settings → Models) reuses the mounted Docker socket for two things, but **only**
+when llama-server is the bundled local container (`LLAMACPP_CONTAINER`, default
+`agent_graph_llamacpp`):
+
+- **GPU auto-detect** — the backend image has no `nvidia-smi`, so `POST /api/hardware/detect` falls
+  back to `docker exec <container> nvidia-smi …` to read the GPU the container *can* see.
+- **Load a model** — `POST /api/llamacpp/load` `docker inspect`s the llama-server container, then
+  `docker rm -f` + recreates it serving the chosen GGUF (`-m /models/<file>` + the recommended
+  flags). It replicates the inspected config — image, the **`llamacpp` network alias** (force-kept so
+  the backend keeps reaching it), the models volume, the **GPU device** (CDI `--device
+  nvidia.com/gpu=all`, or legacy `--runtime nvidia --gpus all` — derived from inspect, never
+  hard-coded), and the restart policy — changing only the command.
+
+A recreate detaches the container from compose until the next `docker compose --profile llamacpp up
+-d llamacpp` reconciles it (the compose labels are replicated so reconciliation is clean). For a
+hand-run or **remote** llama-server the endpoint returns `unmanaged` and the UI disables Load (copy
+the Configure launch command instead). **Security:** like the sandbox, the socket gives the backend
+host-root-equivalent power; the load endpoint contains this to a path-traversal-guarded library
+filename + a recommender-generated command on the single `LLAMACPP_CONTAINER`, but you should still
+auth-gate `/api` (at Caddy) before exposing the app beyond localhost.
+
 ## Service endpoints inside the compose network
 
 The backend reaches the other services by name (set in `docker-compose.yml`):

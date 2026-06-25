@@ -3,7 +3,6 @@ import { Check, Loader2, Pencil, Plus, RefreshCw, Search, Sparkles, Trash2, X } 
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { useApp } from "@/state/appcontext";
@@ -173,12 +172,11 @@ function SkillEditor({
   );
 }
 
-/** The Skill Marketplace dialog: browse Claude's catalog + your authored skills, install/remove, and
- *  author your own. Skills live in an account-wide library and are active in every regular chat. */
-export function SkillMarketplace() {
+/** The Skill Marketplace panel: browse Claude's catalog + your authored skills, install/remove, and
+ *  author your own. Skills live in an account-wide library and are active in every regular chat.
+ *  Rendered inside the Settings page's "Skills" tab (no dialog chrome of its own). */
+export function SkillMarketplacePanel() {
   const {
-    skillMarketplaceOpen,
-    closeSkillMarketplace,
     catalog,
     catalogLoading,
     refreshCatalog,
@@ -247,14 +245,8 @@ export function SkillMarketplace() {
   };
 
   return (
-    <Dialog
-      open={skillMarketplaceOpen}
-      onClose={closeSkillMarketplace}
-      title="Skill Marketplace"
-      className="h-[80vh] w-[min(900px,92vw)]"
-    >
-      <div className="flex h-full flex-col">
-        <header className="shrink-0 border-b border-border p-4 pr-12">
+    <div className="flex h-full flex-col">
+        <header className="shrink-0 border-b border-border p-4">
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <Sparkles className="size-4 text-primary" />
             Skill Marketplace
@@ -350,7 +342,6 @@ export function SkillMarketplace() {
             )}
           </div>
         )}
-      </div>
-    </Dialog>
+    </div>
   );
 }
